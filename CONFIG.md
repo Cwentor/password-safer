@@ -1,77 +1,92 @@
 # Password Safer 配置说明
 
-本文档列出了应用运行所需的全部配置参数。标注 `[待补充]` 的参数需要你提供具体值后才能启用对应功能。
+本文档列出了应用运行所需的全部配置参数。除手动填入路径与同步间隔外，Cookie 类凭证均可在应用内通过扫码登录自动获取。
 
 ---
 
 ## 一、百度网盘云同步
 
-百度网盘提供官方开放平台 API，需要先注册应用获取凭证。
+百度网盘采用 **Web Cookie + bdstoken** 鉴权方式（非 OAuth 开放平台 API）。bdstoken 由应用在每次上传前自动通过 `pan.baidu.com/api/gettemplatevariable` 接口从 Cookie 中提取，无需用户手动填写。
 
-### 1.1 申请步骤
+### 1.1 获取 Cookie（应用内扫码登录 · 推荐）
 
-1. 访问 [百度网盘开放平台](https://pan.baidu.com/union)
-2. 注册开发者账号，创建应用
-3. 获取 `AppKey`（client_id）和 `SecretKey`（client_secret）
-4. 设置回调地址（可填 `oob`）
+1. 打开应用 → 设置 → 「云同步」标签 → 百度网盘区域
+2. 点击「扫码登录」按钮，弹出二维码
+3. 使用百度网盘手机 App 扫码并确认授权
+4. 应用自动轮询登录状态，成功后自动写入 `baidu_cookie` 与 `baidu_cookie_expires_at`
+5. 开启「自动同步」开关即可
 
 ### 1.2 配置参数
 
-| 参数 | 说明 | 当前值 |
+| 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `baidu_app_key` | 百度网盘应用 AppKey | `[待补充]` |
-| `baidu_secret_key` | 百度网盘应用 SecretKey | `[待补充]` |
-| `baidu_access_token` | OAuth2 访问令牌（有效期 30 天） | `[待补充]` - 通过授权流程获取 |
-| `baidu_refresh_token` | OAuth2 刷新令牌（有效期 10 年） | `[待补充]` - 通过授权流程获取 |
+| `baidu_cookie` | 百度网盘登录 Cookie（应用内扫码自动获取） | 空 |
 | `baidu_remote_path` | 网盘中的数据库文件路径 | `/apps/VAULT/vault.db` |
 | `baidu_sync_enabled` | 是否启用百度网盘同步 | `false` |
 | `baidu_sync_interval` | 自动同步间隔（秒） | `300`（5 分钟） |
+| `baidu_cookie_expires_at` | Cookie 过期时间戳（秒，0 表示未知） | `0` |
+| `baidu_last_sync` | 上次同步时间字符串（自动维护） | 空 |
 
-### 1.3 获取 access_token
+### 1.3 同步能力说明
 
-在浏览器中打开以下 URL 进行授权（替换 `YOUR_APP_KEY`）：
+- **上传**：`precreate` → 分片 `upload` → `create`
+- **下载**：通过 `d.pcs.baidu.com` 直接下载
+- **单向上传**：当前未实现 `remote_file_mtime`，调度器仅执行上传，不支持双向同步
 
-```
-https://openapi.baidu.com/oauth/2.0/authorize?response_type=code&client_id=YOUR_APP_KEY&redirect_uri=oob&scope=basic+netdisk&display=popup
-```
-
-授权后获取 `code`，然后用以下 URL 换取 token（替换 `YOUR_CODE`、`YOUR_APP_KEY`、`YOUR_SECRET_KEY`）：
-
-```
-https://openapi.baidu.com/oauth/2.0/token?grant_type=authorization_code&code=YOUR_CODE&client_id=YOUR_APP_KEY&client_secret=YOUR_SECRET_KEY&redirect_uri=oob
-```
-
-返回的 JSON 中包含 `access_token` 和 `refresh_token`，填入应用设置即可。
+> Cookie 有时效性，过期后需重新扫码登录。应用会在 Cookie 失效时自动停用同步并提示。
 
 ---
 
 ## 二、夸克网盘云同步
 
-夸克网盘没有官方开放 API，采用 Web 端 Cookie 鉴权方式。
+夸克网盘无官方开放 API，采用 Web 端 **HttpOnly Cookie** 鉴权方式。应用通过 Tauri 2 的 `cookies_for_url()` API 获取含 HttpOnly 标记的完整 Cookie，确保上传鉴权所需字段齐全。
 
 ### 2.1 获取 Cookie
+
+#### 方式一：应用内 WebView 扫码登录（推荐）
+
+1. 打开应用 → 设置 → 「云同步」标签 → 夸克网盘区域
+2. 点击「扫码登录」按钮，弹出 WebView 窗口加载 `pan.quark.cn/account/login`
+3. 使用夸克 App 扫码并确认登录
+4. 应用后台轮询 Cookie，成功后自动写入 `quark_cookie` 与 `quark_cookie_expires_at`，并关闭窗口
+5. 开启「自动同步」开关即可
+
+> WebView 已注入反反爬虫脚本：移除 `window.__TAURI__` 全局对象、伪装 Chrome 138 用户代理。
+
+#### 方式二：浏览器手动抓取（备选）
 
 1. 在浏览器中登录 [夸克网盘](https://pan.quark.cn)
 2. 按 `F12` 打开开发者工具
 3. 切换到 `Network` 标签页
 4. 刷新页面，点击任意请求
-5. 在请求头中找到 `Cookie` 字段，复制完整值
+5. 在请求头中找到 `Cookie` 字段，复制完整值粘贴到设置页
+
+> 注意：浏览器 `document.cookie` 无法读取 HttpOnly Cookie，手动方式可能遗漏鉴权字段，建议优先使用应用内扫码。
 
 ### 2.2 配置参数
 
-| 参数 | 说明 | 当前值 |
+| 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `quark_cookie` | 夸克网盘登录 Cookie | `[待补充]` |
+| `quark_cookie` | 夸克网盘登录 Cookie（含 HttpOnly） | 空 |
 | `quark_remote_path` | 网盘中的数据库文件路径 | `/VAULT/vault.db` |
 | `quark_sync_enabled` | 是否启用夸克网盘同步 | `false` |
 | `quark_sync_interval` | 自动同步间隔（秒） | `300`（5 分钟） |
+| `quark_cookie_expires_at` | Cookie 过期时间戳（秒，0 表示未知） | `0` |
+| `quark_last_sync` | 上次同步时间字符串（自动维护） | 空 |
+| `quark_last_remote_mtime` | 上次同步时云端文件 mtime（双向同步用，自动维护） | `0` |
 
-### 2.3 注意事项
+### 2.3 同步能力说明
 
-- Cookie 有时效性，过期后需要重新获取
+- **上传**：`file/upload/pre` → `file/update/hash`（秒传判断）→ 分片 PUT → `commit` → `finish`
+- **断点续传**：`.uploadmeta` 元文件记录已上传分片
+- **冲突处理**：23008 doloading 状态自动复用现有目录 fid
+- **双向同步**：比较本地 mtime 与云端 mtime，新者覆盖旧者，相等则跳过
+
+### 2.4 注意事项
+
+- Cookie 有时效性，过期后需重新登录
 - 非官方接口可能随夸克网盘版本更新而失效
-- 上传功能需要进一步完善（下载功能已实现）
-- 建议优先使用百度网盘同步（官方 API 更稳定）
+- Cookie 距过期 <7 天时应用会弹窗预警，过期自动停用同步
 
 ---
 

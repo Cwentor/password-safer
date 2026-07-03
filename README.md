@@ -1,35 +1,101 @@
-# Password Safer - 本地加密密码保管箱
+# Password Safer
 
-基于 Tauri + Rust 的 Windows 桌面密码管理应用。数据本地 SQLite 加密存储，支持百度网盘/夸克网盘定时云同步，无需用户登录注册。
+> 本地优先 · 端到端加密 · 双网盘云同步的 Windows 桌面密码保管箱
+
+![version](https://img.shields.io/badge/version-v2.0.0-cyan?style=flat-square)
+![license](https://img.shields.io/badge/license-PSNCPL%20v1.0-blue?style=flat-square)
+![platform](https://img.shields.io/badge/platform-Windows-success?style=flat-square)
+![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)
+![rust](https://img.shields.io/badge/Rust-edition%202021-dea584?style=flat-square)
+
+Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码管理应用。所有密码数据以 **AES-256-GCM** 加密后存储在本地 SQLite 数据库中，密钥与数据库文件分离保存；支持**百度网盘**与**夸克网盘**双向/单向云同步，无需用户登录注册，开箱即用。
+
+**v2.0.0 亮点**：夸克网盘完整双向同步（含断点续传 + 秒传）、应用内扫码登录、Cookie 过期预警、无边框沉浸式窗口。
+
+---
+
+## 目录
+
+- [功能特性](#功能特性)
+- [技术栈](#技术栈)
+- [快速开始](#快速开始)
+- [项目结构](#项目结构)
+- [数据存储](#数据存储)
+- [同步机制](#同步机制)
+- [数据库导入/导出](#数据库导入导出)
+- [配置参数一览](#配置参数一览)
+- [已知限制](#已知限制)
+- [国内网络配置](#国内网络配置)
+- [许可证](#许可证)
+
+---
 
 ## 功能特性
 
-- **本地加密存储**：AES-256-GCM 加密，密钥与数据库分离存储
-- **模糊搜索**：按名称、用户名、网址、标签、备注不完全匹配查询
-- **标签分类**：自定义标签管理，支持按标签筛选
-- **密码强度**：自动评估密码强度（1-4 级）
+### 🔒 安全
+
+- **AES-256-GCM 加密**：认证加密，密码字段密文存储
+- **密钥与数据库分离**：`master.key` 与 `vault.db` 独立存放，提升物理安全性
+- **密码强度评估**：自动评分 1-4 级（长度 + 大小写 + 数字 + 符号）
+- **密码生成器**：内置强密码生成，长度可配置
+
+### 🗂 管理
+
+- **模糊搜索**：覆盖名称、用户名、网址、标签、备注，Ctrl+F 快捷键
+- **标签分类**：自定义标签云（工作 / 社交 / 金融 / 电商 / 开发 / 娱乐 / 云服务）
 - **收藏标记**：快速访问常用密码
-- **密码生成**：内置强密码生成器
 - **一键复制**：点击即复制密码到剪贴板
-- **百度网盘同步**：官方 API 支持，完整的上传/下载（precreate → upload → create）
-- **夸克网盘同步**：Cookie 鉴权方式，支持下载（上传需进一步完善）
-- **定时同步**：按配置间隔自动上传数据库文件到网盘
-- **数据库导入**：从外部 SQLite 文件反向导入数据到应用
-- **数据库导出**：导出当前数据库文件到任意路径
-- **无需注册**：无用户登录系统，开箱即用
+- **多维排序**：按名称 / 最近使用 / 创建时间 / 密码强度
+
+### ☁️ 云同步
+
+| 网盘 | 鉴权 | 上传 | 下载 | 双向同步 | 扫码登录 |
+|------|------|------|------|----------|----------|
+| **夸克网盘** | HttpOnly Cookie | ✅ 分片 + 断点续传 + 秒传 | ✅ | ✅ mtime 比对 | ✅ WebView 扫码 |
+| **百度网盘** | Web Cookie + bdstoken | ✅ precreate→upload→create | ✅ | ❌ 单向上传 | ✅ API 扫码 |
+
+- **定时自动同步**：后台调度器按间隔（默认 5 分钟）轮询
+- **Cookie 过期预警**：夸克 Cookie 距过期 <7 天时弹窗提醒，过期自动停用同步
+- **手动同步**：设置页面点击「立即上传」/「从云恢复」
+
+### 🖥 体验
+
+- **无边框沉浸式窗口**：自定义系统标题栏与边框隐藏
+- **自绘标题栏**：支持拖拽移动、最小化 / 最大化 / 关闭按钮、双击切换最大化
+- **天青色渐变主题**：Cyan / Teal 配色，三栏式布局（侧栏 / 主区 / 详情）
+- **键盘快捷键**：`Ctrl+F` 聚焦搜索，`Esc` 关闭弹窗
+- **本地存储用量可视化**：侧栏实时显示数据库占用
+
+### 💾 数据
+
+- **数据库导出**：将当前 `vault.db` 复制到任意路径
+- **数据库导入**：从外部 SQLite 文件反向导入（支持加密格式与明文格式）
+- **自动图标映射**：按名称识别常见站点（GitHub → 🐙 等）
+
+### ⚠️ 待完善
+
+- **编辑密码**：后端 `update_password` 命令已实现，前端 UI 待接线
+- **自动锁定**：配置项已就绪（默认 30 分钟），闲置定时逻辑待实现
+- **剪贴板自动清空**：配置项已就绪（默认 30 秒），定时清空逻辑待实现
+
+---
 
 ## 技术栈
 
-| 组件 | 技术 |
-|------|------|
-| 桌面框架 | Tauri 2.x |
-| 后端语言 | Rust (edition 2021) |
-| 数据库 | SQLite (rusqlite, bundled) |
-| 加密 | AES-256-GCM (aes-gcm 0.10) |
-| HTTP 客户端 | reqwest 0.12 (blocking + rustls) |
-| 异步运行时 | tokio 1.x |
-| 前端 | 原生 HTML/CSS/JS (Vite 构建) |
-| UI 主题 | 天青色渐变 (Cyan/Teal) |
+| 组件 | 技术 | 说明 |
+|------|------|------|
+| 桌面框架 | Tauri 2.x | 跨平台桌面应用框架 |
+| 后端语言 | Rust (edition 2021) | 核心业务逻辑 |
+| 数据库 | rusqlite 0.31 (bundled) | SQLite，静态编译 |
+| 加密 | aes-gcm 0.10 | AES-256-GCM 认证加密 |
+| HTTP 客户端 | reqwest 0.12 (blocking + rustls) | 同步 HTTP，避免 OpenSSL 依赖 |
+| 异步运行时 | tokio 1.x (full) | 同步调度器与扫码轮询 |
+| 二维码 | qrcode 0.14 + image 0.25 | 扫码登录二维码渲染 |
+| 哈希 | sha1 0.10 + md-5 0.10 | 夸克上传秒传校验 |
+| 前端 | 原生 HTML / CSS / JS | Vite 5 构建，无框架依赖 |
+| UI 主题 | 天青色渐变 (Cyan / Teal) | 自定义无边框窗口 |
+
+---
 
 ## 快速开始
 
@@ -37,30 +103,27 @@
 
 #### Rust 工具链
 
-```
-访问 https://rustup.rs 下载并安装
-```
+访问 [https://rustup.rs](https://rustup.rs) 下载并安装。
 
-**重要**：Windows 上 Rust 有两种工具链：
+**Windows 上 Rust 有两种工具链可选**：
 
 | 工具链 | 需要的额外组件 | 说明 |
 |--------|---------------|------|
 | `stable-x86_64-pc-windows-msvc` | Visual Studio C++ Build Tools | 官方推荐，编译速度快 |
-| `stable-x86_64-pc-windows-gnu` | 无需额外组件 | 需要 MinGW，安装更简单 |
+| `stable-x86_64-pc-windows-gnu` | 无需额外组件（需 MinGW） | 安装更简单 |
 
 如果选择 MSVC 工具链，需安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)，勾选「使用 C++ 的桌面开发」。
 
-如果不想安装庞大的 MSVC，可以切换 GNU 工具链：
-```
+如果不想安装庞大的 MSVC，可切换 GNU 工具链：
+
+```powershell
 rustup toolchain install stable-x86_64-pc-windows-gnu
 rustup default stable-x86_64-pc-windows-gnu
 ```
 
 #### Node.js
 
-```
-访问 https://nodejs.org/ 下载 LTS 版本安装
-```
+访问 [https://nodejs.org](https://nodejs.org/) 下载 LTS 版本安装。
 
 ### 2. 构建运行
 
@@ -79,43 +142,55 @@ npm run tauri dev        # 开发模式
 npm run tauri build      # 生产构建
 ```
 
+构建产物位于 `src-tauri/target/release/bundle/`：
+- `nsis/` — NSIS 安装程序
+- `msi/` — MSI 安装包
+
 ### 3. 配置云同步
 
-应用启动后，点击右上角设置图标进入设置页面，配置网盘同步参数。
+应用启动后，点击右上角设置图标进入设置页面 → 「云同步」标签，选择网盘并点击「扫码登录」（夸克）或「扫码登录」（百度）即可自动获取 Cookie。详细配置说明请参阅 [CONFIG.md](./CONFIG.md)。
 
-详细配置说明请参阅 [CONFIG.md](./CONFIG.md)。
+---
 
 ## 项目结构
 
 ```
 password-safer/
-├── index.html              # 前端 UI（HTML + CSS + JS 内联）
-├── package.json            # npm 依赖配置
-├── vite.config.js          # Vite 构建配置
-├── build.ps1               # 构建脚本
-├── CONFIG.md               # 配置参数说明文档
-├── README.md               # 本文档
+├── index.html                    # 前端 UI（HTML + CSS + JS 内联）
+├── package.json                  # npm 依赖配置
+├── vite.config.js                # Vite 构建配置
+├── build.ps1                     # 构建脚本
+├── CONFIG.md                     # 配置参数说明文档
+├── LICENSE                       # PSNCPL v1.0 非商业许可
+├── README.md                     # 本文档
 └── src-tauri/
-    ├── Cargo.toml           # Rust 依赖配置
-    ├── tauri.conf.json      # Tauri 应用配置
-    ├── build.rs             # Tauri 构建脚本
-    ├── icons/               # 应用图标
+    ├── Cargo.toml                # Rust 依赖配置
+    ├── tauri.conf.json           # Tauri 应用配置（无边框窗口）
+    ├── build.rs                  # Tauri 构建脚本
+    ├── icons/                    # 应用图标
     ├── .cargo/
-    │   └── config.toml      # Cargo 镜像配置（国内加速）
+    │   └── config.toml           # Cargo 镜像配置（国内加速）
     ├── capabilities/
-    │   └── default.json     # Tauri 权限配置
+    │   ├── default.json          # 主窗口 Tauri 权限配置
+    │   └── quark-login.json      # 夸克登录 WebView 远程页面权限
     └── src/
-        ├── main.rs           # 程序入口
-        ├── lib.rs            # 核心逻辑：Tauri 命令 + 同步调度器
-        ├── models.rs         # 数据模型：PasswordDto, AppConfig 等
-        ├── crypto.rs         # AES-256-GCM 加密/解密
-        ├── db.rs             # SQLite 数据库 CRUD + 导入
-        ├── config.rs         # 配置管理器
+        ├── main.rs               # 程序入口
+        ├── lib.rs                # 核心逻辑：Tauri 命令 + 同步调度器
+        ├── models.rs             # 数据模型：PasswordDto / AppConfig
+        ├── crypto.rs             # AES-256-GCM 加密/解密
+        ├── db.rs                 # SQLite 数据库 CRUD + 导入
+        ├── config.rs             # 配置管理器
         └── sync/
-            ├── mod.rs         # 同步 trait + 辅助函数
-            ├── baidu.rs       # 百度网盘同步（官方 API）
-            └── quark.rs       # 夸克网盘同步（Cookie 方式）
+            ├── mod.rs            # 同步 trait + 辅助函数
+            ├── baidu.rs          # 百度网盘同步（web cookie + bdstoken）
+            ├── quark.rs          # 夸克网盘同步（HttpOnly Cookie + 双向）
+            └── auth/
+                ├── mod.rs        # 扫码登录 trait
+                ├── baidu.rs      # 百度 API 扫码登录
+                └── quark.rs      # 夸克 CAS 扫码登录
 ```
+
+---
 
 ## 数据存储
 
@@ -124,55 +199,129 @@ password-safer/
 | `vault.db` | `%APPDATA%\password-safer\` | SQLite 数据库（密码字段 AES 加密） |
 | `master.key` | `%APPDATA%\password-safer\` | 256 位加密密钥 |
 
-> **密钥安全提醒**：`master.key` 是解密密码的唯一凭证。请单独备份此文件。如果密钥丢失，已加密的密码将无法恢复。请勿将 `master.key` 和 `vault.db` 放在同一位置。
+> **⚠️ 密钥安全提醒**
+>
+> `master.key` 是解密密码的**唯一凭证**。请单独备份此文件。
+> - 如果密钥丢失，已加密的密码将**无法恢复**。
+> - 请勿将 `master.key` 和 `vault.db` 放在同一位置。
+> - 网盘同步仅上传 `vault.db`，**不会上传** `master.key`。
+
+### 加密范围
+
+- 加密算法：**AES-256-GCM**（认证加密）
+- 加密字段：仅 `password_encrypted` 字段加密
+- 明文字段：名称、用户名、网址、标签、备注等（用于搜索筛选）
+- 密钥生成：首次运行时随机生成 256 位密钥
+
+---
 
 ## 同步机制
 
-采用**文件级同步**策略：将整个 SQLite 数据库文件上传/下载到网盘。
+采用**文件级同步**策略：将整个 SQLite 数据库文件上传/下载到网盘，而非同步单条记录。
 
-- **自动同步**：后台定时器按间隔（默认 5 分钟）自动上传
-- **手动同步**：设置页面点击「立即同步」
-- **多设备**：设备 A 上传 → 设备 B 下载恢复
+### 百度网盘（单向上传）
+
+- 鉴权：Web Cookie + bdstoken（自动从 cookie 获取）
+- 上传流程：`precreate` → 分片 `upload` → `create`
+- 下载：通过 `d.pcs.baidu.com` 直接下载
+- **不支持双向同步**（未实现 `remote_file_mtime`）
+
+### 夸克网盘（双向同步）
+
+- 鉴权：HttpOnly Cookie（通过 `cookies_for_url()` 获取完整 cookie）
+- 上传流程：`file/upload/pre` → `file/update/hash`（秒传判断）→ 分片 PUT → `commit` → `finish`
+- 断点续传：`.uploadmeta` 元文件记录进度
+- 冲突处理：23008 doloading 状态自动复用现有目录 fid
+- **双向同步逻辑**：
+  1. 本地无效 → 下载云端恢复
+  2. 本地有效 → 比较本地 mtime 与云端 mtime，新者覆盖旧者
+  3. mtime 相等 → 跳过
+
+### 自动同步调度器
+
+- 后台 `tauri::async_runtime::spawn` 死循环，按 `*_sync_interval`（默认 300 秒）轮询
+- 同步前校验 Cookie 有效性（`QuarkAuth::validate` / `BaiduAuth::validate`）
+- Cookie 距过期 <7 天 → emit `sync://cookie_expiring` 事件
+- Cookie 失效 → 自动关闭同步 + emit `sync://expired` 事件
+- 同步异常 → emit `sync://error` 事件
+
+### 多设备使用流程
+
+1. 设备 A 创建/修改密码 → 自动上传到网盘
+2. 设备 B 打开应用 → 手动「从云恢复」下载 → 覆盖本地数据
+
+> **⚠️ 冲突提醒**
+>
+> 文件级同步不支持增量合并，多设备同时修改可能冲突。建议同一时间只在一台设备上编辑。
+
+---
 
 ## 数据库导入/导出
 
 ### 导出
+
 将当前 `vault.db` 复制到指定路径，包含全部加密数据。
 
 ### 导入（反向转换）
+
 从外部 SQLite 文件读取密码记录，导入到当前数据库：
+
 - 自动验证表结构（需有 `passwords` 表）
 - 尝试解密（如果是本应用导出的加密格式）
 - 解密失败则当作明文处理
 - 重新加密后插入当前数据库
 
+---
+
 ## 配置参数一览
 
-| 参数 | 当前值 | 说明 |
+> 完整配置说明请参阅 [CONFIG.md](./CONFIG.md)。下表仅列出关键字段。
+
+### 百度网盘
+
+| 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `baidu_app_key` | `[待补充]` | 百度网盘应用 AppKey |
-| `baidu_secret_key` | `[待补充]` | 百度网盘应用 SecretKey |
-| `baidu_access_token` | `[待补充]` | OAuth2 访问令牌 |
-| `baidu_refresh_token` | `[待补充]` | OAuth2 刷新令牌 |
+| `baidu_cookie` | 空 | 百度网盘登录 Cookie（应用内扫码登录自动获取） |
 | `baidu_remote_path` | `/apps/VAULT/vault.db` | 网盘存储路径 |
 | `baidu_sync_enabled` | `false` | 是否启用百度同步 |
-| `quark_cookie` | `[待补充]` | 夸克网盘登录 Cookie |
-| `quark_remote_path` | `/VAULT/vault.db` | 夸克网盘存储路径 |
-| `quark_sync_enabled` | `false` | 是否启用夸克同步 |
+| `baidu_sync_interval` | `300` | 自动同步间隔（秒） |
+| `baidu_cookie_expires_at` | `0` | Cookie 过期时间戳 |
 
-> 标注 `[待补充]` 的参数请在应用设置页面中填写。详细获取方式见 [CONFIG.md](./CONFIG.md)。
+### 夸克网盘
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `quark_cookie` | 空 | 夸克网盘登录 Cookie（含 HttpOnly） |
+| `quark_remote_path` | `/VAULT/vault.db` | 网盘存储路径 |
+| `quark_sync_enabled` | `false` | 是否启用夸克同步 |
+| `quark_sync_interval` | `300` | 自动同步间隔（秒） |
+| `quark_cookie_expires_at` | `0` | Cookie 过期时间戳 |
+| `quark_last_remote_mtime` | `0` | 上次同步时云端文件 mtime（双向同步用） |
+
+### 通用设置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `auto_lock_minutes` | `30` | 闲置自动锁定时间（配置占位，逻辑待实现） |
+| `clipboard_clear_seconds` | `30` | 复制后剪贴板清空时间（配置占位，逻辑待实现） |
+| `master_password` | 空 | 主密码（可选额外保护） |
+
+---
 
 ## 已知限制
 
-1. **夸克网盘上传**：夸克无官方 API，上传流程复杂，当前仅实现下载。建议优先使用百度网盘同步
-2. **冲突处理**：文件级同步不支持增量合并，多设备同时修改可能冲突。建议同一时间只在一台设备上编辑
-3. **编辑功能**：当前版本仅支持新增和删除，编辑已有密码记录功能待开发
+1. **编辑密码**：后端 `update_password` 命令已实现并注册，前端 UI 仍显示「编辑功能开发中」，待接线
+2. **冲突处理**：文件级同步不支持增量合并，多设备同时修改可能冲突
+3. **百度双向同步**：当前百度仅支持单向上传，未实现 `remote_file_mtime`，不支持下载恢复（夸克已支持）
+4. **自动锁定 / 剪贴板自动清空**：配置项已就绪，定时触发逻辑待实现
+5. **夸克网盘非官方接口**：依赖 Web 端 Cookie，可能随夸克版本更新失效
+
+---
 
 ## 国内网络配置
 
-项目已配置 rsproxy.cn 镜像加速（`src-tauri/.cargo/config.toml`），无需额外设置。
+项目已配置 [rsproxy.cn](https://rsproxy.cn) 镜像加速（`src-tauri/.cargo/config.toml`），无需额外设置。
 
-如果遇到网络问题，可修改镜像配置：
 ```toml
 [source.crates-io]
 replace-with = "rsproxy-sparse"
@@ -181,6 +330,20 @@ replace-with = "rsproxy-sparse"
 registry = "sparse+https://rsproxy.cn/index/"
 ```
 
+如遇网络问题，可修改上述配置切换其他镜像。
+
+---
+
 ## 许可证
 
-私有项目，未公开发布。
+本项目采用 **Password Safer Non-Commercial Public License (PSNCPL) v1.0** —— 允许个人学习、研究、自用与修改，但**禁止任何形式的商业使用**。商业使用需另行书面授权。
+
+完整协议文本见 [LICENSE](./LICENSE)。
+
+> 本协议为自定义草稿，重要场景下请咨询专业法律意见。
+
+---
+
+<p align="center">
+  <sub>Built with Tauri 2 · Rust · Vite · Made for Windows</sub>
+</p>
