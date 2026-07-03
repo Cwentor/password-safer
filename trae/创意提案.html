@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>创意提案 - Password Safer 密码保管箱</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-deep: #F0F6F8;
+  --bg-panel: #FFFFFF;
+  --bg-card: #F7FAFB;
+  --bg-card-hover: #EEF4F6;
+  --accent: #5B9BA8;
+  --accent-light: #7EBBC8;
+  --accent-deep: #2D5F6B;
+  --accent-glow: rgba(91,155,168,0.25);
+  --accent-soft: rgba(91,155,168,0.08);
+  --gradient-primary: linear-gradient(135deg, #6BB8C9 0%, #4A8FA0 100%);
+  --gradient-header: linear-gradient(135deg, #5B9BA8 0%, #7EBBC8 50%, #8FC6D2 100%);
+  --text-primary: #2C3E50;
+  --text-secondary: #5D7483;
+  --text-dim: #8FA3AD;
+  --border: #DCE6EA;
+  --border-light: #EAF1F3;
+  --shadow-card: 0 2px 12px rgba(91, 155, 168, 0.08);
+  --shadow-card-hover: 0 6px 24px rgba(91, 155, 168, 0.12);
+  --shadow-modal: 0 20px 60px rgba(45, 95, 107, 0.2);
+  --radius-md: 10px;
+  --radius-lg: 16px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  background: radial-gradient(ellipse at top left, rgba(126,187,200,0.18) 0%, transparent 55%), var(--bg-deep);
+  color: var(--text-primary);
+  font-family: 'DM Sans', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 15px;
+  line-height: 1.8;
+}
+
+body {
+  padding: 24px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+}
+
+.page {
+  max-width: 960px;
+  width: 100%;
+}
+
+.header {
+  background: var(--gradient-header);
+  color: #fff;
+  padding: 32px 36px;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-modal);
+  margin-bottom: 24px;
+  position: relative;
+  overflow: hidden;
+}
+
+.header::before {
+  content: '';
+  position: absolute;
+  right: -80px;
+  top: -40px;
+  width: 220px;
+  height: 220px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 50%;
+  filter: blur(24px);
+}
+
+.header-inner {
+  position: relative;
+  z-index: 1;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255,255,255,0.18);
+  padding: 6px 16px;
+  border-radius: 999px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  margin-bottom: 16px;
+}
+
+.badge-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 4px rgba(255,255,255,0.25);
+}
+
+.header h1 {
+  font-size: 32px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  text-shadow: 0 2px 12px rgba(45,95,107,0.25);
+}
+
+.header p {
+  font-size: 15px;
+  opacity: 0.9;
+  max-width: 640px;
+}
+
+.section {
+  background: var(--bg-panel);
+  padding: 28px 32px;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  margin-bottom: 18px;
+  border: 1px solid var(--border-light);
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.section:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-card-hover);
+}
+
+.section h2 {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent-deep);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.section h2::before {
+  content: '';
+  width: 4px;
+  height: 22px;
+  background: var(--gradient-primary);
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.section h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 20px 0 10px 0;
+}
+
+.section p {
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.list {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 18px 20px;
+}
+
+.card strong {
+  display: block;
+  font-size: 15px;
+  color: var(--accent-deep);
+  margin-bottom: 6px;
+}
+
+.tags {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-glow);
+}
+
+.footer {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+
+@media (max-width: 640px) {
+  body { padding: 16px; }
+  .header { padding: 24px 20px; }
+  .header h1 { font-size: 24px; }
+  .section { padding: 22px 18px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="header">
+    <div class="header-inner">
+      <div class="badge">
+        <div class="badge-dot"></div>
+        创意提案 · 学习工作
+      </div>
+      <h1>Password Safer — 密码保管箱</h1>
+      <p>本地加密存储 · 云端安全同步 · 扫码一键绑定 · 数据完全自主可控</p>
+    </div>
+  </header>
+
+  <section class="section">
+    <h2>1. 创意名称 + 创意介绍</h2>
+    <div class="list">
+      <div class="card">
+        <strong>想解决什么问题</strong>
+        <p>互联网账号越来越多，大部分人习惯用同一套密码走天下或者在本地备忘录、TXT 文件里明文记录，一旦一个网站数据泄露，所有账号就会连锁遭殃。同时电脑坏了或换新设备时，密码数据迁移非常麻烦，手动备份到网盘又容易忘记。</p>
+      </div>
+      <div class="card">
+        <strong>为什么会想到做这个</strong>
+        <p>自己在日常工作中管理十几个平台账号，每次换设备都要逐个找回密码，体验极差。市面上的主流密码管理器像 1Password、Bitwarden 尽管功能强大，但要么年费不低，要么数据托管在第三方服务器上，心里始终不踏实，所以决定自己做一个纯本地加密、同时支持云同步的私有方案。</p>
+      </div>
+      <div class="card">
+        <strong>大概是什么产品</strong>
+        <p>一款桌面端（Tauri + Rust）本地加密密码保管箱，支持百度网盘 / 夸克网盘扫码一键绑定、自动增量同步，数据完全掌握在用户自己手中。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>2. 目标用户及痛点</h2>
+    <div class="list">
+      <div class="card">
+        <strong>面向哪些用户</strong>
+        <p>日常使用多平台、多设备的普通互联网用户；对数据隐私有一定要求、不想把密码存到第三方云服务器的个人；以及希望有一个轻量免费方案替代付费密码管理器的轻度用户。</p>
+      </div>
+      <div class="card">
+        <strong>在什么场景下使用</strong>
+        <p>日常登录各类网站/App 时快速搜索和复制密码；注册新账号时一键生成高强度随机密码并自动存储；重装系统或更换电脑后，通过网盘扫码一键恢复全部密码数据。</p>
+      </div>
+      <div class="card">
+        <strong>当前痛点</strong>
+        <p>浏览器自带的密码管理器跨浏览器、跨设备体验割裂，且主密码一旦忘记无法找回；使用第三方密码管理工具虽然方便，但数据放在别人服务器上，存在隐私泄露的风险；手动把加密数据库文件复制到网盘的操作繁琐，间隔一长就忘记同步，导致数据遗失。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>3. 价值与意义</h2>
+    <div class="list">
+      <div class="card">
+        <strong>效率提升 + 信息安全</strong>
+        <p>数据库采用 AES-GCM 256 位加密，密钥文件与数据文件分离存储，只有用户自己的设备能解密，从根本上杜绝云端泄密风险。扫码绑定百度网盘或夸克网盘后，系统会在后台按照设定的间隔自动增量同步，无需任何手动操作，一次设置即可长期免维护运行，既大幅提升了密码管理的效率，又把数据主权彻底归还给用户，不依赖任何第三方订阅服务。</p>
+      </div>
+    </div>
+    <div class="tags">
+      <div class="tag">本地加密</div>
+      <div class="tag">云同步</div>
+      <div class="tag">扫码登录</div>
+      <div class="tag">数据自主</div>
+      <div class="tag">桌面 App</div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    VAULT · 密码保管箱 · 创意提案
+  </footer>
+</div>
+</body>
+</html>

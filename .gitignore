@@ -1,0 +1,68 @@
+# ========== Node.js / 前端 ==========
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.pnpm-store/
+
+# ========== Vite 构建产物 ==========
+dist/
+dist-ssr/
+*.local
+
+# ========== Rust / Tauri 构建产物 ==========
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/Cargo.lock.bak
+
+# ========== Tauri 自动生成 ==========
+src-tauri/gen/
+
+# ========== 环境变量与密钥 ==========
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+
+# ========== 应用数据文件（本地运行时生成） ==========
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+vault.db*
+*.uploadmeta
+
+# ========== 日志 ==========
+*.log
+logs/
+
+# ========== IDE / 编辑器 ==========
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ========== 操作系统 ==========
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ========== 临时文件 ==========
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# ========== Trae 工作区（开发辅助文件，不需提交） ==========
+.trae/documents/
+.trae/specs/
