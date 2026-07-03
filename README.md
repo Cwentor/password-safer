@@ -3,7 +3,7 @@
 > 本地优先 · 端到端加密 · 双网盘云同步的 Windows 桌面密码保管箱
 
 ![version](https://img.shields.io/badge/version-v2.0.0-cyan?style=flat-square)
-![license](https://img.shields.io/badge/license-PSNCPL%20v1.0-blue?style=flat-square)
+![license](https://img.shields.io/badge/license-GPL%20v3-blue?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-Windows-success?style=flat-square)
 ![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)
 ![rust](https://img.shields.io/badge/Rust-edition%202021-dea584?style=flat-square)
@@ -161,7 +161,7 @@ password-safer/
 ├── vite.config.js                # Vite 构建配置
 ├── build.ps1                     # 构建脚本
 ├── CONFIG.md                     # 配置参数说明文档
-├── LICENSE                       # PSNCPL v1.0 非商业许可
+├── LICENSE                       # GNU General Public License v3
 ├── README.md                     # 本文档
 └── src-tauri/
     ├── Cargo.toml                # Rust 依赖配置
@@ -336,11 +336,20 @@ registry = "sparse+https://rsproxy.cn/index/"
 
 ## 许可证
 
-本项目采用 **Password Safer Non-Commercial Public License (PSNCPL) v1.0** —— 允许个人学习、研究、自用与修改，但**禁止任何形式的商业使用**。商业使用需另行书面授权。
+本项目采用 **GNU General Public License v3 (GPLv3)** —— 强 copyleft 开源协议，允许自由使用、研究、修改与分发（含商业用途），但**任何衍生作品必须以 GPLv3 协议开源**，且必须提供完整对应源代码。
 
 完整协议文本见 [LICENSE](./LICENSE)。
 
-> 本协议为自定义草稿，重要场景下请咨询专业法律意见。
+### GPLv3 核心义务
+
+- ✅ **可自由使用**：包括商业用途
+- ✅ **可修改**：但修改后的版本必须同样以 GPLv3 开源
+- ✅ **可分发**：无论免费或付费
+- ❗ **衍生作品传染**：任何基于本软件的衍生作品必须采用 GPLv3 或兼容协议
+- ❗ **源代码公开**：分发软件时必须向接收者提供完整对应源代码
+- ❗ **保留版权声明**：不得移除原作者版权声明与协议声明
+
+> 商业使用无需另行授权，但需严格遵守上述义务。如需将本软件整合入闭源商业产品，请联系作者协商商业许可。
 
 ---
 
