@@ -124,7 +124,7 @@ body::after {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: 260px 1fr 360px;
+  grid-template-columns: 260px 1fr;
   grid-template-rows: 56px 1fr;
   height: 100vh;
   gap: 0;
@@ -938,13 +938,46 @@ body::after {
    Detail Panel
    ============================================ */
 
+.detail-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 89;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.detail-backdrop.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 .detail {
   background: var(--bg-panel);
-  border-left: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: -2px 0 12px rgba(91, 155, 168, 0.04);
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  bottom: auto;
+  width: 432px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 160px);
+  z-index: 90;
+  opacity: 0;
+  transform: translate(-50%, 100vh);
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  box-shadow: var(--shadow-modal);
+}
+
+.detail.show {
+  opacity: 1;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
 }
 
 .detail-header {
@@ -963,6 +996,12 @@ body::after {
   letter-spacing: 1.5px;
   color: var(--accent-dark);
   font-weight: 600;
+}
+
+.detail-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .detail-close {
@@ -1262,31 +1301,108 @@ body::after {
   stroke-width: 1.8;
 }
 
-/* Empty Detail */
-.detail-empty {
+/* Inline Edit Fields */
+.field-edit-input {
   flex: 1;
-  display: flex;
-  flex-direction: column;
+  min-width: 0;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.field-edit-input:focus {
+  background: var(--accent-soft);
+  border-radius: 4px;
+}
+
+.field-edit-textarea {
+  width: 100%;
+  padding: 12px 14px;
+  background: #fff;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  min-height: 80px;
+  outline: none;
+  transition: all 0.2s ease;
+  box-sizing: border-box;
+}
+
+.field-edit-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-glow);
+}
+
+.tag-remove {
+  width: 16px;
+  height: 16px;
+  margin-left: 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 40px;
-  text-align: center;
+  border-radius: 50%;
+  transition: all 0.2s ease;
 }
 
-.detail-empty-icon {
-  width: 80px;
-  height: 80px;
-  stroke: var(--text-dim);
-  fill: none;
-  stroke-width: 1;
-  margin-bottom: 20px;
-  opacity: 0.3;
+.tag-remove:hover {
+  background: rgba(224, 107, 107, 0.15);
+  color: #E06B6B;
 }
 
-.detail-empty-text {
-  font-size: 12px;
+.tag-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px dashed var(--border);
+  border-radius: 20px;
+  background: transparent;
   color: var(--text-dim);
-  letter-spacing: 1px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: all 0.2s ease;
+}
+
+.tag-add-btn:hover {
+  border-color: var(--accent-light);
+  color: var(--accent-dark);
+  background: var(--accent-soft);
+}
+
+.tag-new-input {
+  padding: 4px 10px;
+  background: #fff;
+  border: 1px solid var(--accent-light);
+  border-radius: 20px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  outline: none;
+  min-width: 80px;
+}
+
+.detail-action-btn.disabled,
+.detail-action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 /* ============================================
@@ -1927,7 +2043,7 @@ body::after {
 
 @media (max-width: 1024px) {
   .app {
-    grid-template-columns: 220px 1fr 320px;
+    grid-template-columns: 220px 1fr;
   }
 }
 
@@ -1937,8 +2053,12 @@ body::after {
     grid-template-rows: 56px auto 1fr;
   }
 
-  .sidebar, .detail {
+  .sidebar {
     display: none;
+  }
+
+  .detail {
+    max-height: 70vh;
   }
 }
 </style>
@@ -2000,12 +2120,12 @@ body::after {
         <li class="nav-item" data-filter="recent">
           <svg class="nav-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           最近使用
-          <span class="nav-count">5</span>
+          <span class="nav-count" id="countRecent">0</span>
         </li>
         <li class="nav-item" data-filter="weak">
           <svg class="nav-icon" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
           弱密码
-          <span class="nav-count" style="color:#ff4444">2</span>
+          <span class="nav-count" id="countWeak" style="color:#ff4444">0</span>
         </li>
       </ul>
     </div>
@@ -2071,24 +2191,25 @@ body::after {
   </main>
 
   <!-- ========== DETAIL PANEL ========== -->
+  <div class="detail-backdrop" id="detailBackdrop"></div>
   <aside class="detail" id="detailPanel">
     <div class="detail-header">
       <span class="detail-title">密码详情</span>
-      <button class="detail-close" id="detailClose">
-        <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
+      <div class="detail-header-actions">
+        <button class="detail-close" id="saveBtn" style="display:none" title="保存">
+          <svg viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        </button>
+        <button class="detail-close" id="detailClose">
+          <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
     </div>
 
-    <div class="detail-empty" id="detailEmpty">
-      <svg class="detail-empty-icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      <div class="detail-empty-text">选择一个密码查看详情</div>
-    </div>
-
-    <div class="detail-content" id="detailContent" style="display:none">
+    <div class="detail-content" id="detailContent">
       <!-- Detail content injected by JS -->
     </div>
 
-    <div class="detail-actions" id="detailActions" style="display:none">
+    <div class="detail-actions" id="detailActions">
       <button class="detail-action-btn" id="editBtn">
         <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
         编辑
@@ -2106,6 +2227,23 @@ body::after {
 <div class="toast" id="toast">
   <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
   <span id="toastText">已复制到剪贴板</span>
+</div>
+
+<!-- ========== EDIT CONFIRM DIALOG ========== -->
+<div class="modal-overlay" id="editConfirmDialog">
+  <div class="modal" style="width: 360px;">
+    <div class="modal-header">
+      <div class="modal-title">未保存的修改</div>
+    </div>
+    <div class="modal-body" style="padding: 24px;">
+      <p style="margin: 0; font-size: 14px; color: var(--text-secondary);">是否保存修改？</p>
+    </div>
+    <div class="modal-footer" style="padding: 16px 24px; gap: 8px; justify-content: flex-end;">
+      <button class="secondary-btn" id="editConfirmCancel">取消</button>
+      <button class="secondary-btn" id="editConfirmNo" style="color:#ff6666">否</button>
+      <button class="primary-btn" id="editConfirmYes">是</button>
+    </div>
+  </div>
 </div>
 
 <!-- ========== ADD MODAL ========== -->
@@ -2154,7 +2292,7 @@ body::after {
     </div>
     <div class="modal-footer">
       <button class="secondary-btn" id="cancelBtn">取消</button>
-      <button class="primary-btn" id="saveBtn">保存</button>
+      <button class="primary-btn" id="addSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -2441,13 +2579,17 @@ let appConfig = null;
 const passwordList = document.getElementById('passwordList');
 const searchInput = document.getElementById('searchInput');
 const detailPanel = document.getElementById('detailPanel');
-const detailEmpty = document.getElementById('detailEmpty');
 const detailContent = document.getElementById('detailContent');
 const detailActions = document.getElementById('detailActions');
 const toast = document.getElementById('toast');
 const toastText = document.getElementById('toastText');
 const listTitle = document.getElementById('listTitle');
 const listCount = document.getElementById('listCount');
+
+// 内联编辑态
+let editMode = false;
+let editBuffer = null;  // {name, icon, url, username, password, tags, notes}
+let pendingCloseAfterSave = false;  // 确认对话框"是"分支使用
 
 // ========== 初始化 ==========
 
@@ -2584,6 +2726,9 @@ function renderPasswordList() {
     card.addEventListener('click', (e) => {
       if (e.target.closest('.card-action-btn')) return;
       selectPassword(p.id);
+      // 阻止冒泡到 document：selectPassword 内会 renderPasswordList() 重建卡片，
+      // 导致原 e.target 脱离 DOM，document 的外部点击监听会误判为外部点击而关闭卡片
+      e.stopPropagation();
     });
 
     card.querySelector('[data-action="copy"]').addEventListener('click', (e) => {
@@ -2613,15 +2758,21 @@ async function selectPassword(id) {
   selectedId = id;
   renderPasswordList();
   renderDetail(id);
+  detailPanel.classList.add('show');
+  document.getElementById('detailBackdrop').classList.add('show');
 }
 
 function renderDetail(id) {
   const p = passwords.find(x => x.id === id);
   if (!p) return;
 
-  detailEmpty.style.display = 'none';
-  detailContent.style.display = 'block';
-  detailActions.style.display = 'flex';
+  // 进入查看态：重置编辑状态
+  editMode = false;
+  editBuffer = null;
+  const saveBtnEl = document.getElementById('saveBtn');
+  if (saveBtnEl) saveBtnEl.style.display = 'none';
+  const editBtnEl = document.getElementById('editBtn');
+  if (editBtnEl) editBtnEl.classList.remove('disabled');
 
   const strengthLabel = ['极弱', '弱', '中等', '强', '极强'][p.strength - 1] || '未知';
   const strengthClass = p.strength <= 1 ? 'weak' : p.strength <= 2 ? 'medium' : 'active';
@@ -2629,21 +2780,21 @@ function renderDetail(id) {
   detailContent.innerHTML = `
     <div class="detail-info">
       <div class="detail-icon">${p.icon || '🔑'}</div>
-      <div class="detail-name">${p.name}</div>
-      <div class="detail-url">${p.url || '—'}</div>
+      <div class="detail-name">${escapeHtml(p.name)}</div>
+      <div class="detail-url">${escapeHtml(p.url || '—')}</div>
     </div>
 
-    <div class="field-group">
+    <div class="field-group" data-editable="username">
       <div class="field-label">用户名</div>
       <div class="field-value-wrapper">
-        <div class="field-value" id="detailUsername">${p.username || '—'}</div>
+        <div class="field-value" id="detailUsername">${escapeHtml(p.username || '—')}</div>
         <button class="field-btn" onclick="copyField('${escapeQuotes(p.username || '')}', '用户名')" title="复制">
           <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
         </button>
       </div>
     </div>
 
-    <div class="field-group">
+    <div class="field-group" data-editable="password">
       <div class="field-label">密码</div>
       <div class="field-value-wrapper">
         <div class="field-value masked" id="detailPassword">••••••••••</div>
@@ -2660,16 +2811,16 @@ function renderDetail(id) {
       <div class="strength-text">密码强度：${strengthLabel}</div>
     </div>
 
-    <div class="field-group">
+    <div class="field-group" data-editable="tags">
       <div class="field-label">标签</div>
       <div class="detail-tags">
-        ${(p.tags || []).map(t => `<span class="tag-chip active"><span class="tag-dot"></span>${t}</span>`).join('')}
+        ${(p.tags || []).length ? (p.tags || []).map(t => `<span class="tag-chip active"><span class="tag-dot"></span>${escapeHtml(t)}</span>`).join('') : '<span style="font-size:12px;color:var(--text-dim)">无标签</span>'}
       </div>
     </div>
 
-    <div class="field-group">
+    <div class="field-group" data-editable="notes">
       <div class="field-label">备注</div>
-      <div class="notes-box">${p.notes || '无备注'}</div>
+      <div class="notes-box">${escapeHtml(p.notes || '无备注')}</div>
     </div>
 
     <div class="field-group">
@@ -2677,11 +2828,11 @@ function renderDetail(id) {
       <div class="meta-list">
         <div class="meta-item">
           <span class="meta-key">创建时间</span>
-          <span class="meta-value">${p.created || '—'}</span>
+          <span class="meta-value">${escapeHtml(p.created || '—')}</span>
         </div>
         <div class="meta-item">
           <span class="meta-key">最近使用</span>
-          <span class="meta-value">${p.last_used || '—'}</span>
+          <span class="meta-value">${escapeHtml(p.last_used || '—')}</span>
         </div>
         <div class="meta-item">
           <span class="meta-key">存储位置</span>
@@ -2699,9 +2850,23 @@ function escapeQuotes(str) {
   return (str || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
+function escapeHtml(s) {
+  return (s == null ? '' : String(s)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function escapeAttr(s) {
+  return (s == null ? '' : String(s)).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 window.togglePasswordVisibility = function() {
-  const el = document.getElementById('detailPassword');
   window._passwordVisible = !window._passwordVisible;
+  const editEl = document.getElementById('editPassword');
+  if (editEl) {
+    editEl.type = window._passwordVisible ? 'text' : 'password';
+    return;
+  }
+  const el = document.getElementById('detailPassword');
+  if (!el) return;
   if (window._passwordVisible) {
     el.textContent = window._currentPassword;
     el.classList.remove('masked');
@@ -2714,6 +2879,228 @@ window.togglePasswordVisibility = function() {
 window.copyField = function(value, label) {
   copyToClipboard(value, `${label}已复制`);
 };
+
+window.copyInputValue = function(inputId, label) {
+  const el = document.getElementById(inputId);
+  if (el) copyToClipboard(el.value, `${label}已复制`);
+};
+
+// ========== 内联编辑态 ==========
+
+function enterEditMode() {
+  const orig = passwords.find(x => x.id === selectedId);
+  if (!orig) return;
+  editBuffer = {
+    name: orig.name,
+    icon: orig.icon || '🔑',
+    url: orig.url || '',
+    username: orig.username || '',
+    password: orig.password,
+    tags: [...(orig.tags || [])],
+    notes: orig.notes || ''
+  };
+  editMode = true;
+  window._passwordVisible = false;
+
+  const saveBtnEl = document.getElementById('saveBtn');
+  if (saveBtnEl) saveBtnEl.style.display = 'flex';
+  const editBtnEl = document.getElementById('editBtn');
+  if (editBtnEl) editBtnEl.classList.add('disabled');
+
+  detailContent.innerHTML = `
+    <div class="detail-info">
+      <div class="detail-icon">${editBuffer.icon}</div>
+      <input class="field-edit-input" id="editName" value="${escapeAttr(editBuffer.name)}" placeholder="名称 / 网站" style="text-align:center;font-size:18px;font-weight:700;margin-bottom:6px;border-bottom:1px solid var(--border);padding:6px 4px;">
+      <input class="field-edit-input" id="editUrl" value="${escapeAttr(editBuffer.url)}" placeholder="网址（可选）" style="text-align:center;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);">
+    </div>
+
+    <div class="field-group" data-editable="username">
+      <div class="field-label">用户名</div>
+      <div class="field-value-wrapper">
+        <input class="field-edit-input" id="editUsername" value="${escapeAttr(editBuffer.username)}" placeholder="用户名或邮箱">
+        <button class="field-btn" onclick="copyInputValue('editUsername', '用户名')" title="复制">
+          <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="field-group" data-editable="password">
+      <div class="field-label">密码</div>
+      <div class="field-value-wrapper">
+        <input class="field-edit-input" id="editPassword" type="password" value="${escapeAttr(editBuffer.password)}">
+        <button class="field-btn" onclick="togglePasswordVisibility()" title="显示/隐藏">
+          <svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+        <button class="field-btn" onclick="copyInputValue('editPassword', '密码')" title="复制">
+          <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="field-group" data-editable="tags">
+      <div class="field-label">标签</div>
+      <div class="detail-tags" id="editTagsContainer">
+        ${editBuffer.tags.map((t, i) => `<span class="tag-chip active"><span class="tag-dot"></span>${escapeHtml(t)}<button class="tag-remove" data-idx="${i}">×</button></span>`).join('')}
+        <button class="tag-add-btn" id="tagAddBtn">+</button>
+      </div>
+    </div>
+
+    <div class="field-group" data-editable="notes">
+      <div class="field-label">备注</div>
+      <textarea class="field-edit-textarea" id="editNotes" placeholder="备注（可选）">${escapeHtml(editBuffer.notes)}</textarea>
+    </div>
+
+    <div class="field-group">
+      <div class="field-label">元数据</div>
+      <div class="meta-list">
+        <div class="meta-item">
+          <span class="meta-key">创建时间</span>
+          <span class="meta-value">${escapeHtml(orig.created || '—')}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-key">最近使用</span>
+          <span class="meta-value">${escapeHtml(orig.last_used || '—')}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-key">存储位置</span>
+          <span class="meta-value">本地 SQLite</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderEditTags() {
+  const container = document.getElementById('editTagsContainer');
+  if (!container) return;
+  container.innerHTML = `
+    ${editBuffer.tags.map((t, i) => `<span class="tag-chip active"><span class="tag-dot"></span>${escapeHtml(t)}<button class="tag-remove" data-idx="${i}">×</button></span>`).join('')}
+    <button class="tag-add-btn" id="tagAddBtn">+</button>
+  `;
+}
+
+function exitEditMode(refresh) {
+  editMode = false;
+  editBuffer = null;
+  const saveBtnEl = document.getElementById('saveBtn');
+  if (saveBtnEl) saveBtnEl.style.display = 'none';
+  const editBtnEl = document.getElementById('editBtn');
+  if (editBtnEl) editBtnEl.classList.remove('disabled');
+  if (refresh && selectedId != null) renderDetail(selectedId);
+}
+
+function closeDetailCard() {
+  detailPanel.classList.remove('show');
+  document.getElementById('detailBackdrop').classList.remove('show');
+  selectedId = null;
+  editMode = false;
+  editBuffer = null;
+  const saveBtnEl = document.getElementById('saveBtn');
+  if (saveBtnEl) saveBtnEl.style.display = 'none';
+  const editBtnEl = document.getElementById('editBtn');
+  if (editBtnEl) editBtnEl.classList.remove('disabled');
+  renderPasswordList();
+}
+
+function hasUnsavedChanges() {
+  if (!editMode || !editBuffer) return false;
+  const orig = passwords.find(x => x.id === selectedId);
+  if (!orig) return false;
+  const curName = document.getElementById('editName') ? document.getElementById('editName').value : orig.name;
+  const curUrl = document.getElementById('editUrl') ? document.getElementById('editUrl').value : (orig.url || '');
+  const curUsername = document.getElementById('editUsername') ? document.getElementById('editUsername').value : (orig.username || '');
+  const curPassword = document.getElementById('editPassword') ? document.getElementById('editPassword').value : orig.password;
+  const curNotes = document.getElementById('editNotes') ? document.getElementById('editNotes').value : (orig.notes || '');
+  const curTags = editBuffer.tags;
+  const origTags = orig.tags || [];
+  return curName !== orig.name || curUrl !== (orig.url || '') || curUsername !== (orig.username || '') || curPassword !== orig.password || curNotes !== (orig.notes || '') || JSON.stringify(curTags) !== JSON.stringify(origTags);
+}
+
+async function saveChanges() {
+  if (!selectedId) return false;
+  const orig = passwords.find(x => x.id === selectedId);
+  if (!orig) return false;
+  const nameEl = document.getElementById('editName');
+  const urlEl = document.getElementById('editUrl');
+  const usernameEl = document.getElementById('editUsername');
+  const passwordEl = document.getElementById('editPassword');
+  const notesEl = document.getElementById('editNotes');
+  const name = nameEl ? nameEl.value.trim() : orig.name;
+  const url = urlEl ? urlEl.value.trim() : '';
+  const username = usernameEl ? usernameEl.value.trim() : '';
+  const password = passwordEl ? passwordEl.value : '';
+  const notes = notesEl ? notesEl.value.trim() : '';
+  const tags = editBuffer ? [...editBuffer.tags] : [];
+  const icon = orig.icon || '🔑';
+
+  if (!name || !password) {
+    showToast('请填写名称和密码');
+    return false;
+  }
+
+  try {
+    const result = await invoke('update_password', { id: selectedId, data: { name, icon, url, username, password, tags, notes, favorite: orig.favorite } });
+    const idx = passwords.findIndex(x => x.id === selectedId);
+    if (idx >= 0) passwords[idx] = result;
+    renderPasswordList();
+    renderDetail(selectedId);
+    showToast('已保存');
+    return true;
+  } catch (e) {
+    showToast('保存失败: ' + e);
+    return false;
+  }
+}
+
+// 详情内容事件委托：点击可编辑字段进入编辑态、标签删除、标签新增
+detailContent.addEventListener('click', (e) => {
+  // 阻止冒泡到 document：本委托内可能调用 enterEditMode()/renderEditTags() 重建 DOM，
+  // 导致原 e.target 脱离 detailPanel，document 的外部点击监听会误判为外部点击而关闭卡片
+  e.stopPropagation();
+  // 标签删除
+  const removeBtn = e.target.closest('.tag-remove');
+  if (removeBtn && editMode && editBuffer) {
+    const idx = parseInt(removeBtn.getAttribute('data-idx'), 10);
+    if (!isNaN(idx)) {
+      editBuffer.tags.splice(idx, 1);
+      renderEditTags();
+    }
+    return;
+  }
+  // 标签新增
+  const addBtn = e.target.closest('#tagAddBtn');
+  if (addBtn && editMode && editBuffer) {
+    if (document.getElementById('tagNewInput')) return;
+    const input = document.createElement('input');
+    input.className = 'tag-new-input';
+    input.id = 'tagNewInput';
+    input.placeholder = '新标签';
+    addBtn.parentNode.insertBefore(input, addBtn);
+    input.focus();
+    const commit = () => {
+      const val = (input.value || '').trim();
+      if (val && !editBuffer.tags.includes(val)) {
+        editBuffer.tags.push(val);
+      }
+      renderEditTags();
+    };
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+      else if (ev.key === 'Escape') { renderEditTags(); }
+    });
+    input.addEventListener('blur', commit);
+    return;
+  }
+  // 点击可编辑字段（查看态）进入编辑态
+  if (!editMode) {
+    const fieldBtn = e.target.closest('.field-btn');
+    if (fieldBtn) return; // 点击复制/眼睛按钮不进入编辑态
+    const editable = e.target.closest('[data-editable]');
+    if (editable) {
+      enterEditMode();
+    }
+  }
+});
 
 // ========== 剪贴板 ==========
 
@@ -2756,6 +3143,8 @@ async function toggleFavorite(id) {
 function updateCounts() {
   document.getElementById('countAll').textContent = passwords.length;
   document.getElementById('countFav').textContent = passwords.filter(p => p.favorite).length;
+  document.getElementById('countRecent').textContent = passwords.filter(p => p.last_used).length;
+  document.getElementById('countWeak').textContent = passwords.filter(p => p.strength <= 2).length;
 }
 
 // ========== 搜索 ==========
@@ -2809,12 +3198,51 @@ document.querySelectorAll('.filter-tab').forEach(tab => {
 
 // ========== 详情面板关闭 ==========
 
-document.getElementById('detailClose').addEventListener('click', () => {
-  selectedId = null;
-  detailEmpty.style.display = 'flex';
-  detailContent.style.display = 'none';
-  detailActions.style.display = 'none';
-  renderPasswordList();
+function tryCloseDetail() {
+  if (editMode && hasUnsavedChanges()) {
+    document.getElementById('editConfirmDialog').classList.add('show');
+    pendingCloseAfterSave = true;
+  } else {
+    closeDetailCard();
+  }
+}
+
+document.getElementById('detailClose').addEventListener('click', tryCloseDetail);
+
+// 保存按钮（详情头部，编辑态显示）
+document.getElementById('saveBtn').addEventListener('click', () => { saveChanges(); });
+
+// 编辑确认对话框
+document.getElementById('editConfirmYes').addEventListener('click', async () => {
+  document.getElementById('editConfirmDialog').classList.remove('show');
+  const ok = await saveChanges();
+  if (ok) closeDetailCard();
+  pendingCloseAfterSave = false;
+});
+document.getElementById('editConfirmNo').addEventListener('click', () => {
+  document.getElementById('editConfirmDialog').classList.remove('show');
+  pendingCloseAfterSave = false;
+  closeDetailCard();
+});
+document.getElementById('editConfirmCancel').addEventListener('click', () => {
+  document.getElementById('editConfirmDialog').classList.remove('show');
+  pendingCloseAfterSave = false;
+});
+document.getElementById('editConfirmDialog').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) {
+    e.currentTarget.classList.remove('show');
+    pendingCloseAfterSave = false;
+  }
+});
+
+// 点击卡片外部关闭（编辑态有变更时走确认流程）
+document.addEventListener('click', (e) => {
+  if (!detailPanel.classList.contains('show')) return;
+  if (detailPanel.contains(e.target)) return;
+  if (passwordList && passwordList.contains(e.target)) return;
+  const confirmDialog = document.getElementById('editConfirmDialog');
+  if (confirmDialog && confirmDialog.contains(e.target)) return;
+  tryCloseDetail();
 });
 
 // ========== 新建密码弹窗 ==========
@@ -2876,7 +3304,7 @@ document.getElementById('newPassword').addEventListener('input', (e) => {
 });
 
 // 保存新密码
-document.getElementById('saveBtn').addEventListener('click', async () => {
+document.getElementById('addSaveBtn').addEventListener('click', async () => {
   const name = document.getElementById('newName').value.trim();
   const url = document.getElementById('newUrl').value.trim();
   const username = document.getElementById('newUsername').value.trim();
@@ -2923,11 +3351,7 @@ document.getElementById('deleteBtn').addEventListener('click', async () => {
   try {
     await invoke('delete_password', { id: selectedId });
     passwords = passwords.filter(p => p.id !== selectedId);
-    selectedId = null;
-    detailEmpty.style.display = 'flex';
-    detailContent.style.display = 'none';
-    detailActions.style.display = 'none';
-    renderPasswordList();
+    closeDetailCard();
     updateCounts();
     showToast('密码已删除');
   } catch (e) {
@@ -2937,7 +3361,7 @@ document.getElementById('deleteBtn').addEventListener('click', async () => {
 
 // 编辑按钮
 document.getElementById('editBtn').addEventListener('click', () => {
-  showToast('编辑功能开发中...');
+  if (!editMode) enterEditMode();
 });
 
 // ========== 设置弹窗 ==========
@@ -3405,8 +3829,17 @@ document.addEventListener('keydown', (e) => {
     searchInput.focus();
   }
   if (e.key === 'Escape') {
-    if (addModal.classList.contains('show')) closeModal();
-    else if (settingsModal.classList.contains('show')) settingsModal.classList.remove('show');
+    const confirmDlg = document.getElementById('editConfirmDialog');
+    if (confirmDlg && confirmDlg.classList.contains('show')) {
+      confirmDlg.classList.remove('show');
+      pendingCloseAfterSave = false;
+    } else if (addModal.classList.contains('show')) {
+      closeModal();
+    } else if (settingsModal.classList.contains('show')) {
+      settingsModal.classList.remove('show');
+    } else if (detailPanel.classList.contains('show')) {
+      tryCloseDetail();
+    }
   }
 });
 
