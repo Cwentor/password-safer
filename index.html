@@ -2396,7 +2396,7 @@ body::after {
             <div class="sync-actions">
               <button class="secondary-btn" onclick="manualSync('baidu')">立即上传</button>
               <button class="secondary-btn" onclick="manualDownload('baidu')">从云恢复</button>
-              <button class="secondary-btn" onclick="startQrLogin('baidu')">重新扫码</button>
+              <button class="secondary-btn" onclick="openBaiduLogin()">重新扫码</button>
               <button class="secondary-btn" style="color:#e06b6b" onclick="logoutProvider('baidu')">退出登录</button>
             </div>
           </div>
@@ -3500,10 +3500,12 @@ window.toggleSync = async function(provider) {
   const cookie = provider === 'quark' ? appConfig.quark_cookie : appConfig.baidu_cookie;
   const providerName = provider === 'quark' ? '夸克网盘' : '百度网盘';
 
-  // 未绑定 Cookie 时直接唤起扫码登录（夸克走 WebView 方案，百度仍走 QR 弹窗）
+  // 未绑定 Cookie 时直接唤起登录（夸克、百度均走 WebView 方案）
   if (!cookie) {
     if (provider === 'quark') {
       openQuarkLogin();
+    } else if (provider === 'baidu') {
+      openBaiduLogin();
     } else {
       startQrLogin(provider);
     }
@@ -3574,6 +3576,16 @@ async function openQuarkLogin() {
   }
 }
 window.openQuarkLogin = openQuarkLogin;
+
+async function openBaiduLogin() {
+  try {
+    await invoke('open_baidu_login');
+    showToast('正在打开百度登录窗口...');
+  } catch (e) {
+    showToast('打开百度登录窗口失败: ' + e);
+  }
+}
+window.openBaiduLogin = openBaiduLogin;
 
 async function generateQrCode() {
   const imgEl = document.getElementById('qrImage');
@@ -3817,6 +3829,10 @@ function listenSyncEvents() {
     const providerName = p === 'quark' ? '夸克网盘' : '百度网盘';
     const msg = (e.payload && e.payload.message) || '未知错误';
     showToast(providerName + ' 同步出错: ' + msg);
+  });
+  evt.listen('baidu-login-success', () => {
+    reloadConfigAndUI();
+    showToast('百度网盘登录成功');
   });
   evt.listen('quark-login-success', async (e) => {
     const cookie = (typeof e.payload === 'string') ? e.payload : (e.payload && e.payload.cookie) || '';
