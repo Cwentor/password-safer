@@ -2,7 +2,7 @@
 
 > 本地优先 · 端到端加密 · 双网盘云同步的 Windows 桌面密码保管箱
 
-![version](https://img.shields.io/badge/version-v2.0.0-cyan?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.0.1-cyan?style=flat-square)
 ![license](https://img.shields.io/badge/license-GPL%20v3-blue?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-Windows-success?style=flat-square)
 ![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)

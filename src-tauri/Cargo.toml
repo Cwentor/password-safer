@@ -1,6 +1,6 @@
 [package]
 name = "password-safer"
-version = "2.0.0"
+version = "2.0.1"
 description = "本地加密密码保管箱 - 支持 SQLite 存储 + 网盘云同步"
 edition = "2021"
 
