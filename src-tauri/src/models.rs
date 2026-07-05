@@ -58,13 +58,13 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             baidu_cookie: String::new(),
-            baidu_remote_path: "/apps/VAULT/vault.db".to_string(),
+            baidu_remote_path: "/apps/VAULT/vault.json".to_string(),
             baidu_sync_enabled: false,
             baidu_sync_interval: 300,
             baidu_cookie_expires_at: 0,
             baidu_last_sync: String::new(),
             quark_cookie: String::new(),
-            quark_remote_path: "/VAULT/vault.db".to_string(),
+            quark_remote_path: "/VAULT/vault.json".to_string(),
             quark_sync_enabled: false,
             quark_sync_interval: 300,
             quark_cookie_expires_at: 0,

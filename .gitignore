@@ -31,9 +31,7 @@ src-tauri/gen/
 # ========== 应用数据文件（本地运行时生成） ==========
 *.db
 *.db-journal
-*.db-wal
-*.db-shm
-vault.db*
+vault.json*
 *.uploadmeta
 
 # ========== 日志 ==========

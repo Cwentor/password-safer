@@ -49,7 +49,7 @@ impl BaiduProvider {
         Ok(token)
     }
 
-    /// 把 /a/b/vault.db 拆为 目录(/a/b) 与 文件路径（完整）
+    /// 把 /a/b/vault.json 拆为 目录(/a/b) 与 文件路径（完整）
     fn parent_dir(remote_path: &str) -> String {
         let trimmed = remote_path.trim_start_matches('/');
         match trimmed.rfind('/') {

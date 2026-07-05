@@ -1,9 +1,11 @@
 use super::SyncProvider;
 use base64::Engine;
 use md5::Md5;
+use reqwest::cookie::CookieStore;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 const PART_SIZE: usize = 4 * 1024 * 1024;
@@ -39,25 +41,57 @@ struct UploadMeta {
 pub struct QuarkProvider {
     cookie: String,
     client: reqwest::blocking::Client,
+    download_client: reqwest::blocking::Client,
+    /// 下载专用 cookie jar：自动累积 API 响应中的 Set-Cookie
+    /// 模仿 quarkpan httpx Client 的 cookie 管理行为
+    cookie_jar: Arc<reqwest::cookie::Jar>,
 }
 
 impl QuarkProvider {
     pub fn new(cookie: String) -> Self {
         eprintln!("[quark] QuarkProvider::new cookie.length={}, hasPus={}",
             cookie.len(), cookie.contains("__pus="));
+
+        // 创建 cookie jar，将 WebView 登录 cookie 逐个添加到 jar
+        // 模仿 quarkpan httpx Client 的 cookie 累积机制
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let jar_url: reqwest::Url = "https://pan.quark.cn"
+            .parse()
+            .expect("invalid pan.quark.cn url");
+        let cookie_count = cookie
+            .split("; ")
+            .filter(|kv| {
+                let kv = kv.trim();
+                if kv.is_empty() || !kv.contains('=') {
+                    return false;
+                }
+                // 拼接 Set-Cookie 格式字符串，附带 Domain=.quark.cn; Path=/
+                let set_cookie = format!("{}; Domain=.quark.cn; Path=/", kv);
+                jar.add_cookie_str(&set_cookie, &jar_url);
+                true
+            })
+            .count();
+        eprintln!("[quark] cookie_jar 初始化完成，添加了 {} 个 cookie", cookie_count);
+
         QuarkProvider {
             cookie,
             client: reqwest::blocking::Client::builder()
                 .user_agent(UA)
                 .build()
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+            download_client: reqwest::blocking::Client::builder()
+                .user_agent(UA)
+                .redirect(reqwest::redirect::Policy::none())
+                .cookie_provider(jar.clone())
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+            cookie_jar: jar,
         }
     }
 
-    /// 检测本地 vault.db 文件有效性（三重判据）
+    /// 检测本地 vault.json 文件有效性
     /// 1. 文件存在
     /// 2. 文件大小 > 0
-    /// 3. SQLite PRAGMA integrity_check 返回 ok
     pub fn local_vault_valid(local_path: &std::path::Path) -> bool {
         if !local_path.exists() {
             return false;
@@ -66,10 +100,7 @@ impl QuarkProvider {
             Ok(m) => m,
             Err(_) => return false,
         };
-        if metadata.len() == 0 {
-            return false;
-        }
-        crate::db::integrity_check(local_path)
+        metadata.len() > 0
     }
 
     /// 获取上传断点续传 meta 文件路径
@@ -109,6 +140,7 @@ impl QuarkProvider {
 }
 
     /// 下载文件专用的请求头（对齐 quarkpan 的 download_headers）
+    /// 注意：不再设置 cookie 头，由 download_client 的 cookie_provider 自动管理
     fn download_hdr(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
         let add = |h: &mut reqwest::header::HeaderMap, name: &str, val: &str| {
@@ -132,6 +164,7 @@ impl QuarkProvider {
         add(&mut h, "sec-fetch-mode", "cors");
         add(&mut h, "sec-fetch-site", "same-site");
         add(&mut h, "user-agent", "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36");
+        // Cookie 由 cookie_provider(jar) 自动添加，不在此手动设置
         h
     }
 
@@ -242,7 +275,7 @@ impl QuarkProvider {
     /// 在 fid 目录下查找名为 name 的子目录，找不到则创建
     /// 处理 23008 同名冲突：doloading 状态的目录不在 file/sort 列表，
     /// 需要用 file/search 查找卡死的目录并删除后重试
-    /// 不降级到根目录（避免两份 vault.db 导致索引混乱）
+    /// 不降级到根目录（避免两份 vault.json 导致索引混乱）
     fn find_or_create_dir(&self, pdir_fid: &str, name: &str) -> Result<String, String> {
         let resp = self.file_sort(pdir_fid, 1, 200, "file_type:asc,updated_at:desc")?;
         if let Some(list) = resp["data"]["list"].as_array() {
@@ -431,15 +464,17 @@ impl QuarkProvider {
     }
 
     /// 请求文件下载地址，针对错误码 23018 自动重试（最多 2 次）
+    /// 改用 download_client 以便 API 响应中的 Set-Cookie 被 cookie_jar 自动捕获
     fn request_download_url(&self, fid: &str) -> Result<String, String> {
         let url = format!(
             "https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc&sys=win32&ve=2.5.56&ut=&guid=&{}",
             now_quark_query()
         );
         let body = json!({ "fids": [fid] });
+        eprintln!("[quark] request_download_url fid={} (using download_client for cookie capture)", fid);
         for attempt in 0..3u8 {
             let resp: Value = self
-                .client
+                .download_client
                 .post(&url)
                 .headers(self.hdr())
                 .json(&body)
@@ -942,9 +977,10 @@ impl SyncProvider for QuarkProvider {
             .ok_or("云端未找到该文件")?;
 
         let dl_url = self.request_download_url(&fid)?;
+        eprintln!("[quark] download: fid={}, dl_url={}", fid, &dl_url[..dl_url.len().min(120)]);
 
         // 下载前备份本地文件（若存在），用于失败回滚
-        let bak_path = local_path.with_extension("db.bak");
+        let bak_path = local_path.with_extension("json.bak");
         let had_backup = if local_path.exists() {
             std::fs::copy(local_path, &bak_path)
                 .map(|_| true)
@@ -953,24 +989,84 @@ impl SyncProvider for QuarkProvider {
             false
         };
 
-        // 执行下载，失败时回滚
-        let download_result = (|| -> Result<(), String> {
-            let resp = self
-                .client
-                .get(&dl_url)
-                .headers(self.download_hdr())
-                .send()
-                .map_err(|e| format!("下载失败: {}", e))?;
-            if !resp.status().is_success() {
-                return Err(format!("下载失败: HTTP {}", resp.status()));
+        // 单次下载流程：手动跟随重定向，使用 download_client（cookie_provider 自动管理 cookie）
+        // 返回 (是否为 403, 错误信息或 Ok)
+        let perform_download = |dl_url: &str| -> Result<(), (bool, String)> {
+            let mut current_url = dl_url.to_string();
+            for hop in 0..6u8 {
+                let host = reqwest::Url::parse(&current_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                eprintln!("[quark] download hop={} host={} url={}", hop, host, &current_url[..current_url.len().min(100)]);
+                let resp = self
+                    .download_client
+                    .get(&current_url)
+                    .headers(self.download_hdr())
+                    .send()
+                    .map_err(|e| (false, format!("下载失败: {}", e)))?;
+                let status = resp.status();
+                eprintln!("[quark] download hop={} status={} is_redirect={}", hop, status, status.is_redirection());
+                if status.is_redirection() {
+                    if hop >= 5 {
+                        return Err((false, "下载失败: 重定向次数过多".to_string()));
+                    }
+                    let location = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .ok_or_else(|| (false, "下载失败: 重定向缺少 Location 头".to_string()))?;
+                    eprintln!("[quark] download hop={} redirect -> {}", hop, &location[..location.len().min(120)]);
+                    current_url = location.to_string();
+                    continue;
+                }
+                if !status.is_success() {
+                    let is_403 = status.as_u16() == 403;
+                    if is_403 {
+                        let body_preview = resp.text().unwrap_or_default();
+                        let preview: String = body_preview.chars().take(500).collect();
+                        eprintln!("[quark] download hop={} 403 响应体前 500 字符: {}", hop, preview);
+                        // 打印 cookie_jar 中的 cookie 用于诊断
+                        let jar_url: reqwest::Url = "https://pan.quark.cn".parse().unwrap();
+                        let jar_cookies = self.cookie_jar.cookies(&jar_url);
+                        let jar_cookies_str = jar_cookies
+                            .as_ref()
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        eprintln!("[quark] cookie_jar cookies for pan.quark.cn: {}", jar_cookies_str);
+                        return Err((true, format!("下载失败: HTTP {}", status)));
+                    }
+                    return Err((false, format!("下载失败: HTTP {}", status)));
+                }
+                let bytes = resp
+                    .bytes()
+                    .map_err(|e| (false, format!("读取下载内容失败: {}", e)))?;
+                std::fs::write(local_path, &bytes)
+                    .map_err(|e| (false, format!("写入本地文件失败: {}", e)))?;
+                eprintln!("[quark] download hop={} 写入成功, bytes={}", hop, bytes.len());
+                return Ok(());
             }
-            let bytes = resp
-                .bytes()
-                .map_err(|e| format!("读取下载内容失败: {}", e))?;
-            std::fs::write(local_path, &bytes)
-                .map_err(|e| format!("写入本地文件失败: {}", e))?;
-            Ok(())
-        })();
+            Err((false, "下载失败: 重定向次数过多".to_string()))
+        };
+
+        // 执行下载，403 时重新获取 download_url 重试一次
+        let download_result: Result<(), String> = match perform_download(&dl_url) {
+            Ok(()) => Ok(()),
+            Err((is_403, err_msg)) => {
+                if is_403 {
+                    eprintln!("[quark] download 首次 403，重新获取 download_url 重试一次");
+                    match self.request_download_url(&fid) {
+                        Ok(new_url) => match perform_download(&new_url) {
+                            Ok(()) => Ok(()),
+                            Err((_, retry_err)) => Err(retry_err),
+                        },
+                        Err(re_url_err) => Err(format!("重试时获取 download_url 失败: {}", re_url_err)),
+                    }
+                } else {
+                    Err(err_msg)
+                }
+            }
+        };
 
         if download_result.is_err() && had_backup {
             // 下载失败，回滚本地文件

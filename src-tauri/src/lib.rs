@@ -1,4 +1,5 @@
 mod config;
+mod storage;
 mod crypto;
 mod db;
 mod models;
@@ -6,15 +7,15 @@ mod sync;
 
 use models::*;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use sync::auth::{baidu::BaiduAuth, quark::QuarkAuth, QrAuthenticator, QrLoginSession, QrLoginStatus};
 use sync::SyncProvider;
 use tauri::{Emitter, Manager, State};
 
 /// 应用全局状态
 pub struct AppState {
-    pub database: db::Database,
-    pub config_manager: config::ConfigManager,
+    /// JSON 存储实例（每次操作都重新读取文件，无需 close/reopen）
+    pub database: Mutex<storage::json_store::JsonStore>,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
     /// 夸克 Cookie 即将过期提醒是否已发送（避免重复提醒）
@@ -100,76 +101,76 @@ const FULL_HTML_BODY: &str = r#"<!DOCTYPE html>
 /// 获取所有密码
 #[tauri::command]
 fn get_all_passwords(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.get_all()
+    state.database.lock().unwrap().get_all()
 }
 
 /// 搜索密码（名字不完全匹配）
 #[tauri::command]
 fn search_passwords(query: String, state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
     if query.is_empty() {
-        return state.database.get_all();
+        return state.database.lock().unwrap().get_all();
     }
-    state.database.search(&query)
+    state.database.lock().unwrap().search(&query)
 }
 
 /// 按标签筛选
 #[tauri::command]
 fn get_passwords_by_tag(tag: String, state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.get_by_tag(&tag)
+    state.database.lock().unwrap().get_by_tag(&tag)
 }
 
 /// 获取收藏
 #[tauri::command]
 fn get_favorites(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.get_favorites()
+    state.database.lock().unwrap().get_favorites()
 }
 
 /// 获取弱密码
 #[tauri::command]
 fn get_weak_passwords(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.get_weak()
+    state.database.lock().unwrap().get_weak()
 }
 
 /// 新增密码
 #[tauri::command]
 fn add_password(data: PasswordInput, state: State<'_, Arc<AppState>>) -> Result<PasswordDto, String> {
-    state.database.insert(&data)
+    state.database.lock().unwrap().insert(&data)
 }
 
 /// 更新密码
 #[tauri::command]
 fn update_password(id: i64, data: PasswordInput, state: State<'_, Arc<AppState>>) -> Result<PasswordDto, String> {
-    state.database.update(id, &data)
+    state.database.lock().unwrap().update(id, &data)
 }
 
 /// 删除密码
 #[tauri::command]
 fn delete_password(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.delete(id)
+    state.database.lock().unwrap().delete(id)
 }
 
 /// 切换收藏
 #[tauri::command]
 fn toggle_favorite(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.toggle_favorite(id)
+    state.database.lock().unwrap().toggle_favorite(id)
 }
 
 /// 更新最后使用时间
 #[tauri::command]
 fn update_last_used(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.update_last_used(id)
+    state.database.lock().unwrap().update_last_used(id)
 }
 
 /// 获取配置
 #[tauri::command]
 fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
-    Ok(state.config_manager.load())
+    state.database.lock().unwrap().load_config()
 }
 
 /// 保存配置
 #[tauri::command]
 fn save_config(config: AppConfig, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.config_manager.save(&config)
+    state.database.lock().unwrap().save_config(&config)
 }
 
 /// 立即同步（上传或下载）
@@ -178,8 +179,9 @@ async fn sync_now(
     provider: String,
     direction: String,
     state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
 ) -> Result<SyncResult, String> {
-    let config = state.config_manager.load();
+    let config = state.database.lock().unwrap().load_config()?;
     let db_path = state.db_path.clone();
 
     // 取出对应提供者的 Cookie 与远程路径
@@ -243,6 +245,7 @@ async fn sync_now(
     let cookie_for_task = cookie;
     let remote_for_task = remote_path;
     let direction_for_task = direction.clone();
+
     let result = tokio::task::spawn_blocking(move || {
         match provider_for_task.as_str() {
             "baidu" => {
@@ -254,7 +257,7 @@ async fn sync_now(
                 }
             }
             "quark" => {
-                // 本地 vault.db 有效性检测（仅日志，不改变行为）
+                // 本地 vault.json 有效性检测（仅日志，不改变行为）
                 let local_valid = sync::quark::QuarkProvider::local_vault_valid(&db_path);
                 println!("[sync] quark local_vault_valid = {}", local_valid);
                 let p = sync::quark::QuarkProvider::new(cookie_for_task);
@@ -276,13 +279,19 @@ async fn sync_now(
 
     // 同步成功则更新 last_sync
     if result.success {
-        let mut cfg = state.config_manager.load();
+        let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
         match provider.as_str() {
             "baidu" => cfg.baidu_last_sync = now_ts(),
             "quark" => cfg.quark_last_sync = now_ts(),
             _ => {}
         }
-        let _ = state.config_manager.save(&cfg);
+        let _ = state.database.lock().unwrap().save_config(&cfg);
+
+        // 下载成功后通知前端刷新（JSON 文件无需 reopen，下次 load() 自动读取新内容）
+        if direction == "download" {
+            let _ = app.emit("sync://restored", ());
+            eprintln!("[sync] vault.json downloaded, emit sync://restored");
+        }
     }
 
     Ok(result)
@@ -294,7 +303,7 @@ async fn check_sync_connection(
     provider: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    let config = state.config_manager.load();
+    let config = state.database.lock().unwrap().load_config()?;
     let cookie = match provider.as_str() {
         "baidu" => config.baidu_cookie,
         "quark" => config.quark_cookie,
@@ -359,7 +368,7 @@ async fn qr_poll(
             message,
         }),
         QrLoginStatus::Confirmed { cookie, expires_at } => {
-            let mut config = state.config_manager.load();
+            let mut config = state.database.lock().unwrap().load_config()?;
             match provider_key.as_str() {
                 "baidu" => {
                     config.baidu_cookie = cookie;
@@ -373,7 +382,7 @@ async fn qr_poll(
                 }
                 _ => {}
             }
-            state.config_manager.save(&config)?;
+            state.database.lock().unwrap().save_config(&config)?;
             Ok(QrPollResult {
                 status: "confirmed".to_string(),
                 message: format!("{} 登录成功", provider_key),
@@ -655,10 +664,10 @@ async fn open_quark_login(app: tauri::AppHandle) -> Result<(), String> {
 
                 // 复用 save_quark_cookie 的保存逻辑
                 let app_state = app_for_thread.state::<std::sync::Arc<AppState>>();
-                let mut config = app_state.config_manager.load();
+                let mut config = app_state.database.lock().unwrap().load_config().unwrap_or_default();
                 config.quark_cookie = cookie_str.clone();
                 config.quark_cookie_expires_at = chrono::Local::now().timestamp() + 45 * 86400;
-                match app_state.config_manager.save(&config) {
+                match app_state.database.lock().unwrap().save_config(&config) {
                     Ok(_) => eprintln!("[quark-login] config saved successfully (cookies_for_url path)"),
                     Err(e) => eprintln!("[quark-login] config save failed: {}", e),
                 }
@@ -697,10 +706,10 @@ fn save_quark_cookie(
         eprintln!("[quark-login] save_quark_cookie: cookie 缺少 __puus");
         return Err("Cookie 中缺少 __puus，登录未成功".to_string());
     }
-    let mut config = state.config_manager.load();
+    let mut config = state.database.lock().unwrap().load_config()?;
     config.quark_cookie = cookie;
     config.quark_cookie_expires_at = chrono::Local::now().timestamp() + 45 * 86400;
-    state.config_manager.save(&config)?;
+    state.database.lock().unwrap().save_config(&config)?;
     eprintln!("[quark-login] save_quark_cookie: config saved, expires_at={}", config.quark_cookie_expires_at);
     // 重新登录，重置过期提醒标记
     state.quark_cookie_warn_sent.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -839,10 +848,10 @@ async fn open_baidu_login(app: tauri::AppHandle) -> Result<(), String> {
 
                 // 保存到配置
                 let app_state = app_for_thread.state::<std::sync::Arc<AppState>>();
-                let mut config = app_state.config_manager.load();
+                let mut config = app_state.database.lock().unwrap().load_config().unwrap_or_default();
                 config.baidu_cookie = cookie_str.clone();
                 config.baidu_cookie_expires_at = chrono::Local::now().timestamp() + 60 * 86400;
-                match app_state.config_manager.save(&config) {
+                match app_state.database.lock().unwrap().save_config(&config) {
                     Ok(_) => eprintln!("[baidu-login] config saved successfully (cookies_for_url path)"),
                     Err(e) => eprintln!("[baidu-login] config save failed: {}", e),
                 }
@@ -870,7 +879,7 @@ async fn open_baidu_login(app: tauri::AppHandle) -> Result<(), String> {
 /// 退出登录：清空对应提供者的 Cookie 与失效时间，并关闭自动同步
 #[tauri::command]
 fn logout(provider: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let mut config = state.config_manager.load();
+    let mut config = state.database.lock().unwrap().load_config()?;
     match provider.as_str() {
         "baidu" => {
             config.baidu_cookie = String::new();
@@ -884,10 +893,10 @@ fn logout(provider: String, state: State<'_, Arc<AppState>>) -> Result<(), Strin
         }
         _ => return Err("未知的提供者".to_string()),
     }
-    state.config_manager.save(&config)
+    state.database.lock().unwrap().save_config(&config)
 }
 
-/// 从外部 SQLite 文件导入数据（反向转换：SQLite 文件 → 应用数据）
+/// 从外部 JSON 文件导入数据（直接覆盖当前 vault.json）
 #[tauri::command]
 fn import_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<ImportResult, String> {
     let path = PathBuf::from(&file_path);
@@ -899,15 +908,27 @@ fn import_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<Impor
         });
     }
 
-    match state.database.import_from_db_file(&path) {
-        Ok(count) => Ok(ImportResult {
-            success: true,
-            message: format!("成功导入 {} 条密码记录", count),
-            imported_count: count,
-        }),
+    // 简化方案：直接复制外部 JSON 文件覆盖当前 vault.json
+    // 注意：这会替换当前所有数据，外部文件必须是本应用导出的 vault.json 格式
+    match std::fs::copy(&path, &state.db_path) {
+        Ok(_) => {
+            // 验证复制后的文件可解密
+            match state.database.lock().unwrap().load() {
+                Ok(data) => Ok(ImportResult {
+                    success: true,
+                    message: format!("成功导入，共 {} 条密码记录", data.passwords.len()),
+                    imported_count: data.passwords.len(),
+                }),
+                Err(e) => Ok(ImportResult {
+                    success: false,
+                    message: format!("导入后验证失败（文件可能已损坏或不是本应用导出）: {}", e),
+                    imported_count: 0,
+                }),
+            }
+        }
         Err(e) => Ok(ImportResult {
             success: false,
-            message: e,
+            message: format!("复制文件失败: {}", e),
             imported_count: 0,
         }),
     }
@@ -933,7 +954,7 @@ fn get_db_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, Str
     let size = std::fs::metadata(&state.db_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let count = state.database.get_all().map(|v| v.len()).unwrap_or(0);
+    let count = state.database.lock().unwrap().get_all().map(|v| v.len()).unwrap_or(0);
     Ok(serde_json::json!({
         "path": state.db_path.to_string_lossy(),
         "size": size,
@@ -966,22 +987,22 @@ fn handle_sync_result(
 
     match inner {
         Ok(()) => {
-            let mut cfg = state.config_manager.load();
+            let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
             match provider {
                 "baidu" => cfg.baidu_last_sync = now_ts(),
                 "quark" => cfg.quark_last_sync = now_ts(),
                 _ => {}
             }
-            let _ = state.config_manager.save(&cfg);
+            let _ = state.database.lock().unwrap().save_config(&cfg);
         }
         Err(msg) if msg == "cookie_expired" => {
-            let mut cfg = state.config_manager.load();
+            let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
             match provider {
                 "baidu" => cfg.baidu_sync_enabled = false,
                 "quark" => cfg.quark_sync_enabled = false,
                 _ => {}
             }
-            let _ = state.config_manager.save(&cfg);
+            let _ = state.database.lock().unwrap().save_config(&cfg);
             let _ = app.emit(
                 "sync://expired",
                 serde_json::json!({
@@ -1003,7 +1024,7 @@ fn handle_sync_result(
 fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let config = state.config_manager.load();
+            let config = state.database.lock().unwrap().load_config().unwrap_or_default();
 
             // 百度网盘同步
             if config.baidu_sync_enabled && !config.baidu_cookie.is_empty() {
@@ -1064,19 +1085,19 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
                     Ok(true) => {
                         let provider = sync::quark::QuarkProvider::new(cookie);
 
-                        // 1. 检测本地 vault.db 有效性
+                        // 1. 检测本地 vault.json 有效性
                         let local_valid = sync::quark::QuarkProvider::local_vault_valid(&db_path);
 
                         if !local_valid {
                             // 2. 本地无效 → 查云端是否有文件
                             match provider.remote_file_mtime(&remote) {
                                 Ok(Some(remote_mtime)) => {
-                                    // 云端有文件 → 下载
+                                    // 云端有文件 → 下载（JSON 文件无需 close/reopen）
                                     provider.download(&remote, &db_path)?;
                                     // 下载成功，记录云端 mtime
-                                    let mut cfg = st_inner.config_manager.load();
+                                    let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
                                     cfg.quark_last_remote_mtime = remote_mtime;
-                                    let _ = st_inner.config_manager.save(&cfg);
+                                    let _ = st_inner.database.lock().unwrap().save_config(&cfg);
                                     Ok(())
                                 }
                                 Ok(None) => {
@@ -1095,9 +1116,9 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
                                     // 上传成功后查询云端 mtime
                                     let remote_mtime = provider.remote_file_mtime(&remote)
                                         .ok().flatten().unwrap_or(0);
-                                    let mut cfg = st_inner.config_manager.load();
+                                    let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
                                     cfg.quark_last_remote_mtime = remote_mtime;
-                                    let _ = st_inner.config_manager.save(&cfg);
+                                    let _ = st_inner.database.lock().unwrap().save_config(&cfg);
                                     Ok(())
                                 }
                                 Ok(Some(remote_mtime)) => {
@@ -1112,23 +1133,23 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
                                     if local_mtime > remote_mtime {
                                         // 本地更新 → 上传
                                         provider.upload(&db_path, &remote)?;
-                                        let mut cfg = st_inner.config_manager.load();
+                                        let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
                                         cfg.quark_last_remote_mtime = local_mtime;
-                                        let _ = st_inner.config_manager.save(&cfg);
+                                        let _ = st_inner.database.lock().unwrap().save_config(&cfg);
                                         Ok(())
                                     } else if local_mtime < remote_mtime {
-                                        // 云端更新 → 下载
+                                        // 云端更新 → 下载（JSON 文件无需 close/reopen）
                                         provider.download(&remote, &db_path)?;
-                                        let mut cfg = st_inner.config_manager.load();
+                                        let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
                                         cfg.quark_last_remote_mtime = remote_mtime;
-                                        let _ = st_inner.config_manager.save(&cfg);
+                                        let _ = st_inner.database.lock().unwrap().save_config(&cfg);
                                         Ok(())
                                     } else {
                                         // 时间戳相等 → 跳过
                                         println!("[sync] quark: 本地与云端时间戳一致，跳过同步");
-                                        let mut cfg = st_inner.config_manager.load();
+                                        let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
                                         cfg.quark_last_remote_mtime = remote_mtime;
-                                        let _ = st_inner.config_manager.save(&cfg);
+                                        let _ = st_inner.database.lock().unwrap().save_config(&cfg);
                                         Ok(())
                                     }
                                 }
@@ -1160,26 +1181,136 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
 
 // ========== 应用入口 ==========
 
+/// 数据迁移：如果存在旧 vault.db（SQLite），读取数据并迁移到 vault.json
+/// 迁移完成后将 vault.db 重命名为 vault.db.old（避免重复迁移）
+/// 仅在 vault.json 不存在时执行迁移
+fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Crypto) {
+    let json_path = data_dir.join("vault.json");
+    let db_path = data_dir.join("vault.db");
+    let old_db_path = data_dir.join("vault.db.old");
+
+    // vault.json 已存在，无需迁移
+    if json_path.exists() {
+        return;
+    }
+    // 旧 vault.db 不存在，无需迁移
+    if !db_path.exists() {
+        return;
+    }
+    // vault.db.old 已存在说明之前迁移过，不再重复迁移
+    if old_db_path.exists() {
+        return;
+    }
+
+    eprintln!("[migrate] 检测到旧 vault.db，开始迁移到 vault.json");
+
+    // 打开旧 SQLite 数据库
+    let database = match db::Database::open(&db_path, crypto.clone_key()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[migrate] 打开旧 vault.db 失败: {}，跳过迁移", e);
+            return;
+        }
+    };
+
+    // 读取所有密码记录
+    let passwords = match database.get_all() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[migrate] 读取旧密码数据失败: {}，跳过迁移", e);
+            return;
+        }
+    };
+
+    // 读取旧配置（使用 ConfigManager）
+    let config_manager = match config::ConfigManager::from_db_path(&db_path) {
+        Ok(cm) => cm,
+        Err(e) => {
+            eprintln!("[migrate] 打开旧配置失败: {}，跳过迁移", e);
+            return;
+        }
+    };
+    let config = config_manager.load();
+
+    // 构造 StoreData
+    let mut store_data = storage::json_store::StoreData::default();
+    store_data.config = config;
+    store_data.next_id = passwords.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+
+    for dto in passwords {
+        // 重新加密密码字段（用同一密钥，加密结果不同但解密一致）
+        let password_encrypted = match crypto.encrypt(&dto.password) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[migrate] 加密密码字段失败: {}，跳过该记录", e);
+                continue;
+            }
+        };
+        let record = storage::json_store::PasswordRecord {
+            id: dto.id,
+            name: dto.name,
+            icon: dto.icon,
+            url: dto.url,
+            username: dto.username,
+            password_encrypted,
+            tags: dto.tags,
+            notes: dto.notes,
+            favorite: dto.favorite,
+            strength: dto.strength,
+            created: dto.created,
+            last_used: dto.last_used,
+        };
+        store_data.passwords.push(record);
+    }
+
+    eprintln!("[migrate] 迁移 {} 条密码记录", store_data.passwords.len());
+
+    // 创建 JsonStore 并保存数据
+    let json_store = match storage::json_store::JsonStore::open(json_path.clone(), crypto.clone_key()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[migrate] 创建 vault.json 失败: {}，迁移中止", e);
+            return;
+        }
+    };
+    if let Err(e) = json_store.save(&store_data) {
+        eprintln!("[migrate] 保存 vault.json 失败: {}，迁移中止", e);
+        return;
+    }
+
+    // 迁移成功，将旧 vault.db 重命名为 vault.db.old
+    if let Err(e) = std::fs::rename(&db_path, &old_db_path) {
+        eprintln!("[migrate] 重命名 vault.db 为 vault.db.old 失败: {}（数据已迁移但旧文件未重命名）", e);
+    } else {
+        eprintln!("[migrate] 旧 vault.db 已重命名为 vault.db.old");
+    }
+
+    // 清理 WAL/SHM 残留文件
+    let _ = std::fs::remove_file(data_dir.join("vault.db-wal"));
+    let _ = std::fs::remove_file(data_dir.join("vault.db-shm"));
+
+    eprintln!("[migrate] 迁移完成");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 初始化数据目录
     let data_dir = get_data_dir();
-    let db_path = data_dir.join("vault.db");
+    let db_path = data_dir.join("vault.json");
     let key_path = data_dir.join("master.key");
 
     // 初始化加密器
     let crypto = crypto::Crypto::from_key_file(&key_path).expect("无法初始化加密器");
 
-    // 初始化数据库
-    let database = db::Database::open(&db_path, crypto).expect("无法打开数据库");
+    // 数据迁移：如果存在旧 vault.db（SQLite），迁移数据到 vault.json
+    migrate_from_sqlite_if_needed(&data_dir, &crypto);
 
-    // 初始化配置管理器（使用独立的连接）
-    let config_manager = config::ConfigManager::from_db_path(&db_path)
-        .expect("无法初始化配置管理器");
+    // 初始化 JSON 存储（双重加密：密码字段加密 + 文件整体加密）
+    let database = storage::json_store::JsonStore::open(db_path.clone(), crypto)
+        .expect("无法打开 vault.json");
 
     let state = Arc::new(AppState {
-        database,
-        config_manager,
+        database: Mutex::new(database),
         db_path,
         data_dir,
         quark_cookie_warn_sent: std::sync::atomic::AtomicBool::new(false),
@@ -1210,10 +1341,10 @@ pub fn run() {
             if !cookie.contains("__puus=") {
                 eprintln!("[quark-login] quark-cb: cookie 缺少 __puus，不保存");
             } else {
-                let mut config = app_state.config_manager.load();
+                let mut config = app_state.database.lock().unwrap().load_config().unwrap_or_default();
                 config.quark_cookie = cookie.clone();
                 config.quark_cookie_expires_at = chrono::Local::now().timestamp() + 45 * 86400;
-                match app_state.config_manager.save(&config) {
+                match app_state.database.lock().unwrap().save_config(&config) {
                     Ok(_) => eprintln!("[quark-login] quark-cb: config saved successfully"),
                     Err(e) => eprintln!("[quark-login] quark-cb: config save failed: {}", e),
                 }

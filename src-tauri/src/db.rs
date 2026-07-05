@@ -341,6 +341,79 @@ impl Database {
             last_used: row.get(11)?,
         })
     }
+
+    /// 关闭当前数据库连接，释放文件句柄
+    /// 调用后 `self.conn` 被替换为一个新的内存占位 Connection
+    pub fn close(&mut self) {
+        // 用内存数据库占位替换原 Connection，原 Connection 在此 drop，释放文件句柄
+        if let Ok(mem_conn) = Connection::open_in_memory() {
+            let mut guard = self.conn.lock().unwrap();
+            let _ = std::mem::replace(&mut *guard, mem_conn);
+        }
+    }
+
+    /// 执行 WAL checkpoint，将 WAL 文件中的数据合并到主 db 文件
+    /// 用于上传前确保主 db 文件包含最新数据（WAL 模式下写入先进 -wal 文件）
+    pub fn checkpoint(&self) -> Result<(), String> {
+        let guard = self.conn.lock().map_err(|e| format!("锁失败: {}", e))?;
+        guard
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| format!("checkpoint 失败: {}", e))?;
+        eprintln!("[db] wal_checkpoint TRUNCATE executed");
+        Ok(())
+    }
+
+    /// 重新打开数据库连接
+    /// 用于数据库文件被外部替换后（如从云恢复下载覆盖）重新加载
+    /// 步骤：关闭旧 Connection → 删除 WAL/SHM → 重新 open → 建表
+    pub fn reopen(&mut self, db_path: &Path) -> Result<(), String> {
+        // 1. 关闭旧 Connection（释放文件句柄）
+        self.close();
+
+        // 2. 删除残留的 WAL 和 SHM 文件（避免旧 WAL 污染新数据库）
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&shm_path);
+
+        // 3. 重新打开数据库
+        let conn = Connection::open(db_path)
+            .map_err(|e| format!("重新打开数据库失败: {}", e))?;
+
+        // 4. 启用 WAL 模式和 foreign_keys
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .map_err(|e| format!("设置数据库参数失败: {}", e))?;
+
+        // 5. 创建表（若不存在）
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS passwords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                icon TEXT DEFAULT '🔑',
+                url TEXT DEFAULT '',
+                username TEXT DEFAULT '',
+                password_encrypted TEXT NOT NULL,
+                tags TEXT DEFAULT '[]',
+                notes TEXT DEFAULT '',
+                favorite INTEGER DEFAULT 0,
+                strength INTEGER DEFAULT 0,
+                created TEXT DEFAULT '',
+                last_used TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS app_config (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_passwords_name ON passwords(name);
+            CREATE INDEX IF NOT EXISTS idx_passwords_favorite ON passwords(favorite);",
+        )
+        .map_err(|e| format!("创建表失败: {}", e))?;
+
+        // 6. 替换为新 Connection（crypto 保持不变）
+        let mut guard = self.conn.lock().unwrap();
+        let _ = std::mem::replace(&mut *guard, conn);
+        Ok(())
+    }
 }
 
 fn ext_connection_check(conn: &Connection) -> Result<(), String> {

@@ -2418,12 +2418,12 @@ body::after {
         <div class="storage-card">
           <div class="storage-card-header">
             <span>SQLite 数据库</span>
-            <span class="mono" style="color:var(--accent)">vault.db</span>
+            <span class="mono" style="color:var(--accent)">vault.json</span>
           </div>
           <div class="storage-card-body">
             <div class="detail-row">
               <span class="detail-key">数据库路径</span>
-              <span class="detail-val mono">./data/vault.db</span>
+              <span class="detail-val mono">./data/vault.json</span>
             </div>
             <div class="detail-row">
               <span class="detail-key">当前大小</span>
@@ -2619,10 +2619,10 @@ async function loadConfig() {
     appConfig = await invoke('get_config');
   } catch (e) {
     appConfig = {
-      baidu_cookie: '', baidu_remote_path: '/apps/VAULT/vault.db',
+      baidu_cookie: '', baidu_remote_path: '/apps/VAULT/vault.json',
       baidu_sync_enabled: false, baidu_sync_interval: 300,
       baidu_cookie_expires_at: 0, baidu_last_sync: '',
-      quark_cookie: '', quark_remote_path: '/VAULT/vault.db',
+      quark_cookie: '', quark_remote_path: '/VAULT/vault.json',
       quark_sync_enabled: false, quark_sync_interval: 300,
       quark_cookie_expires_at: 0, quark_last_sync: '',
       auto_lock_minutes: 30, clipboard_clear_seconds: 30, master_password: ''
@@ -3830,6 +3830,17 @@ function listenSyncEvents() {
     const msg = (e.payload && e.payload.message) || '未知错误';
     showToast(providerName + ' 同步出错: ' + msg);
   });
+  evt.listen('sync://restored', async () => {
+    // 从云恢复完成，数据库已重新打开，刷新前端列表
+    try {
+      await loadPasswords();
+      updateCounts();
+      renderTagsCloud();
+      updateStorageInfo();
+    } catch (e) {
+      console.error('restored refresh failed:', e);
+    }
+  });
   evt.listen('baidu-login-success', () => {
     reloadConfigAndUI();
     showToast('百度网盘登录成功');
@@ -3857,7 +3868,7 @@ document.addEventListener('click', async (e) => {
   if (!btn) return;
   const text = btn.textContent.trim();
   if (text === '导出数据库') {
-    const path = prompt('请输入导出文件路径：', 'vault_export.db');
+    const path = prompt('请输入导出文件路径：', 'vault_export.json');
     if (path) {
       try {
         await invoke('export_db', { filePath: path });
@@ -3867,7 +3878,7 @@ document.addEventListener('click', async (e) => {
       }
     }
   } else if (text === '导入数据') {
-    const path = prompt('请输入要导入的数据库文件路径：', 'vault_import.db');
+    const path = prompt('请输入要导入的数据库文件路径：', 'vault_import.json');
     if (path) {
       try {
         const result = await invoke('import_db', { filePath: path });

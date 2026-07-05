@@ -69,6 +69,11 @@ impl Crypto {
 
         String::from_utf8(plaintext).map_err(|e| format!("UTF-8 解码失败: {}", e))
     }
+
+    /// 克隆密钥（用于数据迁移时多个存储实例共享同一密钥）
+    pub fn clone_key(&self) -> Self {
+        Crypto { key: self.key }
+    }
 }
 
 /// 生成随机密码

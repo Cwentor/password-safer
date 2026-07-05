@@ -54,7 +54,7 @@ impl ConfigManager {
             baidu_cookie: self.get("baidu_cookie").unwrap_or_default(),
             baidu_remote_path: self
                 .get("baidu_remote_path")
-                .unwrap_or_else(|| "/apps/VAULT/vault.db".to_string()),
+                .unwrap_or_else(|| "/apps/VAULT/vault.json".to_string()),
             baidu_sync_enabled: self
                 .get("baidu_sync_enabled")
                 .map(|v| v == "true")
@@ -71,7 +71,7 @@ impl ConfigManager {
             quark_cookie: self.get("quark_cookie").unwrap_or_default(),
             quark_remote_path: self
                 .get("quark_remote_path")
-                .unwrap_or_else(|| "/VAULT/vault.db".to_string()),
+                .unwrap_or_else(|| "/VAULT/vault.json".to_string()),
             quark_sync_enabled: self
                 .get("quark_sync_enabled")
                 .map(|v| v == "true")
