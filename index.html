@@ -124,7 +124,7 @@ body::after {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: 208px 1fr;
   grid-template-rows: 56px 1fr;
   height: 100vh;
   gap: 0;
@@ -543,6 +543,9 @@ body::after {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  margin: 12px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-light);
 }
 
 /* Search Bar */
@@ -889,7 +892,25 @@ body::after {
 }
 
 .card-favorite.active {
-  color: var(--warning);
+  color: #FFC107;
+}
+
+.card-favorite.active svg {
+  fill: #FFC107;
+}
+
+/* 已收藏：星标常驻显示 */
+.card-actions:has(.card-favorite.active) {
+  opacity: 1;
+}
+
+.card-actions:has(.card-favorite.active) .card-action-btn:not(.card-favorite.active) {
+  opacity: 0;
+}
+
+/* hover 时所有按钮显示 */
+.password-card:hover .card-actions .card-action-btn {
+  opacity: 1;
 }
 
 /* Search Highlight */
@@ -1514,6 +1535,41 @@ body::after {
   left: 22px;
 }
 
+.sync-chevron {
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.sync-chevron:hover {
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+}
+
+.sync-chevron svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.25s ease;
+}
+
+.sync-chevron.expanded svg {
+  transform: rotate(180deg);
+}
+
 /* ============================================
    Toast / Copy Feedback
    ============================================ */
@@ -2043,7 +2099,7 @@ body::after {
 
 @media (max-width: 1024px) {
   .app {
-    grid-template-columns: 220px 1fr;
+    grid-template-columns: 176px 1fr;
   }
 }
 
@@ -2326,6 +2382,9 @@ body::after {
             <div class="sync-toggle" id="quarkToggle" onclick="toggleSync('quark')">
               <div class="sync-toggle-knob"></div>
             </div>
+            <button class="sync-chevron" id="quarkChevron" onclick="toggleProviderDetail('quark')" title="展开/收起">
+              <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
           </div>
 
           <div class="sync-provider-detail" id="quarkDetail" style="display:none">
@@ -2369,6 +2428,9 @@ body::after {
             <div class="sync-toggle" id="baiduToggle" onclick="toggleSync('baidu')">
               <div class="sync-toggle-knob"></div>
             </div>
+            <button class="sync-chevron" id="baiduChevron" onclick="toggleProviderDetail('baidu')" title="展开/收起">
+              <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
           </div>
 
           <div class="sync-provider-detail" id="baiduDetail" style="display:none">
@@ -2402,10 +2464,6 @@ body::after {
           </div>
         </div>
 
-        <div class="settings-hint">
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-          数据库文件采用 AES-256 加密后上传，网盘服务商无法读取你的密码内容。
-        </div>
       </div>
 
       <!-- Storage Tab -->
@@ -2817,24 +2875,6 @@ function renderDetail(id) {
       <div class="field-label">备注</div>
       <div class="notes-box">${escapeHtml(p.notes || '无备注')}</div>
     </div>
-
-    <div class="field-group">
-      <div class="field-label">元数据</div>
-      <div class="meta-list">
-        <div class="meta-item">
-          <span class="meta-key">创建时间</span>
-          <span class="meta-value">${escapeHtml(p.created || '—')}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-key">最近使用</span>
-          <span class="meta-value">${escapeHtml(p.last_used || '—')}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-key">存储位置</span>
-          <span class="meta-value">本地 SQLite</span>
-        </div>
-      </div>
-    </div>
   `;
 
   window._currentPassword = p.password;
@@ -2943,24 +2983,6 @@ function enterEditMode() {
     <div class="field-group" data-editable="notes">
       <div class="field-label">备注</div>
       <textarea class="field-edit-textarea" id="editNotes" placeholder="备注（可选）">${escapeHtml(editBuffer.notes)}</textarea>
-    </div>
-
-    <div class="field-group">
-      <div class="field-label">元数据</div>
-      <div class="meta-list">
-        <div class="meta-item">
-          <span class="meta-key">创建时间</span>
-          <span class="meta-value">${escapeHtml(orig.created || '—')}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-key">最近使用</span>
-          <span class="meta-value">${escapeHtml(orig.last_used || '—')}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-key">存储位置</span>
-          <span class="meta-value">本地 SQLite</span>
-        </div>
-      </div>
     </div>
   `;
 }
@@ -3441,12 +3463,15 @@ function updateProviderUI(provider) {
   const statusEl = document.getElementById(provider + 'Status');
   const toggleEl = document.getElementById(provider + 'Toggle');
   const detailEl = document.getElementById(provider + 'Detail');
+  const chevronEl = document.getElementById(provider + 'Chevron');
+  // 箭头始终显示，仅当已绑定且有详情时才联动详情显隐
+  const showDetail = cookie && providerDetailExpanded[provider];
+  if (detailEl) detailEl.style.display = showDetail ? 'block' : 'none';
+  if (chevronEl) chevronEl.classList.toggle('expanded', providerDetailExpanded[provider]);
   if (!cookie) {
     if (statusEl) { statusEl.textContent = '未绑定 · 点击扫码'; statusEl.classList.remove('connected'); }
     if (toggleEl) toggleEl.classList.remove('active');
-    if (detailEl) detailEl.style.display = 'none';
   } else {
-    if (detailEl) detailEl.style.display = 'block';
     if (enabled) {
       if (statusEl) { statusEl.textContent = '已绑定 · 自动同步中'; statusEl.classList.add('connected'); }
       if (toggleEl) toggleEl.classList.add('active');
@@ -3456,6 +3481,17 @@ function updateProviderUI(provider) {
     }
   }
 }
+
+const providerDetailExpanded = { quark: false, baidu: false };
+
+window.toggleProviderDetail = function(provider) {
+  providerDetailExpanded[provider] = !providerDetailExpanded[provider];
+  const cookie = provider === 'quark' ? appConfig.quark_cookie : appConfig.baidu_cookie;
+  const detailEl = document.getElementById(provider + 'Detail');
+  const chevronEl = document.getElementById(provider + 'Chevron');
+  if (chevronEl) chevronEl.classList.toggle('expanded', providerDetailExpanded[provider]);
+  if (detailEl) detailEl.style.display = (cookie && providerDetailExpanded[provider]) ? 'block' : 'none';
+};
 
 function formatExpires(ts) {
   if (!ts) return '—';
