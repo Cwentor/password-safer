@@ -1,4 +1,5 @@
 use super::SyncProvider;
+use base64::Engine;
 use md5::Md5;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -14,14 +15,24 @@ struct UploadMeta {
     pub sha1: String,
     /// 上传任务 ID
     pub task_id: String,
-    /// 目标对象 fid
-    pub obj_fid: String,
+    /// OSS 对象 key
+    pub obj_key: String,
+    /// OSS 鉴权信息（来自 pre 响应）
+    pub auth_info: String,
+    /// OSS MultipartUpload ID
+    pub upload_id: String,
+    /// OSS bucket
+    pub bucket: String,
+    /// OSS 回调信息（来自 pre 响应）
+    pub callback: serde_json::Value,
     /// 父目录 fid
     pub parent_fid: String,
     /// 文件名
     pub fname: String,
     /// 已完成分片索引列表
     pub completed_parts: Vec<usize>,
+    /// 已完成分片的 ETag 列表（与 completed_parts 一一对应）
+    pub etags: Vec<String>,
 }
 
 /// 夸克网盘同步提供者（基于 Cookie 走 drive-pc.quark.cn，非官方）
@@ -429,6 +440,125 @@ impl QuarkProvider {
         }
         Err("下载地址请求重试次数耗尽".to_string())
     }
+
+    /// 计算 SHA1 中间状态（处理完整 64 字节块，不进行最终填充）
+    /// 参考 quarkpan 的 calculate_sha1_incremental_state
+    fn calc_sha1_incremental_state(data: &[u8]) -> (u32, u32, u32, u32, u32) {
+        let mut h0: u32 = 0x67452301;
+        let mut h1: u32 = 0xEFCDAB89;
+        let mut h2: u32 = 0x98BADCFE;
+        let mut h3: u32 = 0x10325476;
+        let mut h4: u32 = 0xC3D2E1F0;
+
+        let data_len = data.len();
+        let full_blocks = data_len - (data_len % 64);
+        for i in (0..full_blocks).step_by(64) {
+            let block = &data[i..i + 64];
+            let mut w: [u32; 80] = [0; 80];
+            for j in 0..16 {
+                w[j] = u32::from_be_bytes([
+                    block[j * 4],
+                    block[j * 4 + 1],
+                    block[j * 4 + 2],
+                    block[j * 4 + 3],
+                ]);
+            }
+            for t in 16..80 {
+                let v = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+                w[t] = (v << 1) | (v >> 31);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+            for t in 0..80 {
+                let (f, k): (u32, u32) = if t < 20 {
+                    ((b & c) | ((!b) & d), 0x5A827999)
+                } else if t < 40 {
+                    (b ^ c ^ d, 0x6ED9EBA1)
+                } else if t < 60 {
+                    ((b & c) | (b & d) | (c & d), 0x8F1BBCDC)
+                } else {
+                    (b ^ c ^ d, 0xCA62C1D6)
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(w[t]);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h0 = h0.wrapping_add(a);
+            h1 = h1.wrapping_add(b);
+            h2 = h2.wrapping_add(c);
+            h3 = h3.wrapping_add(d);
+            h4 = h4.wrapping_add(e);
+        }
+        (h0, h1, h2, h3, h4)
+    }
+
+    /// 构造增量哈希上下文 base64 字符串（分片 2+ 必需）
+    fn build_hash_ctx_b64(file_data: &[u8], part_number: usize) -> String {
+        let processed_bytes = (part_number - 1) * PART_SIZE;
+        let processed_bits = (processed_bytes as u64) * 8;
+        let previous_data = &file_data[..processed_bytes.min(file_data.len())];
+        let (h0, h1, h2, h3, h4) = Self::calc_sha1_incremental_state(previous_data);
+        let ctx = json!({
+            "hash_type": "sha1",
+            "h0": h0.to_string(),
+            "h1": h1.to_string(),
+            "h2": h2.to_string(),
+            "h3": h3.to_string(),
+            "h4": h4.to_string(),
+            "Nl": processed_bits.to_string(),
+            "Nh": "0",
+            "data": "",
+            "num": "0"
+        });
+        let json_str = serde_json::to_string(&ctx).unwrap_or_default();
+        base64::engine::general_purpose::STANDARD.encode(json_str.as_bytes())
+    }
+
+    /// 构造分片上传的 auth_meta（OSS StringToSign）
+    fn build_part_auth_meta(
+        mime: &str,
+        oss_date: &str,
+        bucket: &str,
+        obj_key: &str,
+        part_number: usize,
+        upload_id: &str,
+        hash_ctx: Option<&str>,
+    ) -> String {
+        let hash_line = match hash_ctx {
+            Some(h) => format!("x-oss-hash-ctx:{}\n", h),
+            None => String::new(),
+        };
+        format!(
+            "PUT\n\n{mime}\n{date}\nx-oss-date:{date}\n{hash}x-oss-user-agent:aliyun-sdk-js/1.0.0 Chrome Mobile 139.0.0.0 on Google Nexus 5 (Android 6.0)\n/{bucket}/{obj_key}?partNumber={pn}&uploadId={uid}",
+            mime = mime,
+            date = oss_date,
+            hash = hash_line,
+            bucket = bucket,
+            obj_key = obj_key,
+            pn = part_number,
+            uid = upload_id
+        )
+    }
+
+    /// 构造 CompleteMultipartUpload XML body
+    fn build_commit_xml(etags: &[(usize, String)]) -> String {
+        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUpload>\n");
+        for (part_number, etag) in etags {
+            xml.push_str(&format!(
+                "<Part>\n<PartNumber>{}</PartNumber>\n<ETag>\"{}\"</ETag>\n</Part>\n",
+                part_number, etag
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        xml
+    }
 }
 
 impl SyncProvider for QuarkProvider {
@@ -496,14 +626,22 @@ impl SyncProvider for QuarkProvider {
             None
         };
 
-        // 若无 meta，走完整预上传流程（新 API）
-        let (task_id, obj_fid) = if let Some(ref m) = meta {
-            (m.task_id.clone(), m.obj_fid.clone())
+        // 若无 meta，走完整预上传流程（OSS MultipartUpload 协议）
+        let (task_id, obj_key, auth_info, upload_id, bucket, callback) = if let Some(ref m) = meta {
+            (
+                m.task_id.clone(),
+                m.obj_key.clone(),
+                m.auth_info.clone(),
+                m.upload_id.clone(),
+                m.bucket.clone(),
+                m.callback.clone(),
+            )
         } else {
             let now_ts = chrono::Local::now().timestamp_millis();
-            // 预上传（新 API：不传 hash，只传基础信息）
+            // 预上传（不传 hash，只传基础信息）
             let pre_body = json!({
                 "ccp_hash_update": true,
+                "parallel_upload": true,
                 "dir_name": "",
                 "file_name": fname,
                 "format_type": mime_type,
@@ -537,12 +675,29 @@ impl SyncProvider for QuarkProvider {
                 return Ok(());
             }
 
-            let ofid = pre["data"]["obj"]["fid"]
+            // 提取 OSS 上传上下文
+            let obj_key = pre["data"]["obj_key"]
                 .as_str()
-                .or_else(|| pre["data"]["fid"].as_str())
-                .unwrap_or("")
+                .ok_or_else(|| {
+                    format!(
+                        "未获取到 obj_key, pre response: {}",
+                        serde_json::to_string(&pre)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(500)
+                            .collect::<String>()
+                    )
+                })?
                 .to_string();
-            (tid, ofid)
+            let auth_info = pre["data"]["auth_info"].as_str().unwrap_or("").to_string();
+            let upload_id = pre["data"]["upload_id"].as_str().unwrap_or("").to_string();
+            let bucket = pre["data"]["bucket"].as_str().unwrap_or("ul-zb").to_string();
+            let callback = pre["data"]["callback"].clone();
+            eprintln!(
+                "[quark] pre parsed: task_id={}, obj_key={}, bucket={}, upload_id={}, auth_info.len={}, callback={}",
+                tid, obj_key, bucket, upload_id, auth_info.len(), callback.is_object()
+            );
+            (tid, obj_key, auth_info, upload_id, bucket, callback)
         };
 
         // 创建/更新 meta
@@ -550,10 +705,15 @@ impl SyncProvider for QuarkProvider {
             meta = Some(UploadMeta {
                 sha1: full_sha1.clone(),
                 task_id: task_id.clone(),
-                obj_fid: obj_fid.clone(),
+                obj_key: obj_key.clone(),
+                auth_info: auth_info.clone(),
+                upload_id: upload_id.clone(),
+                bucket: bucket.clone(),
+                callback: callback.clone(),
                 parent_fid: parent_fid.clone(),
                 fname: fname.clone(),
                 completed_parts: Vec::new(),
+                etags: Vec::new(),
             });
             // 立即写入 meta（记录 task_id，便于断点恢复）
             if let Some(ref m) = meta {
@@ -561,83 +721,187 @@ impl SyncProvider for QuarkProvider {
             }
         }
 
-        // 计算分片
-        let mut parts: Vec<(i64, String)> = Vec::new();
-        let mut offset = 0i64;
-        for chunk in data.chunks(PART_SIZE) {
-            let mut h = Sha1::new();
-            h.update(chunk);
-            parts.push((offset, hex::encode(h.finalize())));
-            offset += chunk.len() as i64;
-        }
-
-        // 获取上传地址（auth）
-        // 克隆已完成分片快照，避免与后续对 meta 的可变借用冲突
+        // 分片上传（OSS MultipartUpload 协议）
         let done_parts: Vec<usize> = meta.as_ref().unwrap().completed_parts.clone();
-        let mut part_offs: Vec<Value> = Vec::new();
-        for (i, (off, hash)) in parts.iter().enumerate() {
+        let total_parts = (data.len() + PART_SIZE - 1) / PART_SIZE;
+
+        for i in 0..total_parts {
+            let part_number = i + 1;
+
             // 跳过已完成分片
             if done_parts.contains(&i) {
                 continue;
             }
-            part_offs.push(json!({ "part_offset": off, "part_size": PART_SIZE as i64, "part_sha1": hash }));
-        }
 
-        if !part_offs.is_empty() {
+            let chunk_start = i * PART_SIZE;
+            let chunk_end = (chunk_start + PART_SIZE).min(data.len());
+            let chunk = &data[chunk_start..chunk_end];
+
+            // 分片 2+ 计算增量哈希上下文
+            let hash_ctx = if part_number > 1 {
+                Some(Self::build_hash_ctx_b64(&data, part_number))
+            } else {
+                None
+            };
+
+            // 生成 OSS 日期
+            let oss_date = chrono::Utc::now()
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+
+            // 构造 auth_meta
+            let auth_meta = Self::build_part_auth_meta(
+                mime_type,
+                &oss_date,
+                &bucket,
+                &obj_key,
+                part_number,
+                &upload_id,
+                hash_ctx.as_deref(),
+            );
+
+            // 调用 file/upload/auth 获取 auth_key
             let auth_body = json!({
                 "task_id": task_id,
-                "part_offs": part_offs,
-                "hash_enc": full_sha1,
+                "auth_info": auth_info,
+                "auth_meta": auth_meta,
             });
-            let auth = self.api_post("file/upload/auth", &auth_body)?;
+            let auth_resp = self.api_post("file/upload/auth", &auth_body)?;
+            let auth_key = auth_resp["data"]["auth_key"]
+                .as_str()
+                .ok_or_else(|| format!("未获取到 auth_key: {:?}", auth_resp))?;
 
-            let auth_parts = auth["data"]["part_list"]
-                .as_array()
-                .or_else(|| auth["data"]["parts"].as_array())
-                .ok_or_else(|| format!("未获取到分片上传地址: {:?}", auth))?;
+            // 构造 OSS 上传 URL
+            let oss_url = format!(
+                "https://{}.pds.quark.cn/{}?partNumber={}&uploadId={}",
+                bucket, obj_key, part_number, upload_id
+            );
 
-            // auth 返回的是未完成分片的上传地址，需要映射回原始分片索引
-            let mut auth_idx = 0;
-            for (i, chunk) in data.chunks(PART_SIZE).enumerate() {
-                // 跳过已完成分片
-                if done_parts.contains(&i) {
-                    continue;
+            // PUT 到 OSS
+            let mut req = self
+                .client
+                .put(&oss_url)
+                .header("Content-Type", mime_type)
+                .header("x-oss-date", &oss_date)
+                .header(
+                    "x-oss-user-agent",
+                    "aliyun-sdk-js/1.0.0 Chrome Mobile 139.0.0.0 on Google Nexus 5 (Android 6.0)",
+                )
+                .header("authorization", auth_key)
+                .body(chunk.to_vec());
+
+            if let Some(ref h) = hash_ctx {
+                req = req.header("X-Oss-Hash-Ctx", h);
+            }
+
+            let resp = req
+                .send()
+                .map_err(|e| format!("分片 {} 上传失败: {}", part_number, e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().unwrap_or_default();
+                return Err(format!("分片 {} 上传 HTTP {}: {}", part_number, status, body));
+            }
+
+            // 提取 ETag（去掉双引号）
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim_matches('"').to_string())
+                .ok_or_else(|| format!("分片 {} 上传成功但未获取到 ETag", part_number))?;
+
+            eprintln!(
+                "[quark] 分片 {}/{} 上传成功, etag={}",
+                part_number, total_parts, etag
+            );
+
+            // 更新 meta
+            if let Some(ref mut m) = meta {
+                if !m.completed_parts.contains(&i) {
+                    m.completed_parts.push(i);
+                    m.etags.push(etag);
                 }
-                let upload_url = auth_parts
-                    .get(auth_idx)
-                    .and_then(|p| {
-                        p["upload_url"]
-                            .as_str()
-                            .or_else(|| p["url"].as_str())
-                            .or_else(|| p["raw"].as_str())
-                    })
-                    .ok_or_else(|| format!("缺失第 {} 片上传地址", i))?;
-                let resp = self
-                    .client
-                    .put(upload_url)
-                    .body(chunk.to_vec())
-                    .send()
-                    .map_err(|e| format!("分片 {} 上传失败: {}", i, e))?;
-                if !resp.status().is_success() {
-                    return Err(format!("分片 {} 上传 HTTP {}", i, resp.status()));
-                }
-                // 更新 meta
-                if let Some(ref mut m) = meta {
-                    if !m.completed_parts.contains(&i) {
-                        m.completed_parts.push(i);
-                    }
-                    let _ = std::fs::write(&meta_path, serde_json::to_string(m).unwrap_or_default());
-                }
-                auth_idx += 1;
+                let _ = std::fs::write(&meta_path, serde_json::to_string(m).unwrap_or_default());
             }
         }
 
-        // 提交
-        let commit_body = json!({ "task_id": task_id, "fid": obj_fid, "hash_enc": full_sha1 });
-        let _ = self.api_post("file/upload/commit", &commit_body)?;
+        // commit 阶段：OSS CompleteMultipartUpload
+        let m = meta.as_ref().unwrap();
+        // 构造 (part_number, etag) 列表
+        let mut etag_list: Vec<(usize, String)> = Vec::new();
+        for (i, etag) in m.completed_parts.iter().zip(m.etags.iter()) {
+            etag_list.push((*i + 1, etag.clone()));
+        }
+        // 按 part_number 排序
+        etag_list.sort_by_key(|x| x.0);
+
+        let xml_data = Self::build_commit_xml(&etag_list);
+        let xml_md5 = {
+            let mut h = Md5::new();
+            h.update(xml_data.as_bytes());
+            base64::engine::general_purpose::STANDARD.encode(h.finalize())
+        };
+        let callback_b64 = {
+            let json_str = serde_json::to_string(&m.callback).unwrap_or_default();
+            base64::engine::general_purpose::STANDARD.encode(json_str.as_bytes())
+        };
+        let oss_date = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+
+        let commit_auth_meta = format!(
+            "POST\n{md5}\napplication/xml\n{date}\nx-oss-callback:{cb}\nx-oss-date:{date}\nx-oss-user-agent:aliyun-sdk-js/1.0.0 Chrome 139.0.0.0 on OS X 10.15.7 64-bit\n/{bucket}/{obj_key}?uploadId={uid}",
+            md5 = xml_md5,
+            date = oss_date,
+            cb = callback_b64,
+            bucket = m.bucket,
+            obj_key = m.obj_key,
+            uid = m.upload_id
+        );
+
+        let commit_auth_body = json!({
+            "task_id": m.task_id,
+            "auth_meta": commit_auth_meta,
+            "auth_info": m.auth_info,
+        });
+        let commit_auth_resp = self.api_post("file/upload/auth", &commit_auth_body)?;
+        let commit_auth_key = commit_auth_resp["data"]["auth_key"]
+            .as_str()
+            .ok_or_else(|| format!("未获取到 commit auth_key: {:?}", commit_auth_resp))?;
+
+        let commit_url = format!(
+            "https://{}.pds.quark.cn/{}?uploadId={}",
+            m.bucket, m.obj_key, m.upload_id
+        );
+        let commit_resp = self
+            .client
+            .post(&commit_url)
+            .header("Content-Type", "application/xml")
+            .header("x-oss-date", &oss_date)
+            .header(
+                "x-oss-user-agent",
+                "aliyun-sdk-js/1.0.0 Chrome 139.0.0.0 on OS X 10.15.7 64-bit",
+            )
+            .header("authorization", commit_auth_key)
+            .header("x-oss-callback", &callback_b64)
+            .header("Content-MD5", &xml_md5)
+            .body(xml_data)
+            .send()
+            .map_err(|e| format!("commit POST 失败: {}", e))?;
+
+        let commit_status = commit_resp.status();
+        let commit_code = commit_status.as_u16();
+        if commit_code != 200 && commit_code != 203 {
+            let body = commit_resp.text().unwrap_or_default();
+            return Err(format!("commit 失败 HTTP {}: {}", commit_code, body));
+        }
+        eprintln!("[quark] commit 成功, status={}", commit_code);
 
         // 完成
-        let finish_body = json!({ "task_id": task_id, "fid": obj_fid });
+        let obj_key = meta.as_ref().unwrap().obj_key.clone();
+        let task_id = meta.as_ref().unwrap().task_id.clone();
+        let finish_body = json!({ "task_id": task_id, "obj_key": obj_key });
         let _ = self.api_post("file/upload/finish", &finish_body)?;
 
         // 上传完成，删除 meta 文件
