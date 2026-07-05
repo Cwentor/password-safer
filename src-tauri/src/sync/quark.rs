@@ -108,6 +108,33 @@ impl QuarkProvider {
     h
 }
 
+    /// 下载文件专用的请求头（对齐 quarkpan 的 download_headers）
+    fn download_hdr(&self) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        let add = |h: &mut reqwest::header::HeaderMap, name: &str, val: &str| {
+            if let (Ok(n), Ok(v)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(val),
+            ) {
+                h.insert(n, v);
+            }
+        };
+        add(&mut h, "accept", "*/*");
+        add(&mut h, "accept-language", "zh-CN,zh;q=0.9");
+        add(&mut h, "cache-control", "no-cache");
+        add(&mut h, "pragma", "no-cache");
+        add(&mut h, "referer", "https://pan.quark.cn/");
+        add(&mut h, "origin", "https://pan.quark.cn");
+        add(&mut h, "sec-ch-ua", "\"Not;A=Brand\";v=\"99\", \"Google Chrome\";v=\"139\", \"Chromium\";v=\"139\"");
+        add(&mut h, "sec-ch-ua-mobile", "?1");
+        add(&mut h, "sec-ch-ua-platform", "\"Android\"");
+        add(&mut h, "sec-fetch-dest", "empty");
+        add(&mut h, "sec-fetch-mode", "cors");
+        add(&mut h, "sec-fetch-site", "same-site");
+        add(&mut h, "user-agent", "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36");
+        h
+    }
+
     /// drive-pc 业务接口 POST
     fn api_post(&self, action: &str, body: &Value) -> Result<Value, String> {
         let url = format!(
@@ -170,6 +197,18 @@ impl QuarkProvider {
         Ok(resp)
     }
 
+    /// 中层接口封装：列出目录内容（file/sort 接口用 GET 请求）
+    /// 对齐 quarkpan 的 FileService.list_files 实现
+    fn file_sort(&self, pdir_fid: &str, page: u32, size: u32, sort: &str) -> Result<Value, String> {
+        let params = json!({
+            "pdir_fid": pdir_fid,
+            "_page": page,
+            "_size": size,
+            "_sort": sort
+        });
+        self.api_get("file/sort", &params)
+    }
+
     /// 删除文件/目录（按 fid 列表批量删除）
     /// 用于处理同名冲突：上传前先删除远端旧文件
     fn delete_files(&self, fids: &[&str]) -> Result<(), String> {
@@ -178,7 +217,7 @@ impl QuarkProvider {
         }
         let body = json!({
             "action_type": 2,
-            "task_list": fids.iter().map(|f| json!({"fid": f})).collect::<Vec<_>>(),
+            "filelist": fids.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
             "exclude_fids": []
         });
         let _ = self.api_post("file/delete", &body)?;
@@ -205,15 +244,7 @@ impl QuarkProvider {
     /// 需要用 file/search 查找卡死的目录并删除后重试
     /// 不降级到根目录（避免两份 vault.db 导致索引混乱）
     fn find_or_create_dir(&self, pdir_fid: &str, name: &str) -> Result<String, String> {
-        let body = json!({
-            "pdir_fid": pdir_fid,
-            "_page": 1,
-            "_size": 200,
-            "_fetch_total": 1,
-            "_fetch_sub_dirs": "1",
-            "_sort": "file_type:asc,updated_at:desc"
-        });
-        let resp = self.api_post("file/sort", &body)?;
+        let resp = self.file_sort(pdir_fid, 1, 200, "file_type:asc,updated_at:desc")?;
         if let Some(list) = resp["data"]["list"].as_array() {
             for item in list {
                 if item["file_name"].as_str() == Some(name)
@@ -334,15 +365,7 @@ impl QuarkProvider {
         if depth > 3 {
             return Ok(None);
         }
-        let body = json!({
-            "pdir_fid": pdir_fid,
-            "_page": 1,
-            "_size": 200,
-            "_fetch_total": 1,
-            "_fetch_sub_dirs": "1",
-            "_sort": "file_type:asc,updated_at:desc"
-        });
-        let resp = self.api_post("file/sort", &body)?;
+        let resp = self.file_sort(pdir_fid, 1, 200, "file_type:asc,updated_at:desc")?;
         if let Some(list) = resp["data"]["list"].as_array() {
             for item in list {
                 let ft = item["file_type"].as_i64().unwrap_or(0);
@@ -935,6 +958,7 @@ impl SyncProvider for QuarkProvider {
             let resp = self
                 .client
                 .get(&dl_url)
+                .headers(self.download_hdr())
                 .send()
                 .map_err(|e| format!("下载失败: {}", e))?;
             if !resp.status().is_success() {
