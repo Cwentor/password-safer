@@ -8,6 +8,7 @@ pub struct ConfigManager {
     conn: Mutex<Connection>,
 }
 
+#[allow(dead_code)]
 impl ConfigManager {
     pub fn new(conn: Connection) -> Self {
         ConfigManager {

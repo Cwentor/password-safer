@@ -45,6 +45,7 @@ pub trait QrAuthenticator: Send + Sync {
     /// 校验已保存的 Cookie 是否仍有效
     fn validate(&self, cookie: &str) -> Result<bool, String>;
     /// 提供者名称
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 }
 
@@ -68,6 +69,7 @@ pub fn extract_cookies_by_prefixes(
 }
 
 /// 把若干 "k=v" 合并成 Cookie 头值
+#[allow(dead_code)]
 pub fn join_cookies(items: &[&str]) -> String {
     items.join("; ")
 }

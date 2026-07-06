@@ -588,12 +588,8 @@ async fn open_quark_login(app: tauri::AppHandle) -> Result<(), String> {
     let wv = webview_window.clone();
     let app_for_thread = app.clone();
     std::thread::spawn(move || {
-        let mut cookie_sent = false;
         for i in 1..=30 {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            if cookie_sent {
-                break;
-            }
             // 窗口已关闭则停止 probe
             if app_for_thread.get_webview_window("quark-login").is_none() {
                 eprintln!("[quark-login] probe stopped, window closed");
@@ -659,7 +655,6 @@ async fn open_quark_login(app: tauri::AppHandle) -> Result<(), String> {
 
             if has_puus && cookie_str.len() > 50 {
                 // 登录成功，保存完整 Cookie（含 HttpOnly）
-                cookie_sent = true;
                 eprintln!("[quark-login] 登录成功，保存完整 Cookie（含 HttpOnly）, length={}", cookie_str.len());
 
                 // 复用 save_quark_cookie 的保存逻辑
@@ -800,12 +795,8 @@ async fn open_baidu_login(app: tauri::AppHandle) -> Result<(), String> {
     let wv = webview_window.clone();
     let app_for_thread = app.clone();
     std::thread::spawn(move || {
-        let mut cookie_sent = false;
         for i in 1..=30 {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            if cookie_sent {
-                break;
-            }
             // 窗口已关闭则停止 probe
             if app_for_thread.get_webview_window("baidu-login").is_none() {
                 eprintln!("[baidu-login] probe stopped, window closed");
@@ -843,7 +834,6 @@ async fn open_baidu_login(app: tauri::AppHandle) -> Result<(), String> {
 
             if has_bduss && cookie_str.len() > 50 {
                 // 登录成功，保存完整 Cookie（含 HttpOnly）
-                cookie_sent = true;
                 eprintln!("[baidu-login] 登录成功，保存完整 Cookie（含 HttpOnly）, length={}", cookie_str.len());
 
                 // 保存到配置
@@ -1391,8 +1381,63 @@ pub fn run() {
             get_db_info,
         ])
         .setup(move |app| {
+            // 系统托盘菜单
+            let show_item = tauri::menu::MenuItem::with_id(app, "tray_show", "显示主窗口", true, None::<&str>)?;
+            let hide_item = tauri::menu::MenuItem::with_id(app, "tray_hide", "隐藏主窗口", true, None::<&str>)?;
+            let quit_item = tauri::menu::MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+
+            // 系统托盘图标
+            tauri::tray::TrayIconBuilder::with_id("main-tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Password Safer - 密码保管箱")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            match window.is_visible() {
+                                Ok(true) => { let _ = window.hide(); }
+                                _ => {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                            }
+                        }
+                    }
+                })
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "tray_show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "tray_hide" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.hide();
+                            }
+                        }
+                        "tray_quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
             start_sync_scheduler(scheduler_state, app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

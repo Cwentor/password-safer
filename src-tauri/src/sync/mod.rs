@@ -16,6 +16,7 @@ pub trait SyncProvider: Send + Sync {
     fn name(&self) -> &str;
     /// 获取远端文件最后修改时间（unix 秒），文件不存在返回 Ok(None)
     /// 默认实现返回 Err，表示该 provider 不支持
+    #[allow(dead_code)]
     fn remote_file_mtime(&self, _remote_path: &str) -> Result<Option<i64>, String> {
         Err("remote_file_mtime not supported".to_string())
     }

@@ -214,6 +214,7 @@ impl QrAuthenticator for QuarkAuth {
 }
 
 /// 兼容夸克响应里 code 出现在顶层或 data 内
+#[allow(dead_code)]
 fn body_code(v: &serde_json::Value) -> i64 {
     if let Some(c) = v["code"].as_i64() {
         return c;

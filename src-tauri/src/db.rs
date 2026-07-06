@@ -11,6 +11,7 @@ pub struct Database {
     crypto: Crypto,
 }
 
+#[allow(dead_code)]
 impl Database {
     /// 打开或创建数据库
     pub fn open(db_path: &Path, crypto: Crypto) -> Result<Self, String> {
@@ -416,19 +417,22 @@ impl Database {
     }
 }
 
+#[allow(dead_code)]
 fn ext_connection_check(conn: &Connection) -> Result<(), String> {
     conn.prepare("SELECT count(*) FROM passwords")
         .map_err(|_| "外部文件不是有效的密码数据库（缺少 passwords 表）".to_string())?;
     Ok(())
 }
 
-fn ext_connection_query(conn: &Connection) -> Result<rusqlite::Statement, String> {
+#[allow(dead_code)]
+fn ext_connection_query(conn: &Connection) -> Result<rusqlite::Statement<'_>, String> {
     conn.prepare("SELECT id, name, icon, url, username, password_encrypted, tags, notes, favorite, strength, created, last_used FROM passwords")
         .map_err(|e| format!("准备查询失败: {}", e))
 }
 
 /// 检查 SQLite 数据库文件完整性
 /// 执行 PRAGMA integrity_check，返回 true 表示数据库有效（结果为 "ok"）
+#[allow(dead_code)]
 pub fn integrity_check(db_path: &Path) -> bool {
     match Connection::open(db_path) {
         Ok(conn) => {
