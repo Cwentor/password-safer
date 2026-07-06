@@ -2654,6 +2654,12 @@ async function init() {
     listenSyncEvents();
   } catch (e) {
     showToast('初始化失败: ' + e);
+  } finally {
+    // 渲染完成（含失败）后显示窗口，避免启动时白闪
+    try {
+      const { getCurrentWindow } = window.__TAURI__.window;
+      await getCurrentWindow().show();
+    } catch (_) {}
   }
 }
 
