@@ -8,7 +8,7 @@
 ![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)
 ![rust](https://img.shields.io/badge/Rust-edition%202021-dea584?style=flat-square)
 
-Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码管理应用。所有密码数据以 **AES-256-GCM** 加密后存储在本地 SQLite 数据库中，密钥与数据库文件分离保存；支持**百度网盘**与**夸克网盘**双向/单向云同步，无需用户登录注册，开箱即用。
+Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码管理应用。所有密码数据以 **AES-256-GCM** 加密后存储在本地 JSON 文件中，密钥与数据库文件分离保存；支持**百度网盘**与**夸克网盘**双向/单向云同步，无需用户登录注册，开箱即用。
 
 **v2.0.0 亮点**：夸克网盘完整双向同步（含断点续传 + 秒传）、应用内扫码登录、Cookie 过期预警、无边框沉浸式窗口。
 
@@ -35,7 +35,7 @@ Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码
 ### 🔒 安全
 
 - **AES-256-GCM 加密**：认证加密，密码字段密文存储
-- **密钥与数据库分离**：`master.key` 与 `vault.db` 独立存放，提升物理安全性
+- **密钥与数据分离**：`master.key` 与 `vault.json` 独立存放，提升物理安全性
 - **密码强度评估**：自动评分 1-4 级（长度 + 大小写 + 数字 + 符号）
 - **密码生成器**：内置强密码生成，长度可配置
 
@@ -68,8 +68,8 @@ Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码
 
 ### 💾 数据
 
-- **数据库导出**：将当前 `vault.db` 复制到任意路径
-- **数据库导入**：从外部 SQLite 文件反向导入（支持加密格式与明文格式）
+- **数据库导出**：将当前 `vault.json` 复制到任意路径
+- **数据库导入**：从外部 JSON 文件反向导入（支持加密格式与明文格式）
 - **自动图标映射**：按名称识别常见站点（GitHub → 🐙 等）
 
 ### ⚠️ 待完善
@@ -86,7 +86,6 @@ Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码
 |------|------|------|
 | 桌面框架 | Tauri 2.x | 跨平台桌面 / 移动应用框架 |
 | 后端语言 | Rust (edition 2021) | 核心业务逻辑（shared / desktop / mobile 三层） |
-| 数据库 | rusqlite 0.31 (bundled) | SQLite，静态编译 |
 | 加密 | aes-gcm 0.10 | AES-256-GCM 认证加密 |
 | HTTP 客户端 | reqwest 0.12 (blocking + rustls) | 同步 HTTP，避免 OpenSSL 依赖 |
 | 异步运行时 | tokio 1.x (full) | 同步调度器与扫码轮询 |
@@ -225,10 +224,8 @@ password-safer/
         ├── shared/               # 跨平台共享代码
         │   ├── models.rs         # 数据模型（PasswordDto / AppConfig）
         │   ├── crypto.rs         # AES-256-GCM 加密
-        │   ├── db.rs             # SQLite CRUD + 导入
-        │   ├── config.rs         # 配置管理器
         │   ├── sync/             # 云同步（夸克 / 百度）
-        │   └── storage/          # 存储路径抽象（get_app_data_dir）
+        │   └── storage/          # 加密 JSON 存储模块（json_store.rs / mod.rs）
         ├── desktop/              # 桌面专属代码
         │   ├── tray.rs           # 系统托盘
         │   ├── window.rs         # 窗口控制（CloseRequested 拦截等）
@@ -246,15 +243,15 @@ password-safer/
 
 | 文件 | 位置 | 说明 |
 |------|------|------|
-| `vault.db` | `%APPDATA%\password-safer\` | SQLite 数据库（密码字段 AES 加密） |
+| `vault.json` | `%APPDATA%\password-safer\` | 加密 JSON 数据文件 |
 | `master.key` | `%APPDATA%\password-safer\` | 256 位加密密钥 |
 
 > **⚠️ 密钥安全提醒**
 >
 > `master.key` 是解密密码的**唯一凭证**。请单独备份此文件。
 > - 如果密钥丢失，已加密的密码将**无法恢复**。
-> - 请勿将 `master.key` 和 `vault.db` 放在同一位置。
-> - 网盘同步仅上传 `vault.db`，**不会上传** `master.key`。
+> - 请勿将 `master.key` 和 `vault.json` 放在同一位置。
+> - 网盘同步仅上传 `vault.json`，**不会上传** `master.key`。
 
 ### 加密范围
 
@@ -267,7 +264,7 @@ password-safer/
 
 ## 同步机制
 
-采用**文件级同步**策略：将整个 SQLite 数据库文件上传/下载到网盘，而非同步单条记录。
+采用**文件级同步**策略：将整个加密 JSON 文件上传/下载到网盘，而非同步单条记录。
 
 ### 百度网盘（单向上传）
 
@@ -310,16 +307,16 @@ password-safer/
 
 ### 导出
 
-将当前 `vault.db` 复制到指定路径，包含全部加密数据。
+将当前 `vault.json` 复制到指定路径，包含全部加密数据。
 
 ### 导入（反向转换）
 
-从外部 SQLite 文件读取密码记录，导入到当前数据库：
+从外部 JSON 文件读取密码记录，导入到当前数据文件：
 
-- 自动验证表结构（需有 `passwords` 表）
+- 自动验证数据结构（需含 `passwords` 字段）
 - 尝试解密（如果是本应用导出的加密格式）
 - 解密失败则当作明文处理
-- 重新加密后插入当前数据库
+- 重新加密后写入当前数据文件
 
 ---
 
@@ -332,7 +329,7 @@ password-safer/
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `baidu_cookie` | 空 | 百度网盘登录 Cookie（应用内扫码登录自动获取） |
-| `baidu_remote_path` | `/apps/VAULT/vault.db` | 网盘存储路径 |
+| `baidu_remote_path` | `/apps/VAULT/vault.json` | 网盘存储路径 |
 | `baidu_sync_enabled` | `false` | 是否启用百度同步 |
 | `baidu_sync_interval` | `300` | 自动同步间隔（秒） |
 | `baidu_cookie_expires_at` | `0` | Cookie 过期时间戳 |
@@ -342,7 +339,7 @@ password-safer/
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `quark_cookie` | 空 | 夸克网盘登录 Cookie（含 HttpOnly） |
-| `quark_remote_path` | `/VAULT/vault.db` | 网盘存储路径 |
+| `quark_remote_path` | `/VAULT/vault.json` | 网盘存储路径 |
 | `quark_sync_enabled` | `false` | 是否启用夸克同步 |
 | `quark_sync_interval` | `300` | 自动同步间隔（秒） |
 | `quark_cookie_expires_at` | `0` | Cookie 过期时间戳 |

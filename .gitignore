@@ -41,8 +41,6 @@ src-tauri/gen/android/.cxx/
 *.p12
 
 # ========== 应用数据文件（本地运行时生成） ==========
-*.db
-*.db-journal
 vault.json*
 *.uploadmeta
 

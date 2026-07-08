@@ -21,7 +21,7 @@
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `baidu_cookie` | 百度网盘登录 Cookie（应用内扫码自动获取） | 空 |
-| `baidu_remote_path` | 网盘中的数据库文件路径 | `/apps/VAULT/vault.db` |
+| `baidu_remote_path` | 网盘中的数据文件路径 | `/apps/VAULT/vault.json` |
 | `baidu_sync_enabled` | 是否启用百度网盘同步 | `false` |
 | `baidu_sync_interval` | 自动同步间隔（秒） | `300`（5 分钟） |
 | `baidu_cookie_expires_at` | Cookie 过期时间戳（秒，0 表示未知） | `0` |
@@ -68,7 +68,7 @@
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `quark_cookie` | 夸克网盘登录 Cookie（含 HttpOnly） | 空 |
-| `quark_remote_path` | 网盘中的数据库文件路径 | `/VAULT/vault.db` |
+| `quark_remote_path` | 网盘中的数据文件路径 | `/VAULT/vault.json` |
 | `quark_sync_enabled` | 是否启用夸克网盘同步 | `false` |
 | `quark_sync_interval` | 自动同步间隔（秒） | `300`（5 分钟） |
 | `quark_cookie_expires_at` | Cookie 过期时间戳（秒，0 表示未知） | `0` |
@@ -100,46 +100,29 @@
 
 ---
 
-## 四、数据库文件
+## 四、数据文件
 
 ### 4.1 文件位置
 
-- 数据库文件：`%APPDATA%\password-safer\vault.db`
+- 数据文件：`%APPDATA%\password-safer\vault.json`
 - 加密密钥：`%APPDATA%\password-safer\master.key`
 
-### 4.2 数据库结构
+### 4.2 数据结构
 
-```sql
--- 密码表
-CREATE TABLE passwords (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,              -- 名称
-    icon TEXT DEFAULT '🔑',          -- 图标
-    url TEXT DEFAULT '',             -- 网址
-    username TEXT DEFAULT '',        -- 用户名
-    password_encrypted TEXT NOT NULL,-- AES-256-GCM 加密后的密码
-    tags TEXT DEFAULT '[]',          -- 标签（JSON 数组）
-    notes TEXT DEFAULT '',           -- 备注
-    favorite INTEGER DEFAULT 0,      -- 是否收藏
-    strength INTEGER DEFAULT 0,      -- 密码强度（1-4）
-    created TEXT DEFAULT '',         -- 创建日期
-    last_used TEXT DEFAULT ''        -- 最近使用日期
-);
+数据文件 `vault.json` 存储加密后的 JSON 内容。解密后的结构为 `StoreData`，包含两个字段：
 
--- 配置表
-CREATE TABLE app_config (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-```
+- `passwords`：密码记录数组，每条记录包含 `id` / `name` / `icon` / `url` / `username` / `password_encrypted` / `tags` / `notes` / `favorite` / `strength` / `created` / `last_used`
+- `config`：应用配置对象
+
+整个 JSON 内容使用 AES-256-GCM 加密。
 
 ### 4.3 导入/导出
 
-- **导出**：将当前 `vault.db` 文件复制到指定路径
-- **导入**：从外部 SQLite 文件读取密码记录，解密后重新加密导入当前数据库
+- **导出**：将当前 `vault.json` 文件复制到指定路径
+- **导入**：从外部 JSON 文件读取密码记录，解密后重新加密导入当前数据文件
   - 支持本应用导出的加密格式
-  - 也支持明文存储的外部数据库
-  - 自动验证表结构
+  - 也支持明文存储的外部 JSON 文件
+  - 自动验证数据结构
 
 ---
 
@@ -158,10 +141,10 @@ CREATE TABLE app_config (
 
 ### 同步策略
 
-本应用采用**文件级同步**策略：将整个 SQLite 数据库文件上传到网盘，而非同步单条记录。
+本应用采用**文件级同步**策略：将整个加密 JSON 文件上传到网盘，而非同步单条记录。
 
-- **上传同步**：将本地 `vault.db` 上传到网盘，覆盖远程文件
-- **下载同步**：从网盘下载 `vault.db`，覆盖本地文件
+- **上传同步**：将本地 `vault.json` 上传到网盘，覆盖远程文件
+- **下载同步**：从网盘下载 `vault.json`，覆盖本地文件
 - **自动同步**：按配置间隔自动上传（默认 5 分钟）
 - **手动同步**：在设置页面点击「立即同步」
 

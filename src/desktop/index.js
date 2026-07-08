@@ -305,7 +305,7 @@ function getSettingsModalHTML() {
 
           <div class="storage-card">
             <div class="storage-card-header">
-              <span>SQLite 数据库</span>
+              <span>加密 JSON 存储</span>
               <span class="mono" style="color:var(--accent)">vault.json</span>
             </div>
             <div class="storage-card-body">
@@ -402,7 +402,7 @@ function getSettingsModalHTML() {
             <div class="about-version">版本 2.0.1</div>
             <div class="about-desc">
               本地优先的密码管理器<br>
-              数据库采用 SQLite，数据仅存储在本地<br>
+              数据采用加密 JSON 文件，仅存储在本地<br>
               支持夸克网盘、百度网盘加密云同步
             </div>
             <div class="about-links">

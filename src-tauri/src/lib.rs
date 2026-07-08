@@ -710,118 +710,6 @@ fn migrate_from_old_data_dir(new_data_dir: &std::path::Path) {
     eprintln!("[migrate] 数据目录迁移完成（旧目录保留，可手动删除）");
 }
 
-/// 数据迁移：如果存在旧 vault.db（SQLite），读取数据并迁移到 vault.json
-/// 迁移完成后将 vault.db 重命名为 vault.db.old（避免重复迁移）
-/// 仅在 vault.json 不存在时执行迁移
-#[cfg(feature = "sqlite-migrate")]
-fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &shared::crypto::Crypto) {
-    let json_path = data_dir.join("vault.json");
-    let db_path = data_dir.join("vault.db");
-    let old_db_path = data_dir.join("vault.db.old");
-
-    // vault.json 已存在，无需迁移
-    if json_path.exists() {
-        return;
-    }
-    // 旧 vault.db 不存在，无需迁移
-    if !db_path.exists() {
-        return;
-    }
-    // vault.db.old 已存在说明之前迁移过，不再重复迁移
-    if old_db_path.exists() {
-        return;
-    }
-
-    eprintln!("[migrate] 检测到旧 vault.db，开始迁移到 vault.json");
-
-    // 打开旧 SQLite 数据库
-    let database = match shared::db::Database::open(&db_path, crypto.clone_key()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("[migrate] 打开旧 vault.db 失败: {}，跳过迁移", e);
-            return;
-        }
-    };
-
-    // 读取所有密码记录
-    let passwords = match database.get_all() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[migrate] 读取旧密码数据失败: {}，跳过迁移", e);
-            return;
-        }
-    };
-
-    // 读取旧配置（使用 ConfigManager）
-    let config_manager = match shared::config::ConfigManager::from_db_path(&db_path) {
-        Ok(cm) => cm,
-        Err(e) => {
-            eprintln!("[migrate] 打开旧配置失败: {}，跳过迁移", e);
-            return;
-        }
-    };
-    let config = config_manager.load();
-
-    // 构造 StoreData
-    let mut store_data = shared::storage::json_store::StoreData::default();
-    store_data.config = config;
-    store_data.next_id = passwords.iter().map(|p| p.id).max().unwrap_or(0) + 1;
-
-    for dto in passwords {
-        // 重新加密密码字段（用同一密钥，加密结果不同但解密一致）
-        let password_encrypted = match crypto.encrypt(&dto.password) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("[migrate] 加密密码字段失败: {}，跳过该记录", e);
-                continue;
-            }
-        };
-        let record = shared::storage::json_store::PasswordRecord {
-            id: dto.id,
-            name: dto.name,
-            icon: dto.icon,
-            url: dto.url,
-            username: dto.username,
-            password_encrypted,
-            tags: dto.tags,
-            notes: dto.notes,
-            favorite: dto.favorite,
-            strength: dto.strength,
-            created: dto.created,
-            last_used: dto.last_used,
-        };
-        store_data.passwords.push(record);
-    }
-
-    eprintln!("[migrate] 迁移 {} 条密码记录", store_data.passwords.len());
-
-    // 创建 JsonStore 并保存数据
-    let json_store = match shared::storage::json_store::JsonStore::open(json_path.clone(), crypto.clone_key()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[migrate] 创建 vault.json 失败: {}，迁移中止", e);
-            return;
-        }
-    };
-    if let Err(e) = json_store.save(&store_data) {
-        eprintln!("[migrate] 保存 vault.json 失败: {}，迁移中止", e);
-        return;
-    }
-
-    // 迁移成功，将旧 vault.db 重命名为 vault.db.old
-    if let Err(e) = std::fs::rename(&db_path, &old_db_path) {
-        eprintln!("[migrate] 重命名 vault.db 为 vault.db.old 失败: {}（数据已迁移但旧文件未重命名）", e);
-    } else {
-        eprintln!("[migrate] 旧 vault.db 已重命名为 vault.db.old");
-    }
-
-    // 清理 WAL/SHM 残留文件
-    let _ = std::fs::remove_file(data_dir.join("vault.db-wal"));
-    let _ = std::fs::remove_file(data_dir.join("vault.db-shm"));
-
-    eprintln!("[migrate] 迁移完成");
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 创建 Builder，应用平台专属配置（URI scheme、窗口事件等）
@@ -913,10 +801,6 @@ pub fn run() {
 
                     // 初始化加密器
                     let crypto = shared::crypto::Crypto::from_key_file(&key_path)?;
-
-                    // 数据迁移：如果存在旧 vault.db（SQLite），迁移数据到 vault.json
-                    #[cfg(feature = "sqlite-migrate")]
-                    migrate_from_sqlite_if_needed(&data_dir, &crypto);
 
                     // 初始化 JSON 存储（双重加密：密码字段加密 + 文件整体加密）
                     let database =
