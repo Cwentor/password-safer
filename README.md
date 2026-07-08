@@ -2,7 +2,7 @@
 
 > 本地优先 · 端到端加密 · 双网盘云同步的 Windows 桌面密码保管箱
 
-![version](https://img.shields.io/badge/version-v2.0.1-cyan?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.1.0-cyan?style=flat-square)
 ![license](https://img.shields.io/badge/license-GPL%20v3-blue?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Android%20(Phase%202)-blueviolet?style=flat-square)
 ![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)
@@ -10,7 +10,7 @@
 
 Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码管理应用。所有密码数据以 **AES-256-GCM** 加密后存储在本地 JSON 文件中，密钥与数据库文件分离保存；支持**百度网盘**与**夸克网盘**双向/单向云同步，无需用户登录注册，开箱即用。
 
-**v2.0.0 亮点**：夸克网盘完整双向同步（含断点续传 + 秒传）、应用内扫码登录、Cookie 过期预警、无边框沉浸式窗口。
+**v2.1.0 亮点**：加密 JSON 存储迁移（SQLite → vault.json，整体 AES-256-GCM 加密）、SQLite 依赖彻底移除（桌面与安卓编译体积优化，安卓端不再交叉编译 libsqlite3-sys）、Android 端正式落地（架构重构 + 完整实现 + 网盘云同步支持）。继承 v2.0.0 能力：夸克网盘双向同步、应用内扫码登录、Cookie 过期预警、无边框沉浸式窗口。
 
 ---
 
@@ -172,7 +172,7 @@ npm run tauri:android:build       # 生产构建
 
 构建产物位于 `src-tauri/gen/android/app/build/outputs/`。
 
-> ⚠️ 当前环境未安装 Android SDK/NDK，`src-tauri/gen/android/` 工程尚未生成。需先完成上述前置条件并执行 `npx tauri android init`。
+> ✅ Android 工程已生成并就绪：`src-tauri/gen/android/` 目录已存在，可直接执行上述构建命令。首次构建前请确保已安装 Android SDK/NDK 并完成环境配置。
 
 ### 3. 配置云同步
 

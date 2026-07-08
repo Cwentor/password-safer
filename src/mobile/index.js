@@ -395,7 +395,7 @@ function getSettingsModalHTML() {
           <div class="about-card">
             <div class="about-logo">V</div>
             <div class="about-name">VAULT</div>
-            <div class="about-version">版本 2.0.1</div>
+            <div class="about-version">版本 2.1.0</div>
             <div class="about-desc">
               本地优先的密码管理器<br>
               数据库采用 JSON 文件加密存储<br>
