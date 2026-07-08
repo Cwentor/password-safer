@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::crypto::Crypto;
-use crate::models::{calculate_strength, AppConfig, PasswordDto, PasswordInput};
+use crate::shared::crypto::Crypto;
+use crate::shared::models::{calculate_strength, AppConfig, PasswordDto, PasswordInput};
 
 /// JSON 文件存储的完整数据
 #[derive(Debug, Clone, Serialize, Deserialize)]

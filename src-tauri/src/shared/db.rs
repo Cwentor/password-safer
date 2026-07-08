@@ -2,8 +2,8 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::crypto::Crypto;
-use crate::models::{calculate_strength, PasswordDto, PasswordInput};
+use crate::shared::crypto::Crypto;
+use crate::shared::models::{calculate_strength, PasswordDto, PasswordInput};
 
 /// 数据库管理器
 pub struct Database {

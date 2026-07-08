@@ -1,34 +1,25 @@
-mod config;
-mod storage;
-mod crypto;
-mod db;
-mod models;
-mod sync;
+mod shared;
 
-use models::*;
+#[cfg(desktop)]
+mod desktop;
+#[cfg(mobile)]
+mod mobile;
+
+use shared::models::*;
+use shared::sync::auth::{baidu::BaiduAuth, quark::QuarkAuth, QrAuthenticator, QrLoginSession, QrLoginStatus};
+use shared::sync::SyncProvider;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use sync::auth::{baidu::BaiduAuth, quark::QuarkAuth, QrAuthenticator, QrLoginSession, QrLoginStatus};
-use sync::SyncProvider;
 use tauri::{Emitter, Manager, State};
 
 /// 应用全局状态
 pub struct AppState {
     /// JSON 存储实例（每次操作都重新读取文件，无需 close/reopen）
-    pub database: Mutex<storage::json_store::JsonStore>,
+    pub database: Mutex<shared::storage::json_store::JsonStore>,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
     /// 夸克 Cookie 即将过期提醒是否已发送（避免重复提醒）
     pub quark_cookie_warn_sent: std::sync::atomic::AtomicBool,
-}
-
-/// 获取应用数据目录
-pub fn get_data_dir() -> PathBuf {
-    let dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("password-safer");
-    std::fs::create_dir_all(&dir).ok();
-    dir
 }
 
 /// 当前本地时间戳字符串
@@ -37,64 +28,6 @@ fn now_ts() -> String {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
-
-/// URL 解码：手动处理 %XX 十六进制序列与 + → 空格
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let hex = |b: u8| -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    };
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'+' {
-            out.push(b' ');
-            i += 1;
-        } else if b == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-            } else {
-                out.push(b);
-                i += 1;
-            }
-        } else {
-            out.push(b);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// 夸克登录回调页面：显示“登录成功，正在关闭...”
-const FULL_HTML_BODY: &str = r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>登录成功</title>
-<style>
-  html, body { margin: 0; padding: 0; height: 100%; }
-  body {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    font-size: 18px;
-    color: #333;
-    background: #fafafa;
-  }
-</style>
-</head>
-<body>
-<div>登录成功，正在关闭...</div>
-</body>
-</html>"#;
 
 // ========== Tauri Commands ==========
 
@@ -249,22 +182,22 @@ async fn sync_now(
     let result = tokio::task::spawn_blocking(move || {
         match provider_for_task.as_str() {
             "baidu" => {
-                let p = sync::baidu::BaiduProvider::new(cookie_for_task);
+                let p = shared::sync::baidu::BaiduProvider::new(cookie_for_task);
                 if direction_for_task == "download" {
-                    sync::sync_download(&p, &remote_for_task, &db_path)
+                    shared::sync::sync_download(&p, &remote_for_task, &db_path)
                 } else {
-                    sync::sync_upload(&p, &db_path, &remote_for_task)
+                    shared::sync::sync_upload(&p, &db_path, &remote_for_task)
                 }
             }
             "quark" => {
                 // 本地 vault.json 有效性检测（仅日志，不改变行为）
-                let local_valid = sync::quark::QuarkProvider::local_vault_valid(&db_path);
+                let local_valid = shared::sync::quark::QuarkProvider::local_vault_valid(&db_path);
                 println!("[sync] quark local_vault_valid = {}", local_valid);
-                let p = sync::quark::QuarkProvider::new(cookie_for_task);
+                let p = shared::sync::quark::QuarkProvider::new(cookie_for_task);
                 if direction_for_task == "download" {
-                    sync::sync_download(&p, &remote_for_task, &db_path)
+                    shared::sync::sync_download(&p, &remote_for_task, &db_path)
                 } else {
-                    sync::sync_upload(&p, &db_path, &remote_for_task)
+                    shared::sync::sync_upload(&p, &db_path, &remote_for_task)
                 }
             }
             _ => SyncResult {
@@ -391,484 +324,13 @@ async fn qr_poll(
     }
 }
 
-/// quark-login 窗口注入的初始化脚本（捕获 UA、错误、隐藏 __TAURI__、轮询 Cookie）
-const INIT_SCRIPT: &str = r#"
-    (function() {
-        // 第一时间把 UA 和位置写到 window.__probe，供 Rust 端 eval 读取
-        try {
-            window.__probe = {
-                ua: navigator.userAgent,
-                href: location.href,
-                ts: Date.now()
-            };
-        } catch(e) {}
-
-        console.log("[quark-login] init script executed, location=" + location.href);
-        console.log("[quark-login] navigator.userAgent=" + navigator.userAgent);
-        window.addEventListener('error', function(e) {
-            console.log("[quark-login] window error: " + (e.message || 'unknown') +
-                " at " + (e.filename || '') + ":" + (e.lineno || 0));
-        });
-        window.addEventListener('unhandledrejection', function(e) {
-            console.log("[quark-login] unhandled rejection: " +
-                (e.reason && e.reason.message ? e.reason.message : e.reason));
-        });
-
-        if (window.__quarkLoginWatch) return;
-        window.__quarkLoginWatch = true;
-
-        // 保留 __TAURI__ 引用到局部变量，并从 window 上删除以避免被夸克反爬虫检测
-        // 注意：Tauri 2 的 __TAURI_INTERNALS__.invoke 是更底层的 IPC 通道，删除 __TAURI__ 不影响它
-        const __TAURI__ = window.__TAURI__;
-        if (__TAURI__) {
-            delete window.__TAURI__;
-            console.log("[quark-login] __TAURI__ removed from window (local ref kept)");
-        }
-
-        // invoke 辅助函数：优先用 __TAURI__.core.invoke，回退到 __TAURI_INTERNALS__.invoke
-        const tauriInvoke = (cmd, args) => {
-            if (__TAURI__ && __TAURI__.core && __TAURI__.core.invoke) {
-                return __TAURI__.core.invoke(cmd, args);
-            }
-            if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
-                return window.__TAURI_INTERNALS__.invoke(cmd, args);
-            }
-            return Promise.reject(new Error("no tauri invoke available"));
-        };
-
-        const check = async () => {
-            try {
-                const isLoginPage = /\/account\/login/.test(location.pathname);
-                const hasPuus = /(?:^|;\s*)__puus=([^;]+)/.test(document.cookie);
-                console.log("[quark-login] check: isLoginPage=" + isLoginPage +
-                    " hasPuus=" + hasPuus + " path=" + location.pathname);
-                // 双重判据：URL 已离开登录页 + __puus 存在，防止匿名 Cookie 误触发
-                if (!isLoginPage && hasPuus) {
-                    const cookie = document.cookie;
-                    console.log("[quark-login] 登录成功，调用 save_quark_cookie, cookie.length=" + cookie.length);
-                    try {
-                        await tauriInvoke('save_quark_cookie', { cookie });
-                        console.log("[quark-login] save_quark_cookie 调用成功");
-                    } catch (e) {
-                        console.log("[quark-login] save_quark_cookie 调用失败: " + (e.message || e));
-                    }
-                    // 关闭窗口（双保险：Rust 命令内也会 close）
-                    try {
-                        if (__TAURI__ && __TAURI__.window && __TAURI__.window.getCurrentWindow) {
-                            const win = __TAURI__.window.getCurrentWindow();
-                            if (win) await win.close();
-                        }
-                    } catch (e) {}
-                    return;
-                }
-            } catch (e) {
-                console.log("[quark-login] check 异常: " + (e.message || e));
-            }
-            window.setTimeout(check, 1500);
-        };
-        window.setTimeout(check, 2000);
-        console.log("[quark-login] check loop scheduled");
-    })();
-"#;
-
-/// baidu-login 窗口注入的初始化脚本（捕获 UA、错误、隐藏 __TAURI__）。
-/// 不在 JS 端轮询 Cookie：百度 BDUSS 为 HttpOnly，document.cookie 拿不到，
-/// 改由 Rust 端 probe 线程通过 cookies_for_url() 获取完整 Cookie。
-const INIT_SCRIPT_BAIDU: &str = r#"
-    (function() {
-        // 第一时间把 UA 和位置写到 window.__probe，供 Rust 端 eval 读取
-        try {
-            window.__probe = {
-                ua: navigator.userAgent,
-                href: location.href,
-                ts: Date.now()
-            };
-        } catch(e) {}
-
-        console.log("[baidu-login] init script executed, location=" + location.href);
-        console.log("[baidu-login] navigator.userAgent=" + navigator.userAgent);
-        window.addEventListener('error', function(e) {
-            console.log("[baidu-login] window error: " + (e.message || 'unknown') +
-                " at " + (e.filename || '') + ":" + (e.lineno || 0));
-        });
-        window.addEventListener('unhandledrejection', function(e) {
-            console.log("[baidu-login] unhandled rejection: " +
-                (e.reason && e.reason.message ? e.reason.message : e.reason));
-        });
-
-        if (window.__baiduLoginWatch) return;
-        window.__baiduLoginWatch = true;
-
-        // 保留 __TAURI__ 引用到局部变量，并从 window 上删除以避免被百度反爬虫检测
-        // 注意：Tauri 2 的 __TAURI_INTERNALS__.invoke 是更底层的 IPC 通道，删除 __TAURI__ 不影响它
-        const __TAURI__ = window.__TAURI__;
-        if (__TAURI__) {
-            delete window.__TAURI__;
-            console.log("[baidu-login] __TAURI__ removed from window (local ref kept)");
-        }
-
-        console.log("[baidu-login] init done, cookie probe handled by Rust thread");
-    })();
-"#;
-
-/// 打开夸克网盘官方登录页（WebView 方式）：
-/// 由夸克官方前端管理二维码生命周期，扫码成功后通过 Tauri IPC 将 Cookie 回传后端。
-#[tauri::command]
-async fn open_quark_login(app: tauri::AppHandle) -> Result<(), String> {
-    eprintln!("[quark-login] === open_quark_login START (async) ===");
-
-    // 若已存在则先关闭，避免 WebviewWindowBuilder 重复创建报错
-    if let Some(existing) = app.get_webview_window("quark-login") {
-        eprintln!("[quark-login] closing existing window...");
-        let _ = existing.close();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        eprintln!("[quark-login] existing window closed");
-    }
-
-    let url = "https://pan.quark.cn/account/login";
-    eprintln!("[quark-login] building webview window for: {}", url);
-
-    // 用 catch_unwind 捕获 build() 内部可能的 panic
-    let app_clone = app.clone();
-    let build_result = tokio::task::spawn_blocking(move || {
-        eprintln!("[quark-login] entering WebviewWindowBuilder::new...");
-        let builder = tauri::WebviewWindowBuilder::new(
-            &app_clone,
-            "quark-login",
-            tauri::WebviewUrl::External(url.parse().unwrap()),
-        )
-        .title("夸克网盘 · 扫码登录")
-        .inner_size(420.0, 640.0)
-        .center()
-        .resizable(true)
-        .min_inner_size(360.0, 540.0)
-        .decorations(true)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-        .initialization_script(INIT_SCRIPT)
-        .on_navigation(|url| {
-            eprintln!("[quark-login] navigating to: {}", url);
-            true
-        })
-        .on_page_load(|_window, payload| {
-            eprintln!("[quark-login] page load event: {:?} url={}", payload.event(), payload.url());
-        });
-        eprintln!("[quark-login] builder constructed, calling .build()...");
-        builder.build()
-    })
-    .await;
-
-    eprintln!("[quark-login] spawn_blocking returned");
-
-    let webview_window = match build_result {
-        Ok(Ok(w)) => {
-            eprintln!("[quark-login] build() OK, window created");
-            w
-        }
-        Ok(Err(e)) => {
-            eprintln!("[quark-login] build() returned Err: {:?}", e);
-            return Err(format!("打开夸克登录窗口失败: {}", e));
-        }
-        Err(join_err) => {
-            eprintln!("[quark-login] spawn_blocking join error: {:?}", join_err);
-            if join_err.is_panic() {
-                return Err(format!("打开夸克登录窗口时线程 panic: {}", join_err));
-            }
-            return Err(format!("打开夸克登录窗口时线程异常: {}", join_err));
-        }
-    };
-
-    // 始终打开 DevTools（不限于 debug 模式），便于调试空白问题
-    eprintln!("[quark-login] opening devtools...");
-    webview_window.open_devtools();
-    eprintln!("[quark-login] devtools opened");
-
-    // 启动后台线程，定期检测登录状态
-    // 登录成功后用 Tauri 2 官方 cookies_for_url() 获取完整 Cookie（含 HttpOnly）
-    // 这是修复 31001 [guest] 错误的关键：document.cookie 拿不到 HttpOnly Cookie
-    let wv = webview_window.clone();
-    let app_for_thread = app.clone();
-    std::thread::spawn(move || {
-        for i in 1..=30 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            // 窗口已关闭则停止 probe
-            if app_for_thread.get_webview_window("quark-login").is_none() {
-                eprintln!("[quark-login] probe stopped, window closed");
-                break;
-            }
-
-            // 用 eval 输出调试信息（eval 不返回值，用 console.log 输出）
-            let probe_js = format!(
-                r#"(function(){{
-                    try {{
-                        var path = location.pathname || "";
-                        var isLoginPage = /\/account\/login/.test(path);
-                        var hasPuus = /(?:^|;\s*)__puus=/.test(document.cookie);
-                        console.log("[quark-login] probe #{}: isLoginPage=" + isLoginPage +
-                            " hasPuus=" + hasPuus + " path=" + path);
-                    }} catch(e) {{}}
-                }})();"#,
-                i
-            );
-            if wv.eval(&probe_js).is_err() {
-                eprintln!("[quark-login] probe #{} eval FAILED, stopping", i);
-                break;
-            }
-
-            // 短暂等待 eval 执行
-            std::thread::sleep(std::time::Duration::from_millis(300));
-
-            // 再次检查窗口状态
-            if app_for_thread.get_webview_window("quark-login").is_none() {
-                eprintln!("[quark-login] probe stopped after eval, window closed");
-                break;
-            }
-
-            // 用 Tauri 2 官方 API 获取完整 Cookie（含 HttpOnly）
-            // probe 是独立线程，不在 Tauri 主消息循环中，可安全调用
-            let url: tauri::Url = match "https://pan.quark.cn".parse() {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            let cookies = match wv.cookies_for_url(url.clone()) {
-                Ok(c) => {
-                    eprintln!("[quark-login] probe #{}: cookies_for_url() returned {} cookies", i, c.len());
-                    c
-                }
-                Err(e) => {
-                    eprintln!("[quark-login] probe #{}: cookies_for_url() FAILED: {:?}, will retry", i, e);
-                    continue;
-                }
-            };
-
-            // 拼接 Cookie 字符串：key=value; key=value
-            let cookie_str: String = cookies
-                .iter()
-                .map(|c| format!("{}={}", c.name(), c.value()))
-                .collect::<Vec<_>>()
-                .join("; ");
-
-            // 检查是否包含 __puus（登录成功的标志）
-            let has_puus = cookie_str.contains("__puus=");
-            // 检查 URL 是否已离开登录页（通过 eval 读取的 path 无法直接拿到，用 cookie 判断）
-            eprintln!("[quark-login] probe #{}: cookie_str.length={}, hasPuus={}",
-                i, cookie_str.len(), has_puus);
-
-            if has_puus && cookie_str.len() > 50 {
-                // 登录成功，保存完整 Cookie（含 HttpOnly）
-                eprintln!("[quark-login] 登录成功，保存完整 Cookie（含 HttpOnly）, length={}", cookie_str.len());
-
-                // 复用 save_quark_cookie 的保存逻辑
-                let app_state = app_for_thread.state::<std::sync::Arc<AppState>>();
-                let mut config = app_state.database.lock().unwrap().load_config().unwrap_or_default();
-                config.quark_cookie = cookie_str.clone();
-                config.quark_cookie_expires_at = chrono::Local::now().timestamp() + 45 * 86400;
-                match app_state.database.lock().unwrap().save_config(&config) {
-                    Ok(_) => eprintln!("[quark-login] config saved successfully (cookies_for_url path)"),
-                    Err(e) => eprintln!("[quark-login] config save failed: {}", e),
-                }
-                // 重置过期提醒标记
-                app_state.quark_cookie_warn_sent.store(false, std::sync::atomic::Ordering::SeqCst);
-
-                // emit 事件通知前端
-                let _ = app_for_thread.emit("quark-login-success", &cookie_str);
-                eprintln!("[quark-login] emitted quark-login-success event");
-
-                // 关闭登录窗口
-                if let Some(w) = app_for_thread.get_webview_window("quark-login") {
-                    let _ = w.close();
-                    eprintln!("[quark-login] quark-login window closed");
-                }
-                break;
-            }
-        }
-    });
-
-    let _ = webview_window;
-    eprintln!("[quark-login] === open_quark_login END ===");
-    Ok(())
-}
-
-/// 保存夸克网盘登录 Cookie（由 quark-login 窗口的 init script 通过 invoke 调用）：
-/// 校验 Cookie → 写入配置 → emit 事件通知主窗口 → 关闭登录窗口。
-#[tauri::command]
-fn save_quark_cookie(
-    cookie: String,
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    eprintln!("[quark-login] save_quark_cookie called, cookie.length={}", cookie.len());
-    if !cookie.contains("__puus=") {
-        eprintln!("[quark-login] save_quark_cookie: cookie 缺少 __puus");
-        return Err("Cookie 中缺少 __puus，登录未成功".to_string());
-    }
-    let mut config = state.database.lock().unwrap().load_config()?;
-    config.quark_cookie = cookie;
-    config.quark_cookie_expires_at = chrono::Local::now().timestamp() + 45 * 86400;
-    state.database.lock().unwrap().save_config(&config)?;
-    eprintln!("[quark-login] save_quark_cookie: config saved, expires_at={}", config.quark_cookie_expires_at);
-    // 重新登录，重置过期提醒标记
-    state.quark_cookie_warn_sent.store(false, std::sync::atomic::Ordering::SeqCst);
-    let _ = app.emit("quark-login-success", &config.quark_cookie);
-    eprintln!("[quark-login] save_quark_cookie: emitted quark-login-success event");
-    if let Some(w) = app.get_webview_window("quark-login") {
-        let _ = w.close();
-        eprintln!("[quark-login] save_quark_cookie: quark-login window closed");
-    }
-    Ok(())
-}
-
-/// 打开百度网盘官方登录页（WebView 方式）：
-/// 由百度官方前端管理登录流程，扫码/登录成功后由 Rust 端 probe 线程
-/// 通过 cookies_for_url() 获取完整 Cookie（含 HttpOnly 的 BDUSS）并保存。
-#[tauri::command]
-async fn open_baidu_login(app: tauri::AppHandle) -> Result<(), String> {
-    eprintln!("[baidu-login] === open_baidu_login START (async) ===");
-
-    // 若已存在则先关闭，避免 WebviewWindowBuilder 重复创建报错
-    if let Some(existing) = app.get_webview_window("baidu-login") {
-        eprintln!("[baidu-login] closing existing window...");
-        let _ = existing.close();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        eprintln!("[baidu-login] existing window closed");
-    }
-
-    let url = "https://pan.baidu.com/login";
-    eprintln!("[baidu-login] building webview window for: {}", url);
-
-    // 用 catch_unwind 捕获 build() 内部可能的 panic
-    let app_clone = app.clone();
-    let build_result = tokio::task::spawn_blocking(move || {
-        eprintln!("[baidu-login] entering WebviewWindowBuilder::new...");
-        let builder = tauri::WebviewWindowBuilder::new(
-            &app_clone,
-            "baidu-login",
-            tauri::WebviewUrl::External(url.parse().unwrap()),
-        )
-        .title("百度网盘 · 扫码登录")
-        .inner_size(420.0, 640.0)
-        .center()
-        .resizable(true)
-        .min_inner_size(360.0, 540.0)
-        .decorations(true)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-        .initialization_script(INIT_SCRIPT_BAIDU)
-        .on_navigation(|url| {
-            eprintln!("[baidu-login] navigating to: {}", url);
-            true
-        })
-        .on_page_load(|_window, payload| {
-            eprintln!("[baidu-login] page load event: {:?} url={}", payload.event(), payload.url());
-        });
-        eprintln!("[baidu-login] builder constructed, calling .build()...");
-        builder.build()
-    })
-    .await;
-
-    eprintln!("[baidu-login] spawn_blocking returned");
-
-    let webview_window = match build_result {
-        Ok(Ok(w)) => {
-            eprintln!("[baidu-login] build() OK, window created");
-            w
-        }
-        Ok(Err(e)) => {
-            eprintln!("[baidu-login] build() returned Err: {:?}", e);
-            return Err(format!("打开百度登录窗口失败: {}", e));
-        }
-        Err(join_err) => {
-            eprintln!("[baidu-login] spawn_blocking join error: {:?}", join_err);
-            if join_err.is_panic() {
-                return Err(format!("打开百度登录窗口时线程 panic: {}", join_err));
-            }
-            return Err(format!("打开百度登录窗口时线程异常: {}", join_err));
-        }
-    };
-
-    // 始终打开 DevTools（不限于 debug 模式），便于调试空白问题
-    eprintln!("[baidu-login] opening devtools...");
-    webview_window.open_devtools();
-    eprintln!("[baidu-login] devtools opened");
-
-    // 启动后台线程，定期检测登录状态
-    // 登录成功后用 Tauri 2 官方 cookies_for_url() 获取完整 Cookie（含 HttpOnly）
-    // 百度 BDUSS 为 HttpOnly，document.cookie 拿不到，必须用此 API
-    let wv = webview_window.clone();
-    let app_for_thread = app.clone();
-    std::thread::spawn(move || {
-        for i in 1..=30 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            // 窗口已关闭则停止 probe
-            if app_for_thread.get_webview_window("baidu-login").is_none() {
-                eprintln!("[baidu-login] probe stopped, window closed");
-                break;
-            }
-
-            // 用 Tauri 2 官方 API 获取完整 Cookie（含 HttpOnly）
-            // probe 是独立线程，不在 Tauri 主消息循环中，可安全调用
-            let url: tauri::Url = match "https://pan.baidu.com".parse() {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            let cookies = match wv.cookies_for_url(url.clone()) {
-                Ok(c) => {
-                    eprintln!("[baidu-login] probe #{}: cookies_for_url() returned {} cookies", i, c.len());
-                    c
-                }
-                Err(e) => {
-                    eprintln!("[baidu-login] probe #{}: cookies_for_url() FAILED: {:?}, will retry", i, e);
-                    continue;
-                }
-            };
-
-            // 拼接 Cookie 字符串：key=value; key=value
-            let cookie_str: String = cookies
-                .iter()
-                .map(|c| format!("{}={}", c.name(), c.value()))
-                .collect::<Vec<_>>()
-                .join("; ");
-
-            // 检查是否包含 BDUSS（登录成功的标志）
-            let has_bduss = cookie_str.contains("BDUSS=");
-            eprintln!("[baidu-login] probe #{}: cookie_str.length={}, hasBduss={}",
-                i, cookie_str.len(), has_bduss);
-
-            if has_bduss && cookie_str.len() > 50 {
-                // 登录成功，保存完整 Cookie（含 HttpOnly）
-                eprintln!("[baidu-login] 登录成功，保存完整 Cookie（含 HttpOnly）, length={}", cookie_str.len());
-
-                // 保存到配置
-                let app_state = app_for_thread.state::<std::sync::Arc<AppState>>();
-                let mut config = app_state.database.lock().unwrap().load_config().unwrap_or_default();
-                config.baidu_cookie = cookie_str.clone();
-                config.baidu_cookie_expires_at = chrono::Local::now().timestamp() + 60 * 86400;
-                match app_state.database.lock().unwrap().save_config(&config) {
-                    Ok(_) => eprintln!("[baidu-login] config saved successfully (cookies_for_url path)"),
-                    Err(e) => eprintln!("[baidu-login] config save failed: {}", e),
-                }
-                // 注意：AppState 上没有 baidu_cookie_warn_sent 字段，无需重置
-
-                // emit 事件通知前端
-                let _ = app_for_thread.emit("baidu-login-success", &cookie_str);
-                eprintln!("[baidu-login] emitted baidu-login-success event");
-
-                // 关闭登录窗口
-                if let Some(w) = app_for_thread.get_webview_window("baidu-login") {
-                    let _ = w.close();
-                    eprintln!("[baidu-login] baidu-login window closed");
-                }
-                break;
-            }
-        }
-    });
-
-    let _ = webview_window;
-    eprintln!("[baidu-login] === open_baidu_login END ===");
-    Ok(())
-}
-
 /// 退出登录：清空对应提供者的 Cookie 与失效时间，并关闭自动同步
 #[tauri::command]
-fn logout(provider: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+fn logout(
+    provider: String,
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let mut config = state.database.lock().unwrap().load_config()?;
     match provider.as_str() {
         "baidu" => {
@@ -883,7 +345,24 @@ fn logout(provider: String, state: State<'_, Arc<AppState>>) -> Result<(), Strin
         }
         _ => return Err("未知的提供者".to_string()),
     }
-    state.database.lock().unwrap().save_config(&config)
+    state.database.lock().unwrap().save_config(&config)?;
+
+    // 移动端：若所有同步均已停用，取消常驻通知
+    #[cfg(mobile)]
+    {
+        let cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
+        let any_sync = (cfg.baidu_sync_enabled && !cfg.baidu_cookie.is_empty())
+            || (cfg.quark_sync_enabled && !cfg.quark_cookie.is_empty());
+        if !any_sync {
+            mobile::notification::cancel_all(&app);
+        }
+    }
+
+    // 桌面端无通知模块，显式标记参数已使用以避免警告
+    #[cfg(not(mobile))]
+    let _ = &app;
+
+    Ok(())
 }
 
 /// 从外部 JSON 文件导入数据（直接覆盖当前 vault.json）
@@ -935,7 +414,7 @@ fn export_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<(), S
 #[tauri::command]
 fn generate_password(length: Option<usize>) -> Result<String, String> {
     let len = length.unwrap_or(16);
-    Ok(crypto::generate_password(len))
+    Ok(shared::crypto::generate_password(len))
 }
 
 /// 获取数据库文件路径（供前端显示）
@@ -984,6 +463,13 @@ fn handle_sync_result(
                 _ => {}
             }
             let _ = state.database.lock().unwrap().save_config(&cfg);
+            // 移动端：同步完成通知
+            #[cfg(mobile)]
+            {
+                if let Err(e) = mobile::notification::show_sync_complete(&app) {
+                    eprintln!("[mobile] 同步完成通知失败: {}", e);
+                }
+            }
         }
         Err(msg) if msg == "cookie_expired" => {
             let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
@@ -1000,12 +486,24 @@ fn handle_sync_result(
                     "message": format!("{} 登录已失效，请重新扫码", provider)
                 }),
             );
+            // 移动端：Cookie 失效，取消常驻通知（同步调度器仍运行，但实际无任务可做）
+            #[cfg(mobile)]
+            {
+                mobile::notification::cancel_running(&app);
+            }
         }
         Err(msg) => {
             let _ = app.emit(
                 "sync://error",
                 serde_json::json!({ "provider": provider, "message": msg }),
             );
+            // 移动端：同步失败通知
+            #[cfg(mobile)]
+            {
+                if let Err(e) = mobile::notification::show_sync_error(&app, &msg) {
+                    eprintln!("[mobile] 同步错误通知失败: {}", e);
+                }
+            }
         }
     }
 }
@@ -1025,7 +523,7 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
                 let ap = app.clone();
                 let res = tauri::async_runtime::spawn_blocking(move || match BaiduAuth::new().validate(&cookie) {
                     Ok(true) => {
-                        let provider = sync::baidu::BaiduProvider::new(cookie);
+                        let provider = shared::sync::baidu::BaiduProvider::new(cookie);
                         provider.upload(&db_path, &remote)
                     }
                     Ok(false) => Err("cookie_expired".to_string()),
@@ -1073,10 +571,10 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
                 let ap = app.clone();
                 let res = tauri::async_runtime::spawn_blocking(move || match QuarkAuth::new().validate(&cookie) {
                     Ok(true) => {
-                        let provider = sync::quark::QuarkProvider::new(cookie);
+                        let provider = shared::sync::quark::QuarkProvider::new(cookie);
 
                         // 1. 检测本地 vault.json 有效性
-                        let local_valid = sync::quark::QuarkProvider::local_vault_valid(&db_path);
+                        let local_valid = shared::sync::quark::QuarkProvider::local_vault_valid(&db_path);
 
                         if !local_valid {
                             // 2. 本地无效 → 查云端是否有文件
@@ -1171,10 +669,52 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
 
 // ========== 应用入口 ==========
 
+/// 桌面端数据目录迁移：从旧路径（dirs::data_dir()/password-safer）迁移到
+/// Tauri 标准 app_data_dir（%APPDATA%\com.passwordsafer.app\）
+/// 仅在新目录尚无 vault.json 且旧目录存在时执行，避免数据丢失
+#[cfg(desktop)]
+fn migrate_from_old_data_dir(new_data_dir: &std::path::Path) {
+    let old_data_dir = match dirs::data_dir() {
+        Some(d) => d.join("password-safer"),
+        None => return,
+    };
+
+    if !old_data_dir.exists() {
+        return;
+    }
+
+    // 新目录已有 vault.json，说明已迁移过，跳过
+    if new_data_dir.join("vault.json").exists() {
+        return;
+    }
+
+    eprintln!(
+        "[migrate] 检测到旧数据目录: {:?}，迁移到 {:?}",
+        old_data_dir, new_data_dir
+    );
+
+    // 复制旧目录下所有文件到新目录
+    if let Ok(entries) = std::fs::read_dir(&old_data_dir) {
+        for entry in entries.flatten() {
+            let from = entry.path();
+            if from.is_file() {
+                let to = new_data_dir.join(entry.file_name());
+                match std::fs::copy(&from, &to) {
+                    Ok(_) => eprintln!("[migrate] 已迁移文件: {:?}", entry.file_name()),
+                    Err(e) => eprintln!("[migrate] 复制 {:?} 失败: {}", from, e),
+                }
+            }
+        }
+    }
+
+    eprintln!("[migrate] 数据目录迁移完成（旧目录保留，可手动删除）");
+}
+
 /// 数据迁移：如果存在旧 vault.db（SQLite），读取数据并迁移到 vault.json
 /// 迁移完成后将 vault.db 重命名为 vault.db.old（避免重复迁移）
 /// 仅在 vault.json 不存在时执行迁移
-fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Crypto) {
+#[cfg(feature = "sqlite-migrate")]
+fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &shared::crypto::Crypto) {
     let json_path = data_dir.join("vault.json");
     let db_path = data_dir.join("vault.db");
     let old_db_path = data_dir.join("vault.db.old");
@@ -1195,7 +735,7 @@ fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Cr
     eprintln!("[migrate] 检测到旧 vault.db，开始迁移到 vault.json");
 
     // 打开旧 SQLite 数据库
-    let database = match db::Database::open(&db_path, crypto.clone_key()) {
+    let database = match shared::db::Database::open(&db_path, crypto.clone_key()) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("[migrate] 打开旧 vault.db 失败: {}，跳过迁移", e);
@@ -1213,7 +753,7 @@ fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Cr
     };
 
     // 读取旧配置（使用 ConfigManager）
-    let config_manager = match config::ConfigManager::from_db_path(&db_path) {
+    let config_manager = match shared::config::ConfigManager::from_db_path(&db_path) {
         Ok(cm) => cm,
         Err(e) => {
             eprintln!("[migrate] 打开旧配置失败: {}，跳过迁移", e);
@@ -1223,7 +763,7 @@ fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Cr
     let config = config_manager.load();
 
     // 构造 StoreData
-    let mut store_data = storage::json_store::StoreData::default();
+    let mut store_data = shared::storage::json_store::StoreData::default();
     store_data.config = config;
     store_data.next_id = passwords.iter().map(|p| p.id).max().unwrap_or(0) + 1;
 
@@ -1236,7 +776,7 @@ fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Cr
                 continue;
             }
         };
-        let record = storage::json_store::PasswordRecord {
+        let record = shared::storage::json_store::PasswordRecord {
             id: dto.id,
             name: dto.name,
             icon: dto.icon,
@@ -1256,7 +796,7 @@ fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Cr
     eprintln!("[migrate] 迁移 {} 条密码记录", store_data.passwords.len());
 
     // 创建 JsonStore 并保存数据
-    let json_store = match storage::json_store::JsonStore::open(json_path.clone(), crypto.clone_key()) {
+    let json_store = match shared::storage::json_store::JsonStore::open(json_path.clone(), crypto.clone_key()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[migrate] 创建 vault.json 失败: {}，迁移中止", e);
@@ -1284,160 +824,156 @@ fn migrate_from_sqlite_if_needed(data_dir: &std::path::Path, crypto: &crypto::Cr
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 初始化数据目录
-    let data_dir = get_data_dir();
-    let db_path = data_dir.join("vault.json");
-    let key_path = data_dir.join("master.key");
+    // 创建 Builder，应用平台专属配置（URI scheme、窗口事件等）
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = desktop::configure_builder(builder);
+    #[cfg(mobile)]
+    let builder = mobile::configure_builder(builder);
 
-    // 初始化加密器
-    let crypto = crypto::Crypto::from_key_file(&key_path).expect("无法初始化加密器");
+    // 注册命令处理器（共享命令 + 平台专属命令）
+    #[cfg(desktop)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_all_passwords,
+        search_passwords,
+        get_passwords_by_tag,
+        get_favorites,
+        get_weak_passwords,
+        add_password,
+        update_password,
+        delete_password,
+        toggle_favorite,
+        update_last_used,
+        get_config,
+        save_config,
+        sync_now,
+        check_sync_connection,
+        qr_start,
+        qr_poll,
+        logout,
+        import_db,
+        export_db,
+        generate_password,
+        get_db_info,
+        desktop::auth::quark::open_quark_login,
+        desktop::auth::quark::save_quark_cookie,
+        desktop::auth::baidu::open_baidu_login,
+    ]);
 
-    // 数据迁移：如果存在旧 vault.db（SQLite），迁移数据到 vault.json
-    migrate_from_sqlite_if_needed(&data_dir, &crypto);
+    #[cfg(mobile)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_all_passwords,
+        search_passwords,
+        get_passwords_by_tag,
+        get_favorites,
+        get_weak_passwords,
+        add_password,
+        update_password,
+        delete_password,
+        toggle_favorite,
+        update_last_used,
+        get_config,
+        save_config,
+        sync_now,
+        check_sync_connection,
+        qr_start,
+        qr_poll,
+        logout,
+        import_db,
+        export_db,
+        generate_password,
+        get_db_info,
+        mobile::auth::quark::open_quark_login,
+        mobile::auth::baidu::open_baidu_login,
+    ]);
 
-    // 初始化 JSON 存储（双重加密：密码字段加密 + 文件整体加密）
-    let database = storage::json_store::JsonStore::open(db_path.clone(), crypto)
-        .expect("无法打开 vault.json");
-
-    let state = Arc::new(AppState {
-        database: Mutex::new(database),
-        db_path,
-        data_dir,
-        quark_cookie_warn_sent: std::sync::atomic::AtomicBool::new(false),
-    });
-
-    // 启动定时同步
-    let scheduler_state = state.clone();
-    tauri::Builder::default()
-        .manage(state.clone())
-        .register_uri_scheme_protocol("quark-cb", move |app, request| -> tauri::http::Response<Vec<u8>> {
-            // 请求形如：http://quark-cb.localhost/success?c=ENCODED_COOKIE
-            let uri = request.uri().to_string();
-            eprintln!("[quark-login] quark-cb received request: {}", uri.chars().take(100).collect::<String>());
-            let cookie = uri
-                .find("c=")
-                .and_then(|pos| {
-                    let start = pos + 2;
-                    let rest = &uri[start..];
-                    let end = rest.find('&').unwrap_or(rest.len());
-                    Some(url_decode(&rest[..end]))
-                })
-                .unwrap_or_default();
-            eprintln!("[quark-login] quark-cb decoded cookie.length={}, hasPuus={}", cookie.len(), cookie.contains("__puus="));
-            let handle = app.app_handle();
-
-            // 直接在 Rust 端保存 Cookie 到配置（不依赖前端 invoke）
-            let app_state = handle.state::<std::sync::Arc<AppState>>();
-            if !cookie.contains("__puus=") {
-                eprintln!("[quark-login] quark-cb: cookie 缺少 __puus，不保存");
-            } else {
-                let mut config = app_state.database.lock().unwrap().load_config().unwrap_or_default();
-                config.quark_cookie = cookie.clone();
-                config.quark_cookie_expires_at = chrono::Local::now().timestamp() + 45 * 86400;
-                match app_state.database.lock().unwrap().save_config(&config) {
-                    Ok(_) => eprintln!("[quark-login] quark-cb: config saved successfully"),
-                    Err(e) => eprintln!("[quark-login] quark-cb: config save failed: {}", e),
-                }
-                // 重置过期提醒标记
-                app_state.quark_cookie_warn_sent.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-
-            let _ = handle.emit("quark-login-success", &cookie);
-            eprintln!("[quark-login] quark-cb: emitted quark-login-success event");
-            if let Some(w) = handle.get_webview_window("quark-login") {
-                let _ = w.close();
-                eprintln!("[quark-login] quark-cb: quark-login window closed");
-            }
-            tauri::http::Response::builder()
-                .status(200)
-                .header("Content-Type", "text/html; charset=utf-8")
-                .body(FULL_HTML_BODY.as_bytes().to_vec())
-                .unwrap()
-        })
-        .invoke_handler(tauri::generate_handler![
-            get_all_passwords,
-            search_passwords,
-            get_passwords_by_tag,
-            get_favorites,
-            get_weak_passwords,
-            add_password,
-            update_password,
-            delete_password,
-            toggle_favorite,
-            update_last_used,
-            get_config,
-            save_config,
-            sync_now,
-            check_sync_connection,
-            qr_start,
-            qr_poll,
-            open_quark_login,
-            save_quark_cookie,
-            open_baidu_login,
-            logout,
-            import_db,
-            export_db,
-            generate_password,
-            get_db_info,
-        ])
+    builder
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            // 系统托盘菜单
-            let show_item = tauri::menu::MenuItem::with_id(app, "tray_show", "显示主窗口", true, None::<&str>)?;
-            let hide_item = tauri::menu::MenuItem::with_id(app, "tray_hide", "隐藏主窗口", true, None::<&str>)?;
-            let quit_item = tauri::menu::MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+            // 初始化数据目录（通过 Tauri AppHandle 获取跨平台路径）
+            // 仅保留快速路径计算与目录创建，避免阻塞 Android 主线程触发 ANR
+            let data_dir = shared::storage::get_app_data_dir(app.handle());
+            std::fs::create_dir_all(&data_dir).ok();
 
-            // 系统托盘图标
-            tauri::tray::TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Password Safer - 密码保管箱")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            match window.is_visible() {
-                                Ok(true) => { let _ = window.hide(); }
-                                _ => {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
-                            }
-                        }
-                    }
-                })
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "tray_show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "tray_hide" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
-                        }
-                        "tray_quit" => {
-                            app.exit(0);
-                        }
-                        _ => {}
-                    }
-                })
-                .build(app)?;
+            let app_handle = app.handle().clone();
 
-            start_sync_scheduler(scheduler_state, app.handle().clone());
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
+            // 同步 I/O 与解密操作放入异步任务，setup 立即返回 Ok(())
+            tauri::async_runtime::spawn(async move {
+                // spawn_blocking 在独立线程池执行同步 I/O，不阻塞主线程
+                let blocking_result = tauri::async_runtime::spawn_blocking(move || -> Result<Arc<AppState>, String> {
+                    // 桌面端：从旧路径（password-safer）迁移到标准 app_data_dir
+                    #[cfg(desktop)]
+                    migrate_from_old_data_dir(&data_dir);
+
+                    let db_path = data_dir.join("vault.json");
+                    let key_path = data_dir.join("master.key");
+
+                    // 初始化加密器
+                    let crypto = shared::crypto::Crypto::from_key_file(&key_path)?;
+
+                    // 数据迁移：如果存在旧 vault.db（SQLite），迁移数据到 vault.json
+                    #[cfg(feature = "sqlite-migrate")]
+                    migrate_from_sqlite_if_needed(&data_dir, &crypto);
+
+                    // 初始化 JSON 存储（双重加密：密码字段加密 + 文件整体加密）
+                    let database =
+                        shared::storage::json_store::JsonStore::open(db_path.clone(), crypto)?;
+
+                    let state = Arc::new(AppState {
+                        database: Mutex::new(database),
+                        db_path,
+                        data_dir,
+                        quark_cookie_warn_sent: std::sync::atomic::AtomicBool::new(false),
+                    });
+
+                    Ok(state)
+                })
+                .await;
+
+                match blocking_result {
+                    Ok(Ok(state)) => {
+                        // AppState 注入（必须在平台 init 与 sync 调度之前）
+                        app_handle.manage(state.clone());
+
+                        // 平台专属初始化（系统托盘等）
+                        #[cfg(desktop)]
+                        {
+                            if let Err(e) = desktop::init(&app_handle) {
+                                let _ = app_handle
+                                    .emit("app-error", format!("桌面端初始化失败: {:?}", e));
+                                return;
+                            }
+                        }
+                        #[cfg(mobile)]
+                        {
+                            if let Err(e) = mobile::init(&app_handle) {
+                                let _ = app_handle
+                                    .emit("app-error", format!("移动端初始化失败: {:?}", e));
+                                return;
+                            }
+                        }
+
+                        start_sync_scheduler(state, app_handle.clone());
+
+                        // 通知前端：应用初始化完成，可以开始调用 invoke
+                        let _ = app_handle.emit("app-ready", ());
+                    }
+                    Ok(Err(e)) => {
+                        // spawn_blocking 内部返回的 Err（加密器/存储初始化失败）
+                        let _ = app_handle.emit("app-error", e);
+                    }
+                    Err(e) => {
+                        // spawn_blocking 任务本身 panic 或被取消
+                        let _ = app_handle
+                            .emit("app-error", format!("初始化任务异常: {:?}", e));
+                    }
                 }
-            }
+            });
+
+            Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,14 +1,18 @@
 ﻿# ============================================================
 # Password Safer - 构建脚本
 # 使用方式:
-#   .\build.ps1           - 开发模式（热重载）
-#   .\build.ps1 -Build    - 生产构建（生成安装包）
-#   .\build.ps1 -Check    - 仅检查环境依赖
+#   .\build.ps1                  - 桌面开发模式（热重载）
+#   .\build.ps1 -Build           - 桌面生产构建（生成安装包）
+#   .\build.ps1 -Check           - 仅检查环境依赖
+#   .\build.ps1 -Android         - 安卓开发模式（需 Android SDK）
+#   .\build.ps1 -Android -Build  - 安卓生产构建（生成 APK / AAB）
+#   .\build.ps1 -Android -Check  - 仅检查 Android 环境
 # ============================================================
 
 param(
     [switch]$Build,
-    [switch]$Check
+    [switch]$Check,
+    [switch]$Android
 )
 
 $ErrorActionPreference = "Stop"
@@ -148,6 +152,62 @@ if (-not (Test-Path $tauriCli)) {
     Write-Host "  Tauri CLI: OK" -ForegroundColor Green
 }
 
+# ========== 4.5 检查 Android SDK（仅 -Android 模式） ==========
+if ($Android) {
+    Write-Host ""
+    Write-Host "检查 Android SDK..." -ForegroundColor Yellow
+
+    if (-not $env:ANDROID_HOME) {
+        Write-Host "  [ERROR] ANDROID_HOME 环境变量未设置" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Android 构建需要 Android SDK + NDK 环境。请:" -ForegroundColor White
+        Write-Host "    1. 安装 Android Studio: https://developer.android.com/studio" -ForegroundColor White
+        Write-Host "    2. 通过 SDK Manager 安装 Android SDK Platform / Build-Tools" -ForegroundColor White
+        Write-Host "    3. 安装 NDK (Side by side) 与 CMake" -ForegroundColor White
+        Write-Host "    4. 设置环境变量 ANDROID_HOME 指向 SDK 根目录" -ForegroundColor White
+        Write-Host "       (例如: C:\Users\<user>\AppData\Local\Android\Sdk)" -ForegroundColor White
+        Write-Host "    5. 首次运行需执行: npx tauri android init" -ForegroundColor White
+        Write-Host ""
+        exit 1
+    }
+
+    if (-not (Test-Path $env:ANDROID_HOME)) {
+        Write-Host "  [ERROR] ANDROID_HOME 路径不存在: $env:ANDROID_HOME" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "  ANDROID_HOME: $env:ANDROID_HOME" -ForegroundColor Green
+
+    if ($env:NDK_HOME -and (Test-Path $env:NDK_HOME)) {
+        Write-Host "  NDK_HOME: $env:NDK_HOME" -ForegroundColor Green
+    } else {
+        Write-Host "  [WARNING] NDK_HOME 未设置, Tauri 将尝试自动检测 NDK" -ForegroundColor Yellow
+    }
+
+    $androidGen = Join-Path $ProjectRoot "src-tauri\gen\android"
+    if (-not (Test-Path $androidGen)) {
+        Write-Host "  [WARNING] src-tauri\gen\android\ 不存在" -ForegroundColor Yellow
+        if (-not $Check) {
+            $choice = Read-Host "  是否现在执行 tauri android init? (y/N)"
+            if ($choice -eq "y" -or $choice -eq "Y") {
+                Push-Location $ProjectRoot
+                npx tauri android init
+                $initExit = $LASTEXITCODE
+                Pop-Location
+                if ($initExit -ne 0) {
+                    Write-Host "  [ERROR] tauri android init 失败" -ForegroundColor Red
+                    exit 1
+                }
+                Write-Host "  Android 工程初始化完成" -ForegroundColor Green
+            } else {
+                Write-Host "  跳过初始化, 构建可能失败" -ForegroundColor Yellow
+            }
+        }
+    } else {
+        Write-Host "  Android 工程已初始化: OK" -ForegroundColor Green
+    }
+}
+
 # ========== 5. 构建/运行 ==========
 Write-Host ""
 Write-Host "[5/5] 启动构建..." -ForegroundColor Yellow
@@ -163,7 +223,48 @@ if ($Check) {
 
 Push-Location $ProjectRoot
 
-if ($Build) {
+if ($Android) {
+    if ($Build) {
+        Write-Host "  执行 Android 生产构建 (npm run tauri:android:build)..." -ForegroundColor White
+        Write-Host "  这将生成 Android APK / AAB" -ForegroundColor White
+        Write-Host ""
+        npm run tauri:android:build
+        $buildExit = $LASTEXITCODE
+
+        if ($buildExit -eq 0) {
+            Write-Host ""
+            Write-Host "==========================================" -ForegroundColor Green
+            Write-Host "  Android 构建成功!" -ForegroundColor Green
+            Write-Host "==========================================" -ForegroundColor Green
+            Write-Host ""
+            Write-Host "  产物位置:" -ForegroundColor Cyan
+            $apkPath = Join-Path $ProjectRoot "src-tauri\gen\android\app\build\outputs"
+            if (Test-Path $apkPath) {
+                Get-ChildItem $apkPath -Recurse -Include *.apk,*.aab | ForEach-Object {
+                    Write-Host "    $($_.FullName)" -ForegroundColor White
+                }
+            }
+            Write-Host ""
+        } else {
+            Write-Host ""
+            Write-Host "==========================================" -ForegroundColor Red
+            Write-Host "  Android 构建失败! 退出码: $buildExit" -ForegroundColor Red
+            Write-Host "==========================================" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  常见问题:" -ForegroundColor Yellow
+            Write-Host "    1. ANDROID_HOME / NDK_HOME 未正确设置" -ForegroundColor White
+            Write-Host "    2. 未执行 npx tauri android init" -ForegroundColor White
+            Write-Host "    3. 未连接设备或未启动模拟器 (dev 模式)" -ForegroundColor White
+            Write-Host "    4. Android SDK Build-Tools / Platform 版本不匹配" -ForegroundColor White
+            Write-Host ""
+        }
+    } else {
+        Write-Host "  启动 Android 开发模式 (npm run tauri:android:dev)..." -ForegroundColor White
+        Write-Host "  需连接 Android 设备或启动模拟器" -ForegroundColor White
+        Write-Host ""
+        npm run tauri:android:dev
+    }
+} elseif ($Build) {
     Write-Host "  执行生产构建 (npm run tauri build)..." -ForegroundColor White
     Write-Host "  这将生成 Windows 安装包 (.msi / .exe)" -ForegroundColor White
     Write-Host ""

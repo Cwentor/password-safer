@@ -18,7 +18,19 @@ src-tauri/gen/schemas/
 src-tauri/Cargo.lock.bak
 
 # ========== Tauri 自动生成 ==========
+# 注意: src-tauri/gen/ 整体已被忽略（Tauri 生成工程，含 Android Studio 项目）。
+#       下方 Android 专项规则为显式声明，便于在移除 gen/ 整体忽略时仍保留对构建产物的过滤。
 src-tauri/gen/
+
+# ========== Android (Tauri mobile) ==========
+# 即使后续选择提交 src-tauri/gen/android/ 中的关键配置（如 AndroidManifest.xml），
+# 以下构建产物与本地配置也不应入库：
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/build/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/captures/
+src-tauri/gen/android/.cxx/
 
 # ========== 环境变量与密钥 ==========
 .env

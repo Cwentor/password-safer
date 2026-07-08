@@ -2,7 +2,7 @@ pub mod auth;
 pub mod baidu;
 pub mod quark;
 
-use crate::models::SyncResult;
+use crate::shared::models::SyncResult;
 use std::path::PathBuf;
 
 /// 同步提供者 trait

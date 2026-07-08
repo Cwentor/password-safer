@@ -4,7 +4,7 @@
 
 ![version](https://img.shields.io/badge/version-v2.0.1-cyan?style=flat-square)
 ![license](https://img.shields.io/badge/license-GPL%20v3-blue?style=flat-square)
-![platform](https://img.shields.io/badge/platform-Windows-success?style=flat-square)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Android%20(Phase%202)-blueviolet?style=flat-square)
 ![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)
 ![rust](https://img.shields.io/badge/Rust-edition%202021-dea584?style=flat-square)
 
@@ -84,15 +84,17 @@ Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码
 
 | 组件 | 技术 | 说明 |
 |------|------|------|
-| 桌面框架 | Tauri 2.x | 跨平台桌面应用框架 |
-| 后端语言 | Rust (edition 2021) | 核心业务逻辑 |
+| 桌面框架 | Tauri 2.x | 跨平台桌面 / 移动应用框架 |
+| 后端语言 | Rust (edition 2021) | 核心业务逻辑（shared / desktop / mobile 三层） |
 | 数据库 | rusqlite 0.31 (bundled) | SQLite，静态编译 |
 | 加密 | aes-gcm 0.10 | AES-256-GCM 认证加密 |
 | HTTP 客户端 | reqwest 0.12 (blocking + rustls) | 同步 HTTP，避免 OpenSSL 依赖 |
 | 异步运行时 | tokio 1.x (full) | 同步调度器与扫码轮询 |
 | 二维码 | qrcode 0.14 + image 0.25 | 扫码登录二维码渲染 |
 | 哈希 | sha1 0.10 + md-5 0.10 | 夸克上传秒传校验 |
-| 前端 | 原生 HTML / CSS / JS | Vite 5 构建，无框架依赖 |
+| 前端 | 原生 HTML / CSS / JS (ES Modules) | Vite 5 构建，组件化，无框架依赖 |
+| 平台检测 | @tauri-apps/plugin-os | 桌面 / 安卓平台识别与布局分发 |
+| 应用唤起 | @tauri-apps/plugin-shell | 安卓端 Deep Link 与外部唤起支持 |
 | UI 主题 | 天青色渐变 (Cyan / Teal) | 自定义无边框窗口 |
 
 ---
@@ -146,6 +148,33 @@ npm run tauri build      # 生产构建
 - `nsis/` — NSIS 安装程序
 - `msi/` — MSI 安装包
 
+### 2.1 Android 构建（Phase 2，需 Android SDK）
+
+Android 端完整功能将在 Phase 2 实现，当前已就绪多端架构骨架：
+- 后端 `src-tauri/src/mobile/` 模块骨架（auth / notification 占位）
+- 前端 `src/mobile/` 布局骨架
+- Tauri Android 工程配置（`capabilities/mobile.json`、`tauri-plugin-os` / `tauri-plugin-shell`）
+
+**前置条件**：
+1. 安装 [Android Studio](https://developer.android.com/studio) + SDK + NDK
+2. 设置环境变量 `ANDROID_HOME`（指向 SDK 根目录），可选 `NDK_HOME`
+3. 首次运行需初始化 Android 工程：`npx tauri android init`
+
+```powershell
+# 使用构建脚本（推荐）
+.\build.ps1 -Android              # 安卓开发模式（需连接设备 / 模拟器）
+.\build.ps1 -Android -Build       # 安卓生产构建（生成 APK / AAB）
+.\build.ps1 -Android -Check       # 仅检查 Android 环境
+
+# 手动命令
+npm run tauri:android:dev         # 开发模式
+npm run tauri:android:build       # 生产构建
+```
+
+构建产物位于 `src-tauri/gen/android/app/build/outputs/`。
+
+> ⚠️ 当前环境未安装 Android SDK/NDK，`src-tauri/gen/android/` 工程尚未生成。需先完成上述前置条件并执行 `npx tauri android init`。
+
 ### 3. 配置云同步
 
 应用启动后，点击右上角设置图标进入设置页面 → 「云同步」标签，选择网盘并点击「扫码登录」（夸克）或「扫码登录」（百度）即可自动获取 Cookie。详细配置说明请参阅 [CONFIG.md](./CONFIG.md)。
@@ -154,41 +183,62 @@ npm run tauri build      # 生产构建
 
 ## 项目结构
 
+项目采用 **前后端三层架构**（`shared/` + `desktop/` + `mobile/`），共享代码集中管理，平台专属代码独立隔离，便于桌面端与安卓端并行演进。
+
 ```
 password-safer/
-├── index.html                    # 前端 UI（HTML + CSS + JS 内联）
+├── index.html                    # Vite 入口模板
 ├── package.json                  # npm 依赖配置
 ├── vite.config.js                # Vite 构建配置
-├── build.ps1                     # 构建脚本
+├── build.ps1                     # 构建脚本（支持桌面 / 安卓）
 ├── CONFIG.md                     # 配置参数说明文档
 ├── LICENSE                       # GNU General Public License v3
 ├── README.md                     # 本文档
+├── src/                          # 前端源码（组件化 ES Modules）
+│   ├── main.js                   # 入口：平台检测 + 动态加载 desktop/mobile
+│   ├── shared/                   # 跨平台共享
+│   │   ├── components/           # 共享组件（PasswordList / DetailPanel / AddModal 等）
+│   │   ├── lib/                  # 工具库（api / platform / utils / state 等）
+│   │   └── styles/               # 设计令牌（tokens.css）+ 基础样式（base.css）
+│   ├── desktop/                  # 桌面端专属
+│   │   ├── components/           # TitleBar / Sidebar
+│   │   ├── styles/               # 桌面布局样式（desktop.css）
+│   │   └── index.js              # 桌面三栏布局组装
+│   └── mobile/                   # 安卓端专属（Phase 2 完整实现）
+│       ├── components/           # 底部导航等（Phase 2）
+│       ├── styles/               # 移动布局样式（mobile.css）
+│       └── index.js              # 移动布局骨架
 └── src-tauri/
     ├── Cargo.toml                # Rust 依赖配置
-    ├── tauri.conf.json           # Tauri 应用配置（无边框窗口）
+    ├── tauri.conf.json           # Tauri 应用配置
     ├── build.rs                  # Tauri 构建脚本
     ├── icons/                    # 应用图标
     ├── .cargo/
     │   └── config.toml           # Cargo 镜像配置（国内加速）
-    ├── capabilities/
-    │   ├── default.json          # 主窗口 Tauri 权限配置
-    │   └── quark-login.json      # 夸克登录 WebView 远程页面权限
+    ├── capabilities/             # Tauri 权限配置
+    │   ├── default.json          # 桌面端权限
+    │   ├── quark-login.json      # 夸克登录 WebView 远程页面权限
+    │   └── mobile.json           # 安卓端权限（os / shell 等）
     └── src/
         ├── main.rs               # 程序入口
-        ├── lib.rs                # 核心逻辑：Tauri 命令 + 同步调度器
-        ├── models.rs             # 数据模型：PasswordDto / AppConfig
-        ├── crypto.rs             # AES-256-GCM 加密/解密
-        ├── db.rs                 # SQLite 数据库 CRUD + 导入
-        ├── config.rs             # 配置管理器
-        └── sync/
-            ├── mod.rs            # 同步 trait + 辅助函数
-            ├── baidu.rs          # 百度网盘同步（web cookie + bdstoken）
-            ├── quark.rs          # 夸克网盘同步（HttpOnly Cookie + 双向）
-            └── auth/
-                ├── mod.rs        # 扫码登录 trait
-                ├── baidu.rs      # 百度 API 扫码登录
-                └── quark.rs      # 夸克 CAS 扫码登录
+        ├── lib.rs                # 平台分发入口 + 共享命令注册
+        ├── shared/               # 跨平台共享代码
+        │   ├── models.rs         # 数据模型（PasswordDto / AppConfig）
+        │   ├── crypto.rs         # AES-256-GCM 加密
+        │   ├── db.rs             # SQLite CRUD + 导入
+        │   ├── config.rs         # 配置管理器
+        │   ├── sync/             # 云同步（夸克 / 百度）
+        │   └── storage/          # 存储路径抽象（get_app_data_dir）
+        ├── desktop/              # 桌面专属代码
+        │   ├── tray.rs           # 系统托盘
+        │   ├── window.rs         # 窗口控制（CloseRequested 拦截等）
+        │   └── auth/             # WebView 扫码登录（夸克 / 百度）
+        └── mobile/               # 安卓专属代码（Phase 2）
+            ├── auth/             # Deep Link 登录
+            └── notification.rs   # 前台服务通知
 ```
+
+> 安卓端 `src-tauri/gen/android/` 工程由 `tauri android init` 生成，已加入 `.gitignore`。
 
 ---
 
@@ -315,6 +365,7 @@ password-safer/
 3. **百度双向同步**：当前百度仅支持单向上传，未实现 `remote_file_mtime`，不支持下载恢复（夸克已支持）
 4. **自动锁定 / 剪贴板自动清空**：配置项已就绪，定时触发逻辑待实现
 5. **夸克网盘非官方接口**：依赖 Web 端 Cookie，可能随夸克版本更新失效
+6. **安卓端完整功能待 Phase 2 实现**：当前 Phase 1 已完成多端架构骨架（后端 `mobile/` 模块、前端 `mobile/` 布局、Tauri Android 工程配置与权限），完整移动端 UI、Deep Link 登录、前台服务通知等原生功能将在 Phase 2 实现
 
 ---
 
@@ -354,5 +405,5 @@ registry = "sparse+https://rsproxy.cn/index/"
 ---
 
 <p align="center">
-  <sub>Built with Tauri 2 · Rust · Vite · Made for Windows</sub>
+  <sub>Built with Tauri 2 · Rust · Vite · Made for Windows · Android (Phase 2)</sub>
 </p>

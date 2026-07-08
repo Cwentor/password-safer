@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
-use crate::models::AppConfig;
+use crate::shared::models::AppConfig;
 
 /// 配置管理器：从 SQLite app_config 表读写配置
 pub struct ConfigManager {
