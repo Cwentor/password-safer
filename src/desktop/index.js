@@ -15,7 +15,7 @@ import { showToast, initToast } from '../shared/components/Toast.js';
 import { initPasswordList, renderPasswordList, renderTagsCloud, updateCounts } from '../shared/components/PasswordList.js';
 import { initDetailPanel, tryCloseDetail } from '../shared/components/DetailPanel.js';
 import { initAddModal, closeAddModal } from '../shared/components/AddModal.js';
-import { initSettingsModal, populateSettingsForm, updateSyncUI, listenSyncEvents } from '../shared/components/SettingsModal.js';
+import { initSettingsModal, initCloudSyncModal, populateSettingsForm, updateSyncUI, listenSyncEvents } from '../shared/components/SettingsModal.js';
 import { initQrLoginModal } from '../shared/components/QrLoginModal.js';
 import { updateStorageInfo } from '../shared/components/StorageInfo.js';
 import { getTitleBarHTML, initTitleBar } from './components/TitleBar.js';
@@ -174,6 +174,121 @@ function getAddModalHTML() {
   `;
 }
 
+function getCloudSyncModalHTML() {
+  return `
+  <div class="modal-overlay" id="cloudSyncModal">
+    <div class="modal" style="width:560px">
+      <div class="modal-header">
+        <div class="modal-title">云同步</div>
+        <button class="detail-close" id="cloudSyncClose">
+          <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <div class="settings-section-title">
+          <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><polyline points="21 3 21 8 16 8"/></svg>
+          云同步设置
+        </div>
+        <p class="settings-desc">配置云端备份，将密码数据库同步到网盘。所有数据在上传前已在本地加密。</p>
+
+        <div class="sync-providers settings-sync">
+          <div class="sync-provider">
+            <div class="sync-provider-icon quark">夸</div>
+            <div class="sync-provider-info">
+              <div class="sync-provider-name">夸克网盘</div>
+              <div class="sync-provider-status" id="quarkStatus">未连接</div>
+            </div>
+            <div class="sync-toggle" id="quarkToggle" onclick="toggleSync('quark')">
+              <div class="sync-toggle-knob"></div>
+            </div>
+            <button class="sync-chevron" id="quarkChevron" onclick="toggleProviderDetail('quark')" title="展开/收起">
+              <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+          </div>
+
+          <div class="sync-provider-detail" id="quarkDetail" style="display:none">
+            <div class="detail-row">
+              <span class="detail-key">备份路径</span>
+              <input class="form-input mono" id="quarkRemotePath" style="padding:4px 8px;font-size:11px;flex:1;margin-left:12px;text-align:right" />
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">同步间隔</span>
+              <select class="form-input mono" id="quarkInterval" style="padding:4px 8px;font-size:11px;width:auto;margin-left:12px">
+                <option value="60">1 分钟</option>
+                <option value="300">5 分钟</option>
+                <option value="600">10 分钟</option>
+                <option value="1800">30 分钟</option>
+              </select>
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">上次同步</span>
+              <span class="detail-val mono" id="quarkLastSync">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">登录有效期至</span>
+              <span class="detail-val mono" id="quarkExpires">—</span>
+            </div>
+            <div class="sync-actions">
+              <button class="secondary-btn" onclick="manualSync('quark')">立即上传</button>
+              <button class="secondary-btn" onclick="manualDownload('quark')">从云恢复</button>
+              <button class="secondary-btn" onclick="openQuarkLogin()">重新扫码</button>
+              <button class="secondary-btn" style="color:#e06b6b" onclick="logoutProvider('quark')">退出登录</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sync-providers settings-sync">
+          <div class="sync-provider">
+            <div class="sync-provider-icon baidu">百</div>
+            <div class="sync-provider-info">
+              <div class="sync-provider-name">百度网盘</div>
+              <div class="sync-provider-status" id="baiduStatus">未连接</div>
+            </div>
+            <div class="sync-toggle" id="baiduToggle" onclick="toggleSync('baidu')">
+              <div class="sync-toggle-knob"></div>
+            </div>
+            <button class="sync-chevron" id="baiduChevron" onclick="toggleProviderDetail('baidu')" title="展开/收起">
+              <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+          </div>
+
+          <div class="sync-provider-detail" id="baiduDetail" style="display:none">
+            <div class="detail-row">
+              <span class="detail-key">备份路径</span>
+              <input class="form-input mono" id="baiduRemotePath" style="padding:4px 8px;font-size:11px;flex:1;margin-left:12px;text-align:right" />
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">同步间隔</span>
+              <select class="form-input mono" id="baiduInterval" style="padding:4px 8px;font-size:11px;width:auto;margin-left:12px">
+                <option value="60">1 分钟</option>
+                <option value="300">5 分钟</option>
+                <option value="600">10 分钟</option>
+                <option value="1800">30 分钟</option>
+              </select>
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">上次同步</span>
+              <span class="detail-val mono" id="baiduLastSync">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">登录有效期至</span>
+              <span class="detail-val mono" id="baiduExpires">—</span>
+            </div>
+            <div class="sync-actions">
+              <button class="secondary-btn" onclick="manualSync('baidu')">立即上传</button>
+              <button class="secondary-btn" onclick="manualDownload('baidu')">从云恢复</button>
+              <button class="secondary-btn" onclick="openBaiduLogin()">重新扫码</button>
+              <button class="secondary-btn" style="color:#e06b6b" onclick="logoutProvider('baidu')">退出登录</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  `;
+}
+
 function getSettingsModalHTML() {
   return `
   <div class="modal-overlay" id="settingsModal">
@@ -186,118 +301,15 @@ function getSettingsModalHTML() {
       </div>
 
       <div class="settings-nav">
-        <button class="settings-tab active" data-tab="sync">云同步</button>
-        <button class="settings-tab" data-tab="storage">存储</button>
+        <button class="settings-tab active" data-tab="storage">存储</button>
         <button class="settings-tab" data-tab="security">安全</button>
         <button class="settings-tab" data-tab="about">关于</button>
       </div>
 
       <div class="modal-body">
 
-        <!-- Sync Tab -->
-        <div class="settings-panel" id="tab-sync">
-          <div class="settings-section-title">
-            <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><polyline points="21 3 21 8 16 8"/></svg>
-            云同步设置
-          </div>
-          <p class="settings-desc">配置云端备份，将密码数据库同步到网盘。所有数据在上传前已在本地加密。</p>
-
-          <div class="sync-providers settings-sync">
-            <div class="sync-provider">
-              <div class="sync-provider-icon quark">夸</div>
-              <div class="sync-provider-info">
-                <div class="sync-provider-name">夸克网盘</div>
-                <div class="sync-provider-status" id="quarkStatus">未连接</div>
-              </div>
-              <div class="sync-toggle" id="quarkToggle" onclick="toggleSync('quark')">
-                <div class="sync-toggle-knob"></div>
-              </div>
-              <button class="sync-chevron" id="quarkChevron" onclick="toggleProviderDetail('quark')" title="展开/收起">
-                <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-              </button>
-            </div>
-
-            <div class="sync-provider-detail" id="quarkDetail" style="display:none">
-              <div class="detail-row">
-                <span class="detail-key">备份路径</span>
-                <input class="form-input mono" id="quarkRemotePath" style="padding:4px 8px;font-size:11px;flex:1;margin-left:12px;text-align:right" />
-              </div>
-              <div class="detail-row">
-                <span class="detail-key">同步间隔</span>
-                <select class="form-input mono" id="quarkInterval" style="padding:4px 8px;font-size:11px;width:auto;margin-left:12px">
-                  <option value="60">1 分钟</option>
-                  <option value="300">5 分钟</option>
-                  <option value="600">10 分钟</option>
-                  <option value="1800">30 分钟</option>
-                </select>
-              </div>
-              <div class="detail-row">
-                <span class="detail-key">上次同步</span>
-                <span class="detail-val mono" id="quarkLastSync">—</span>
-              </div>
-              <div class="detail-row">
-                <span class="detail-key">登录有效期至</span>
-                <span class="detail-val mono" id="quarkExpires">—</span>
-              </div>
-              <div class="sync-actions">
-                <button class="secondary-btn" onclick="manualSync('quark')">立即上传</button>
-                <button class="secondary-btn" onclick="manualDownload('quark')">从云恢复</button>
-                <button class="secondary-btn" onclick="openQuarkLogin()">重新扫码</button>
-                <button class="secondary-btn" style="color:#e06b6b" onclick="logoutProvider('quark')">退出登录</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="sync-providers settings-sync">
-            <div class="sync-provider">
-              <div class="sync-provider-icon baidu">百</div>
-              <div class="sync-provider-info">
-                <div class="sync-provider-name">百度网盘</div>
-                <div class="sync-provider-status" id="baiduStatus">未连接</div>
-              </div>
-              <div class="sync-toggle" id="baiduToggle" onclick="toggleSync('baidu')">
-                <div class="sync-toggle-knob"></div>
-              </div>
-              <button class="sync-chevron" id="baiduChevron" onclick="toggleProviderDetail('baidu')" title="展开/收起">
-                <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-              </button>
-            </div>
-
-            <div class="sync-provider-detail" id="baiduDetail" style="display:none">
-              <div class="detail-row">
-                <span class="detail-key">备份路径</span>
-                <input class="form-input mono" id="baiduRemotePath" style="padding:4px 8px;font-size:11px;flex:1;margin-left:12px;text-align:right" />
-              </div>
-              <div class="detail-row">
-                <span class="detail-key">同步间隔</span>
-                <select class="form-input mono" id="baiduInterval" style="padding:4px 8px;font-size:11px;width:auto;margin-left:12px">
-                  <option value="60">1 分钟</option>
-                  <option value="300">5 分钟</option>
-                  <option value="600">10 分钟</option>
-                  <option value="1800">30 分钟</option>
-                </select>
-              </div>
-              <div class="detail-row">
-                <span class="detail-key">上次同步</span>
-                <span class="detail-val mono" id="baiduLastSync">—</span>
-              </div>
-              <div class="detail-row">
-                <span class="detail-key">登录有效期至</span>
-                <span class="detail-val mono" id="baiduExpires">—</span>
-              </div>
-              <div class="sync-actions">
-                <button class="secondary-btn" onclick="manualSync('baidu')">立即上传</button>
-                <button class="secondary-btn" onclick="manualDownload('baidu')">从云恢复</button>
-                <button class="secondary-btn" onclick="openBaiduLogin()">重新扫码</button>
-                <button class="secondary-btn" style="color:#e06b6b" onclick="logoutProvider('baidu')">退出登录</button>
-              </div>
-            </div>
-          </div>
-
-        </div>
-
         <!-- Storage Tab -->
-        <div class="settings-panel" id="tab-storage" style="display:none">
+        <div class="settings-panel" id="tab-storage">
           <div class="settings-section-title">
             <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
             本地存储
@@ -478,6 +490,7 @@ function bindKeyboardShortcuts() {
     if (e.key === 'Escape') {
       const confirmDlg = document.getElementById('editConfirmDialog');
       const addModal = document.getElementById('addModal');
+      const cloudSyncModal = document.getElementById('cloudSyncModal');
       const settingsModal = document.getElementById('settingsModal');
       const detailPanel = document.getElementById('detailPanel');
       if (confirmDlg && confirmDlg.classList.contains('show')) {
@@ -485,6 +498,8 @@ function bindKeyboardShortcuts() {
         state.pendingCloseAfterSave = false;
       } else if (addModal && addModal.classList.contains('show')) {
         closeAddModal();
+      } else if (cloudSyncModal && cloudSyncModal.classList.contains('show')) {
+        cloudSyncModal.classList.remove('show');
       } else if (settingsModal && settingsModal.classList.contains('show')) {
         settingsModal.classList.remove('show');
       } else if (detailPanel && detailPanel.classList.contains('show')) {
@@ -506,6 +521,7 @@ export function mount(appElement) {
   document.body.insertAdjacentHTML('beforeend', getToastHTML());
   document.body.insertAdjacentHTML('beforeend', getEditConfirmDialogHTML());
   document.body.insertAdjacentHTML('beforeend', getAddModalHTML());
+  document.body.insertAdjacentHTML('beforeend', getCloudSyncModalHTML());
   document.body.insertAdjacentHTML('beforeend', getSettingsModalHTML());
   document.body.insertAdjacentHTML('beforeend', getQrModalHTML());
 
@@ -528,6 +544,7 @@ export function mount(appElement) {
   initDetailPanel();
   initAddModal();
   initQrLoginModal();
+  initCloudSyncModal();
   initSettingsModal();
 
   // 键盘快捷键

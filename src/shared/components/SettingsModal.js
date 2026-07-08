@@ -61,6 +61,29 @@ export function openSettingsModal() {
   if (settingsModalEl) settingsModalEl.classList.add('show');
 }
 
+// ========== 独立云同步弹窗（桌面端） ==========
+
+export function initCloudSyncModal() {
+  const cloudSyncModalEl = document.getElementById('cloudSyncModal');
+  const cloudSyncBtn = document.getElementById('cloudSyncBtn');
+  const cloudSyncClose = document.getElementById('cloudSyncClose');
+
+  if (cloudSyncBtn) {
+    cloudSyncBtn.addEventListener('click', async () => {
+      await loadConfig();
+      populateSettingsForm();
+      if (cloudSyncModalEl) cloudSyncModalEl.classList.add('show');
+    });
+  }
+
+  if (cloudSyncClose) cloudSyncClose.addEventListener('click', () => cloudSyncModalEl.classList.remove('show'));
+  if (cloudSyncModalEl) {
+    cloudSyncModalEl.addEventListener('click', (e) => {
+      if (e.target === cloudSyncModalEl) cloudSyncModalEl.classList.remove('show');
+    });
+  }
+}
+
 // ========== 表单填充 ==========
 
 export function populateSettingsForm() {
