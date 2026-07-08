@@ -71,6 +71,9 @@ $RECYCLE.BIN/
 *.bak
 *.cache
 
+# ==========竞赛报名产物 ==========
+competition/
+
 # ========== Trae 工作区（开发辅助文件，不需提交） ==========
 .trae/documents/
 .trae/specs/
