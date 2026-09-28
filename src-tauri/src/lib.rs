@@ -7,19 +7,46 @@ mod mobile;
 
 use shared::models::*;
 use shared::sync::auth::{baidu::BaiduAuth, quark::QuarkAuth, QrAuthenticator, QrLoginSession, QrLoginStatus};
-use shared::sync::SyncProvider;
-use std::path::PathBuf;
+use shared::sync::engine;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 /// 应用全局状态
 pub struct AppState {
-    /// JSON 存储实例（每次操作都重新读取文件，无需 close/reopen）
-    pub database: Mutex<shared::storage::json_store::JsonStore>,
+    /// JSON 存储实例（每次操作都重新读取文件，无需 close/reopen）；
+    /// 套 Arc 是为了让云同步引擎的 VaultAccess 能持引用走单一写入口
+    pub database: Arc<Mutex<shared::storage::json_store::JsonStore>>,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
-    /// 夸克 Cookie 即将过期提醒是否已发送（避免重复提醒）
+    /// Cookie 即将过期提醒是否已发送（避免重复提醒，按网盘各记一个）
     pub quark_cookie_warn_sent: std::sync::atomic::AtomicBool,
+    pub baidu_cookie_warn_sent: std::sync::atomic::AtomicBool,
+}
+
+/// 密码簿文件访问的生产实现：写入一律经 Mutex<JsonStore> 单一入口，
+/// 供云同步引擎下载后替换本地密码簿使用
+struct VaultAccess {
+    db_path: PathBuf,
+    database: Arc<Mutex<shared::storage::json_store::JsonStore>>,
+}
+
+impl engine::VaultIo for VaultAccess {
+    fn path(&self) -> &Path {
+        &self.db_path
+    }
+
+    fn local_mtime(&self) -> Option<i64> {
+        std::fs::metadata(&self.db_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+    }
+
+    fn replace(&self, bytes: &[u8]) -> Result<(), String> {
+        self.database.lock().unwrap().replace_raw(bytes)
+    }
 }
 
 /// 当前本地时间戳字符串
@@ -29,39 +56,21 @@ fn now_ts() -> String {
         .to_string()
 }
 
+/// 网盘显示名（提示信息与事件用）
+fn provider_display(provider: &str) -> &'static str {
+    match provider {
+        "baidu" => "百度网盘",
+        "quark" => "夸克网盘",
+        _ => "未知网盘",
+    }
+}
+
 // ========== Tauri Commands ==========
 
 /// 获取所有密码
 #[tauri::command]
 fn get_all_passwords(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
     state.database.lock().unwrap().get_all()
-}
-
-/// 搜索密码（名字不完全匹配）
-#[tauri::command]
-fn search_passwords(query: String, state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    if query.is_empty() {
-        return state.database.lock().unwrap().get_all();
-    }
-    state.database.lock().unwrap().search(&query)
-}
-
-/// 按标签筛选
-#[tauri::command]
-fn get_passwords_by_tag(tag: String, state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.lock().unwrap().get_by_tag(&tag)
-}
-
-/// 获取收藏
-#[tauri::command]
-fn get_favorites(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.lock().unwrap().get_favorites()
-}
-
-/// 获取弱密码
-#[tauri::command]
-fn get_weak_passwords(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.lock().unwrap().get_weak()
 }
 
 /// 新增密码
@@ -106,7 +115,8 @@ fn save_config(config: AppConfig, state: State<'_, Arc<AppState>>) -> Result<(),
     state.database.lock().unwrap().save_config(&config)
 }
 
-/// 立即同步（上传或下载）
+/// 立即同步（上传或下载）；方向由用户在界面上指定。
+/// 策略与执行都在云同步引擎里，这里只做输入组装与结果落地。
 #[tauri::command]
 async fn sync_now(
     provider: String,
@@ -115,9 +125,6 @@ async fn sync_now(
     app: tauri::AppHandle,
 ) -> Result<SyncResult, String> {
     let config = state.database.lock().unwrap().load_config()?;
-    let db_path = state.db_path.clone();
-
-    // 取出对应提供者的 Cookie 与远程路径
     let (cookie, remote_path) = match provider.as_str() {
         "baidu" => (config.baidu_cookie.clone(), config.baidu_remote_path.clone()),
         "quark" => (config.quark_cookie.clone(), config.quark_remote_path.clone()),
@@ -138,80 +145,35 @@ async fn sync_now(
         });
     }
 
-    // 诊断日志：打印 Cookie 长度和是否包含 HttpOnly 标志（__pus 通常是 HttpOnly）
-    eprintln!("[sync] {} cookie.length={}, hasPuus={}, hasPus={}",
-        provider, cookie.len(),
-        cookie.contains("__puus="),
-        cookie.contains("__pus="));
+    let db_path = state.db_path.clone();
+    let database = state.database.clone();
+    let provider_key = provider.clone();
+    let is_download = direction == "download";
 
-    // 上传前先校验 Cookie 是否仍然有效（非官方 Cookie 可能随时失效）
-    if direction == "upload" {
-        let p2 = provider.clone();
-        let c2 = cookie.clone();
-        let valid = tokio::task::spawn_blocking(move || match p2.as_str() {
-            "baidu" => BaiduAuth::new().validate(&c2),
-            "quark" => QuarkAuth::new().validate(&c2),
-            _ => Ok(false),
-        })
-        .await
-        .map_err(|e| format!("校验失败: {}", e))?;
-        match valid {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(SyncResult {
-                    success: false,
-                    message: "登录已失效，请重新扫码".to_string(),
-                    synced_at: now_ts(),
-                });
-            }
-            Err(e) => {
-                return Ok(SyncResult {
-                    success: false,
-                    message: format!("校验失败: {}", e),
-                    synced_at: now_ts(),
-                });
-            }
-        }
-    }
-
-    let provider_for_task = provider.clone();
-    let cookie_for_task = cookie;
-    let remote_for_task = remote_path;
-    let direction_for_task = direction.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        match provider_for_task.as_str() {
-            "baidu" => {
-                let p = shared::sync::baidu::BaiduProvider::new(cookie_for_task);
-                if direction_for_task == "download" {
-                    shared::sync::sync_download(&p, &remote_for_task, &db_path)
-                } else {
-                    shared::sync::sync_upload(&p, &db_path, &remote_for_task)
-                }
-            }
-            "quark" => {
-                // 本地 vault.json 有效性检测（仅日志，不改变行为）
-                let local_valid = shared::sync::quark::QuarkProvider::local_vault_valid(&db_path);
-                println!("[sync] quark local_vault_valid = {}", local_valid);
-                let p = shared::sync::quark::QuarkProvider::new(cookie_for_task);
-                if direction_for_task == "download" {
-                    shared::sync::sync_download(&p, &remote_for_task, &db_path)
-                } else {
-                    shared::sync::sync_upload(&p, &db_path, &remote_for_task)
-                }
-            }
-            _ => SyncResult {
-                success: false,
-                message: "未知的同步提供者".to_string(),
-                synced_at: now_ts(),
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let (provider, validator) = match shared::sync::build_provider(&provider_key, cookie.clone()) {
+            Ok(x) => x,
+            Err(e) => return engine::SyncReport::new(engine::Outcome::Failed(e)),
+        };
+        let vault = VaultAccess { db_path, database };
+        engine::run_manual(engine::ManualInputs {
+            provider: provider.as_ref(),
+            validator: Some(validator.as_ref()),
+            cookie: &cookie,
+            remote_path: &remote_path,
+            direction: if is_download {
+                engine::Direction::Download
+            } else {
+                engine::Direction::Upload
             },
-        }
+            vault: &vault,
+        })
     })
     .await
     .map_err(|e| format!("同步任务失败: {}", e))?;
 
     // 同步成功则更新 last_sync
-    if result.success {
+    if report.record_sync {
         let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
         match provider.as_str() {
             "baidu" => cfg.baidu_last_sync = now_ts(),
@@ -219,40 +181,26 @@ async fn sync_now(
             _ => {}
         }
         let _ = state.database.lock().unwrap().save_config(&cfg);
-
-        // 下载成功后通知前端刷新（JSON 文件无需 reopen，下次 load() 自动读取新内容）
-        if direction == "download" {
-            let _ = app.emit("sync://restored", ());
-            eprintln!("[sync] vault.json downloaded, emit sync://restored");
-        }
     }
 
-    Ok(result)
-}
+    // 下载成功后通知前端刷新（JSON 文件无需 reopen，下次 load() 自动读取新内容）
+    if report.downloaded {
+        let _ = app.emit("sync://restored", ());
+        eprintln!("[sync] vault.json downloaded, emit sync://restored");
+    }
 
-/// 检查同步连接（基于扫码登录 Cookie 校验）
-#[tauri::command]
-async fn check_sync_connection(
-    provider: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<bool, String> {
-    let config = state.database.lock().unwrap().load_config()?;
-    let cookie = match provider.as_str() {
-        "baidu" => config.baidu_cookie,
-        "quark" => config.quark_cookie,
-        _ => return Err("未知的同步提供者".to_string()),
+    let (success, message) = match &report.outcome {
+        engine::Outcome::Uploaded => (true, format!("已上传到 {}", provider_display(&provider))),
+        engine::Outcome::Downloaded => (true, format!("已从 {} 下载", provider_display(&provider))),
+        engine::Outcome::CookieExpired => (false, "登录已失效，请重新扫码".to_string()),
+        engine::Outcome::Failed(e) => (false, e.clone()),
+        engine::Outcome::Skipped | engine::Outcome::NotLoggedIn => (false, "无需同步".to_string()),
     };
-    if cookie.is_empty() {
-        return Ok(false);
-    }
-    let res: Result<bool, String> = tokio::task::spawn_blocking(move || match provider.as_str() {
-        "baidu" => BaiduAuth::new().validate(&cookie),
-        "quark" => QuarkAuth::new().validate(&cookie),
-        _ => Ok(false),
+    Ok(SyncResult {
+        success,
+        message,
+        synced_at: now_ts(),
     })
-    .await
-    .map_err(|e| format!("检查失败: {}", e))?;
-    Ok(res.unwrap_or(false))
 }
 
 /// 启动扫码登录，返回二维码图片与轮询票据
@@ -365,7 +313,7 @@ fn logout(
     Ok(())
 }
 
-/// 从外部 JSON 文件导入数据（直接覆盖当前 vault.json）
+/// 从外部文件导入数据（整体替换当前密码簿）
 #[tauri::command]
 fn import_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<ImportResult, String> {
     let path = PathBuf::from(&file_path);
@@ -377,35 +325,45 @@ fn import_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<Impor
         });
     }
 
-    // 简化方案：直接复制外部 JSON 文件覆盖当前 vault.json
-    // 注意：这会替换当前所有数据，外部文件必须是本应用导出的 vault.json 格式
-    match std::fs::copy(&path, &state.db_path) {
-        Ok(_) => {
-            // 验证复制后的文件可解密
-            match state.database.lock().unwrap().load() {
-                Ok(data) => Ok(ImportResult {
-                    success: true,
-                    message: format!("成功导入，共 {} 条密码记录", data.passwords.len()),
-                    imported_count: data.passwords.len(),
-                }),
-                Err(e) => Ok(ImportResult {
-                    success: false,
-                    message: format!("导入后验证失败（文件可能已损坏或不是本应用导出）: {}", e),
-                    imported_count: 0,
-                }),
-            }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(ImportResult {
+                success: false,
+                message: format!("读取文件失败: {}", e),
+                imported_count: 0,
+            });
+        }
+    };
+
+    // 单一写入口：先验证可解密、可解析，再原子替换；验证不过不会破坏现有数据
+    match state.database.lock().unwrap().replace_raw(&bytes) {
+        Ok(()) => {
+            let imported_count = state
+                .database
+                .lock()
+                .unwrap()
+                .get_all()
+                .map(|v| v.len())
+                .unwrap_or(0);
+            Ok(ImportResult {
+                success: true,
+                message: format!("成功导入，共 {} 条密码记录", imported_count),
+                imported_count,
+            })
         }
         Err(e) => Ok(ImportResult {
             success: false,
-            message: format!("复制文件失败: {}", e),
+            message: format!("导入失败: {}", e),
             imported_count: 0,
         }),
     }
 }
 
-/// 导出数据库文件到指定路径
+/// 导出数据库文件到指定路径（复制在锁内进行，不与写入并发）
 #[tauri::command]
 fn export_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let _guard = state.database.lock().unwrap();
     std::fs::copy(&state.db_path, &file_path).map_err(|e| format!("导出失败: {}", e))?;
     Ok(())
 }
@@ -433,45 +391,62 @@ fn get_db_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, Str
 
 // ========== 定时同步调度 ==========
 
-/// 调度循环里每个提供者的同步结果处理：
-/// - 成功：更新 last_sync
-/// - Cookie 失效：关闭自动同步，发 sync://expired 事件通知前端重新扫码
-/// - 其它失败：发 sync://error 事件
-fn handle_sync_result(
-    res: Result<Result<(), String>, String>,
+/// 把云同步引擎的报告落地：所有同步副作用的唯一出口。
+/// 配置只做一次读-改-写；事件与移动端通知按结局分发。
+fn apply_sync_report(
     provider: &str,
-    state: Arc<AppState>,
-    app: tauri::AppHandle,
+    report: engine::SyncReport,
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
 ) {
-    let inner = match res {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = app.emit(
-                "sync://error",
-                serde_json::json!({ "provider": provider, "message": format!("任务异常: {}", e) }),
-            );
-            return;
+    // 过期预警标记与事件
+    if let Some(v) = report.set_warn_sent {
+        match provider {
+            "baidu" => state
+                .baidu_cookie_warn_sent
+                .store(v, std::sync::atomic::Ordering::SeqCst),
+            "quark" => state
+                .quark_cookie_warn_sent
+                .store(v, std::sync::atomic::Ordering::SeqCst),
+            _ => {}
         }
-    };
+    }
+    if let Some(w) = report.expiry_warning {
+        let _ = app.emit(
+            "sync://cookie_expiring",
+            serde_json::json!({
+                "provider": provider,
+                "days_left": w.days_left,
+                "message": format!("{} 登录将在 {} 天后过期，请及时重新扫码", provider_display(provider), w.days_left)
+            }),
+        );
+    }
 
-    match inner {
-        Ok(()) => {
-            let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
-            match provider {
-                "baidu" => cfg.baidu_last_sync = now_ts(),
-                "quark" => cfg.quark_last_sync = now_ts(),
-                _ => {}
+    match report.outcome {
+        engine::Outcome::Uploaded | engine::Outcome::Downloaded | engine::Outcome::Skipped => {
+            if report.record_sync {
+                let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
+                match provider {
+                    "baidu" => cfg.baidu_last_sync = now_ts(),
+                    "quark" => cfg.quark_last_sync = now_ts(),
+                    _ => {}
+                }
+                let _ = state.database.lock().unwrap().save_config(&cfg);
             }
-            let _ = state.database.lock().unwrap().save_config(&cfg);
+            if report.downloaded {
+                let _ = app.emit("sync://restored", ());
+            }
             // 移动端：同步完成通知
             #[cfg(mobile)]
             {
-                if let Err(e) = mobile::notification::show_sync_complete(&app) {
+                if let Err(e) = mobile::notification::show_sync_complete(app) {
                     eprintln!("[mobile] 同步完成通知失败: {}", e);
                 }
             }
         }
-        Err(msg) if msg == "cookie_expired" => {
+        engine::Outcome::NotLoggedIn => {}
+        engine::Outcome::CookieExpired => {
+            // Cookie 失效：关闭自动同步，通知前端重新扫码
             let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
             match provider {
                 "baidu" => cfg.baidu_sync_enabled = false,
@@ -489,10 +464,10 @@ fn handle_sync_result(
             // 移动端：Cookie 失效，取消常驻通知（同步调度器仍运行，但实际无任务可做）
             #[cfg(mobile)]
             {
-                mobile::notification::cancel_running(&app);
+                mobile::notification::cancel_running(app);
             }
         }
-        Err(msg) => {
+        engine::Outcome::Failed(msg) => {
             let _ = app.emit(
                 "sync://error",
                 serde_json::json!({ "provider": provider, "message": msg }),
@@ -500,7 +475,7 @@ fn handle_sync_result(
             // 移动端：同步失败通知
             #[cfg(mobile)]
             {
-                if let Err(e) = mobile::notification::show_sync_error(&app, &msg) {
+                if let Err(e) = mobile::notification::show_sync_error(app, &msg) {
                     eprintln!("[mobile] 同步错误通知失败: {}", e);
                 }
             }
@@ -508,149 +483,73 @@ fn handle_sync_result(
     }
 }
 
-/// 启动后台定时同步：每次上传前先 validate Cookie，失效则停用并通知前端
+/// 启动后台定时同步。调度器只负责到点触发；方向判定、过期预警、记账
+/// 都在云同步引擎（shared::sync::engine）里，结果经 apply_sync_report 落地。
 fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             let config = state.database.lock().unwrap().load_config().unwrap_or_default();
+            let now_secs = chrono::Local::now().timestamp();
 
-            // 百度网盘同步
-            if config.baidu_sync_enabled && !config.baidu_cookie.is_empty() {
-                let cookie = config.baidu_cookie.clone();
-                let db_path = state.db_path.clone();
-                let remote = config.baidu_remote_path.clone();
-                let st = state.clone();
-                let ap = app.clone();
-                let res = tauri::async_runtime::spawn_blocking(move || match BaiduAuth::new().validate(&cookie) {
-                    Ok(true) => {
-                        let provider = shared::sync::baidu::BaiduProvider::new(cookie);
-                        provider.upload(&db_path, &remote)
-                    }
-                    Ok(false) => Err("cookie_expired".to_string()),
-                    Err(e) => Err(format!("validate:{}", e)),
-                })
-                .await
-                .map_err(|e| format!("任务异常: {}", e));
-                handle_sync_result(res, "baidu", st, ap);
-            }
-
-            // 夸克网盘同步（双向：本地无效→下载；本地有效→比较 mtime，新者覆盖旧者）
-            if config.quark_sync_enabled && !config.quark_cookie.is_empty() {
-                // Cookie 即将过期检测（距过期 < 7 天时提醒前端）
-                let now_ts = chrono::Local::now().timestamp();
-                let expires_at = config.quark_cookie_expires_at;
-                if expires_at > 0 {
-                    let secs_left = expires_at - now_ts;
-                    if secs_left <= 0 {
-                        // 已过期，走原有 cookie_expired 逻辑（由 validate 返回 false 触发）
-                    } else if secs_left < 7 * 86400 {
-                        // 即将过期（< 7 天）
-                        if !state.quark_cookie_warn_sent.load(std::sync::atomic::Ordering::SeqCst) {
-                            let days_left = secs_left / 86400;
-                            let _ = app.emit(
-                                "sync://cookie_expiring",
-                                serde_json::json!({
-                                    "provider": "quark",
-                                    "days_left": days_left,
-                                    "message": format!("夸克登录将在 {} 天后过期，请及时重新扫码", days_left)
-                                }),
-                            );
-                            state.quark_cookie_warn_sent.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    } else {
-                        // 距过期还远，重置提醒标记（便于下次过期前再次提醒）
-                        state.quark_cookie_warn_sent.store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
+            for name in ["baidu", "quark"] {
+                let (enabled, cookie, remote, expires_at, warn_sent) = match name {
+                    "baidu" => (
+                        config.baidu_sync_enabled,
+                        config.baidu_cookie.clone(),
+                        config.baidu_remote_path.clone(),
+                        config.baidu_cookie_expires_at,
+                        state
+                            .baidu_cookie_warn_sent
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    ),
+                    "quark" => (
+                        config.quark_sync_enabled,
+                        config.quark_cookie.clone(),
+                        config.quark_remote_path.clone(),
+                        config.quark_cookie_expires_at,
+                        state
+                            .quark_cookie_warn_sent
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    ),
+                    _ => continue,
+                };
+                if !enabled || cookie.is_empty() {
+                    continue;
                 }
 
-                let cookie = config.quark_cookie.clone();
-                let db_path = state.db_path.clone();
-                let remote = config.quark_remote_path.clone();
                 let st = state.clone();
-                let st_inner = state.clone();
-                let ap = app.clone();
-                let res = tauri::async_runtime::spawn_blocking(move || match QuarkAuth::new().validate(&cookie) {
-                    Ok(true) => {
-                        let provider = shared::sync::quark::QuarkProvider::new(cookie);
-
-                        // 1. 检测本地 vault.json 有效性
-                        let local_valid = shared::sync::quark::QuarkProvider::local_vault_valid(&db_path);
-
-                        if !local_valid {
-                            // 2. 本地无效 → 查云端是否有文件
-                            match provider.remote_file_mtime(&remote) {
-                                Ok(Some(remote_mtime)) => {
-                                    // 云端有文件 → 下载（JSON 文件无需 close/reopen）
-                                    provider.download(&remote, &db_path)?;
-                                    // 下载成功，记录云端 mtime
-                                    let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
-                                    cfg.quark_last_remote_mtime = remote_mtime;
-                                    let _ = st_inner.database.lock().unwrap().save_config(&cfg);
-                                    Ok(())
-                                }
-                                Ok(None) => {
-                                    // 云端也无文件 → 跳过
-                                    println!("[sync] quark: 本地与云端均无有效数据，跳过");
-                                    Ok(())
-                                }
-                                Err(e) => Err(format!("获取远端文件信息失败: {}", e)),
-                            }
-                        } else {
-                            // 3. 本地有效 → 获取云端 mtime
-                            match provider.remote_file_mtime(&remote) {
-                                Ok(None) => {
-                                    // 4. 云端不存在 → 上传
-                                    provider.upload(&db_path, &remote)?;
-                                    // 上传成功后查询云端 mtime
-                                    let remote_mtime = provider.remote_file_mtime(&remote)
-                                        .ok().flatten().unwrap_or(0);
-                                    let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
-                                    cfg.quark_last_remote_mtime = remote_mtime;
-                                    let _ = st_inner.database.lock().unwrap().save_config(&cfg);
-                                    Ok(())
-                                }
-                                Ok(Some(remote_mtime)) => {
-                                    // 5. 云端存在 → 比较时间戳
-                                    let local_mtime = std::fs::metadata(&db_path)
-                                        .ok()
-                                        .and_then(|m| m.modified().ok())
-                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                        .map(|d| d.as_secs() as i64)
-                                        .unwrap_or(0);
-
-                                    if local_mtime > remote_mtime {
-                                        // 本地更新 → 上传
-                                        provider.upload(&db_path, &remote)?;
-                                        let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
-                                        cfg.quark_last_remote_mtime = local_mtime;
-                                        let _ = st_inner.database.lock().unwrap().save_config(&cfg);
-                                        Ok(())
-                                    } else if local_mtime < remote_mtime {
-                                        // 云端更新 → 下载（JSON 文件无需 close/reopen）
-                                        provider.download(&remote, &db_path)?;
-                                        let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
-                                        cfg.quark_last_remote_mtime = remote_mtime;
-                                        let _ = st_inner.database.lock().unwrap().save_config(&cfg);
-                                        Ok(())
-                                    } else {
-                                        // 时间戳相等 → 跳过
-                                        println!("[sync] quark: 本地与云端时间戳一致，跳过同步");
-                                        let mut cfg = st_inner.database.lock().unwrap().load_config().unwrap_or_default();
-                                        cfg.quark_last_remote_mtime = remote_mtime;
-                                        let _ = st_inner.database.lock().unwrap().save_config(&cfg);
-                                        Ok(())
-                                    }
-                                }
-                                Err(e) => Err(format!("获取远端文件信息失败: {}", e)),
-                            }
-                        }
-                    }
-                    Ok(false) => Err("cookie_expired".to_string()),
-                    Err(e) => Err(format!("validate:{}", e)),
+                let res = tauri::async_runtime::spawn_blocking(move || {
+                    let (provider, validator) = match shared::sync::build_provider(name, cookie.clone()) {
+                        Ok(x) => x,
+                        Err(e) => return engine::SyncReport::new(engine::Outcome::Failed(e)),
+                    };
+                    let vault = VaultAccess {
+                        db_path: st.db_path.clone(),
+                        database: st.database.clone(),
+                    };
+                    engine::run_cycle(engine::CycleInputs {
+                        provider: provider.as_ref(),
+                        validator: validator.as_ref(),
+                        cookie: &cookie,
+                        remote_path: &remote,
+                        cookie_expires_at: expires_at,
+                        warn_sent,
+                        now_secs,
+                        vault: &vault,
+                    })
                 })
                 .await
                 .map_err(|e| format!("任务异常: {}", e));
-                handle_sync_result(res, "quark", st, ap);
+
+                match res {
+                    Ok(report) => apply_sync_report(name, report, &state, &app),
+                    Err(e) => {
+                        let _ = app.emit(
+                            "sync://error",
+                            serde_json::json!({ "provider": name, "message": e }),
+                        );
+                    }
+                }
             }
 
             // 取较短的启用间隔作为轮询周期
@@ -723,10 +622,6 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_all_passwords,
-        search_passwords,
-        get_passwords_by_tag,
-        get_favorites,
-        get_weak_passwords,
         add_password,
         update_password,
         delete_password,
@@ -735,7 +630,6 @@ pub fn run() {
         get_config,
         save_config,
         sync_now,
-        check_sync_connection,
         qr_start,
         qr_poll,
         logout,
@@ -751,10 +645,6 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_all_passwords,
-        search_passwords,
-        get_passwords_by_tag,
-        get_favorites,
-        get_weak_passwords,
         add_password,
         update_password,
         delete_password,
@@ -763,7 +653,6 @@ pub fn run() {
         get_config,
         save_config,
         sync_now,
-        check_sync_connection,
         qr_start,
         qr_poll,
         logout,
@@ -807,10 +696,11 @@ pub fn run() {
                         shared::storage::json_store::JsonStore::open(db_path.clone(), crypto)?;
 
                     let state = Arc::new(AppState {
-                        database: Mutex::new(database),
+                        database: Arc::new(Mutex::new(database)),
                         db_path,
                         data_dir,
                         quark_cookie_warn_sent: std::sync::atomic::AtomicBool::new(false),
+                        baidu_cookie_warn_sent: std::sync::atomic::AtomicBool::new(false),
                     });
 
                     Ok(state)

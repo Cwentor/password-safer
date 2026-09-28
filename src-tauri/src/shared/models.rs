@@ -47,7 +47,6 @@ pub struct AppConfig {
     pub quark_sync_interval: u64,
     pub quark_cookie_expires_at: i64,
     pub quark_last_sync: String,
-    pub quark_last_remote_mtime: i64,
     // 通用设置
     pub auto_lock_minutes: u64,
     pub clipboard_clear_seconds: u64,
@@ -69,7 +68,6 @@ impl Default for AppConfig {
             quark_sync_interval: 300,
             quark_cookie_expires_at: 0,
             quark_last_sync: String::new(),
-            quark_last_remote_mtime: 0,
             auto_lock_minutes: 30,
             clipboard_clear_seconds: 30,
             master_password: String::new(),

@@ -4,7 +4,7 @@ use md5::Md5;
 use reqwest::cookie::CookieStore;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
@@ -87,20 +87,6 @@ impl QuarkProvider {
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
             cookie_jar: jar,
         }
-    }
-
-    /// 检测本地 vault.json 文件有效性
-    /// 1. 文件存在
-    /// 2. 文件大小 > 0
-    pub fn local_vault_valid(local_path: &std::path::Path) -> bool {
-        if !local_path.exists() {
-            return false;
-        }
-        let metadata = match std::fs::metadata(local_path) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        metadata.len() > 0
     }
 
     /// 获取上传断点续传 meta 文件路径
@@ -620,11 +606,7 @@ impl QuarkProvider {
 }
 
 impl SyncProvider for QuarkProvider {
-    fn name(&self) -> &str {
-        "夸克网盘"
-    }
-
-    fn upload(&self, local_path: &PathBuf, remote_path: &str) -> Result<(), String> {
+    fn upload(&self, local_path: &Path, remote_path: &str) -> Result<(), String> {
         let trimmed = remote_path.trim_start_matches('/');
         let fname = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
         let parent_fid = self.ensure_parent_fid(remote_path)?;
@@ -968,7 +950,7 @@ impl SyncProvider for QuarkProvider {
         Ok(())
     }
 
-    fn download(&self, remote_path: &str, local_path: &PathBuf) -> Result<(), String> {
+    fn download(&self, remote_path: &str) -> Result<Vec<u8>, String> {
         let trimmed = remote_path.trim_start_matches('/');
         let fname = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
 
@@ -979,19 +961,9 @@ impl SyncProvider for QuarkProvider {
         let dl_url = self.request_download_url(&fid)?;
         eprintln!("[quark] download: fid={}, dl_url={}", fid, &dl_url[..dl_url.len().min(120)]);
 
-        // 下载前备份本地文件（若存在），用于失败回滚
-        let bak_path = local_path.with_extension("json.bak");
-        let had_backup = if local_path.exists() {
-            std::fs::copy(local_path, &bak_path)
-                .map(|_| true)
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
         // 单次下载流程：手动跟随重定向，使用 download_client（cookie_provider 自动管理 cookie）
-        // 返回 (是否为 403, 错误信息或 Ok)
-        let perform_download = |dl_url: &str| -> Result<(), (bool, String)> {
+        // 返回 (是否为 403, 错误信息或下载数据)
+        let perform_download = |dl_url: &str| -> Result<Vec<u8>, (bool, String)> {
             let mut current_url = dl_url.to_string();
             for hop in 0..6u8 {
                 let host = reqwest::Url::parse(&current_url)
@@ -1041,39 +1013,29 @@ impl SyncProvider for QuarkProvider {
                 let bytes = resp
                     .bytes()
                     .map_err(|e| (false, format!("读取下载内容失败: {}", e)))?;
-                std::fs::write(local_path, &bytes)
-                    .map_err(|e| (false, format!("写入本地文件失败: {}", e)))?;
-                eprintln!("[quark] download hop={} 写入成功, bytes={}", hop, bytes.len());
-                return Ok(());
+                eprintln!("[quark] download hop={} 读取成功, bytes={}", hop, bytes.len());
+                return Ok(bytes.to_vec());
             }
             Err((false, "下载失败: 重定向次数过多".to_string()))
         };
 
         // 执行下载，403 时重新获取 download_url 重试一次
-        let download_result: Result<(), String> = match perform_download(&dl_url) {
-            Ok(()) => Ok(()),
+        let bytes = match perform_download(&dl_url) {
+            Ok(bytes) => Ok(bytes),
             Err((is_403, err_msg)) => {
                 if is_403 {
                     eprintln!("[quark] download 首次 403，重新获取 download_url 重试一次");
                     match self.request_download_url(&fid) {
-                        Ok(new_url) => match perform_download(&new_url) {
-                            Ok(()) => Ok(()),
-                            Err((_, retry_err)) => Err(retry_err),
-                        },
+                        Ok(new_url) => perform_download(&new_url).map_err(|(_, e)| e),
                         Err(re_url_err) => Err(format!("重试时获取 download_url 失败: {}", re_url_err)),
                     }
                 } else {
                     Err(err_msg)
                 }
             }
-        };
+        }?;
 
-        if download_result.is_err() && had_backup {
-            // 下载失败，回滚本地文件
-            let _ = std::fs::copy(&bak_path, local_path);
-        }
-
-        download_result
+        Ok(bytes)
     }
 
     fn remote_file_mtime(&self, remote_path: &str) -> Result<Option<i64>, String> {
