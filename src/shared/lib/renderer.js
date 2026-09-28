@@ -12,10 +12,7 @@ export const renderers = {
   renderTagsCloud: () => {},
   updateCounts: () => {},
   updateStorageInfo: () => {},
-  updateSyncUI: () => {},
   populateSettingsForm: () => {},
-  reloadConfigAndUI: () => {},
-  renderDetail: () => {},
 };
 
 export function setRenderers(map) {

@@ -7,17 +7,16 @@ import { state, DEFAULT_CONFIG } from './state.js';
 import { renderers } from './renderer.js';
 import { showToast } from '../components/Toast.js';
 import { getAllPasswords, getConfig } from './api.js';
+import { refreshAll } from './passwordService.js';
 
 export async function loadPasswords() {
   try {
     state.passwords = await getAllPasswords();
-    renderers.renderPasswordList();
-    renderers.renderTagsCloud();
+    refreshAll();
   } catch (e) {
     showToast('加载密码失败: ' + e);
     state.passwords = [];
-    renderers.renderPasswordList();
-    renderers.renderTagsCloud();
+    refreshAll();
   }
 }
 
@@ -32,5 +31,4 @@ export async function loadConfig() {
 export async function reloadConfigAndUI() {
   await loadConfig();
   renderers.populateSettingsForm();
-  renderers.updateSyncUI();
 }

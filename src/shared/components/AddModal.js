@@ -3,10 +3,9 @@
 // 新建密码弹窗 + 密码生成器
 // ============================================
 
-import { state } from '../lib/state.js';
-import { renderers } from '../lib/renderer.js';
 import { showToast } from './Toast.js';
-import { addPassword, generatePassword } from '../lib/api.js';
+import { generatePassword } from '../lib/api.js';
+import { createPassword } from '../lib/passwordService.js';
 
 let addModalEl = null;
 
@@ -80,14 +79,8 @@ export function initAddModal() {
       }
 
       try {
-        const result = await addPassword({ name, icon, url, username, password, tags, notes, favorite: false });
-        state.passwords.unshift(result);
+        await createPassword({ name, icon, url, username, password, tags, notes, favorite: false });
         closeAddModal();
-        renderers.renderPasswordList();
-        renderers.updateCounts();
-        renderers.renderTagsCloud();
-        renderers.updateStorageInfo();
-        showToast('密码已保存');
       } catch (e) {
         showToast('保存失败: ' + e);
       }
