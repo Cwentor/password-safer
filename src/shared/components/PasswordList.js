@@ -149,16 +149,22 @@ export function renderPasswordList() {
   });
 }
 
-export function renderTagsCloud() {
-  if (!tagsCloudEl) return;
+// 统计各标签出现的次数（标签云与移动端标签计数共用）
+export function countTags(passwords) {
   const counter = {};
-  state.passwords.forEach(p => {
+  passwords.forEach(p => {
     (p.tags || []).forEach(t => {
       const key = String(t).trim();
       if (!key) return;
       counter[key] = (counter[key] || 0) + 1;
     });
   });
+  return counter;
+}
+
+export function renderTagsCloud() {
+  if (!tagsCloudEl) return;
+  const counter = countTags(state.passwords);
   const tags = Object.keys(counter).sort((a, b) => counter[b] - counter[a] || a.localeCompare(b, 'zh'));
   if (tags.length === 0) {
     tagsCloudEl.innerHTML = '<span style="font-size:12px;color:var(--text-dim)">暂无标签</span>';

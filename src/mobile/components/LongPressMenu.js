@@ -10,10 +10,9 @@
 // ============================================
 
 import { state } from '../../shared/lib/state.js';
-import { showToast } from '../../shared/components/Toast.js';
 import { copyToClipboard } from '../../shared/lib/clipboard.js';
-import { toggleFavorite as apiToggleFavorite, deletePassword, updateLastUsed } from '../../shared/lib/api.js';
-import { renderers } from '../../shared/lib/renderer.js';
+import { updateLastUsed } from '../../shared/lib/api.js';
+import { toggleFavorite, deletePassword } from '../../shared/lib/passwordService.js';
 
 let sheetEl = null;
 let backdropEl = null;
@@ -133,30 +132,11 @@ async function handleAction(action) {
       break;
     }
     case 'favorite': {
-      try {
-        await apiToggleFavorite(id);
-        p.favorite = !p.favorite;
-        renderers.renderPasswordList();
-        renderers.updateCounts();
-        showToast(p.favorite ? '已添加到收藏夹' : '已从收藏夹移除');
-      } catch (e) {
-        showToast('操作失败: ' + e);
-      }
+      await toggleFavorite(id);
       break;
     }
     case 'delete': {
-      if (!confirm('确定要删除这个密码吗？此操作不可撤销。')) return;
-      try {
-        await deletePassword(id);
-        state.passwords = state.passwords.filter(x => x.id !== id);
-        renderers.renderPasswordList();
-        renderers.updateCounts();
-        renderers.renderTagsCloud();
-        renderers.updateStorageInfo();
-        showToast('密码已删除');
-      } catch (e) {
-        showToast('删除失败: ' + e);
-      }
+      await deletePassword(id);
       break;
     }
   }

@@ -5,10 +5,10 @@
 
 import { state } from '../lib/state.js';
 import { renderers } from '../lib/renderer.js';
-import { escapeHtml, escapeAttr, escapeQuotes } from '../lib/utils.js';
+import { escapeHtml, escapeAttr } from '../lib/utils.js';
 import { copyToClipboard } from '../lib/clipboard.js';
 import { showToast } from './Toast.js';
-import { updatePassword, deletePassword } from '../lib/api.js';
+import { deletePassword, updatePassword } from '../lib/passwordService.js';
 
 let detailPanelEl = null;
 let detailContentEl = null;
@@ -123,23 +123,12 @@ export function initDetailPanel() {
     tryCloseDetail();
   });
 
-  // 删除密码
+  // 删除密码（确认、删除、刷新、提示都在密码簿模块内；这里只负责关闭详情面板）
   const deleteBtn = document.getElementById('deleteBtn');
   if (deleteBtn) {
     deleteBtn.addEventListener('click', async () => {
       if (!state.selectedId) return;
-      if (!confirm('确定要删除这个密码吗？此操作不可撤销。')) return;
-      try {
-        await deletePassword(state.selectedId);
-        state.passwords = state.passwords.filter(p => p.id !== state.selectedId);
-        closeDetailCard();
-        renderers.updateCounts();
-        renderers.renderTagsCloud();
-        renderers.updateStorageInfo();
-        showToast('密码已删除');
-      } catch (e) {
-        showToast('删除失败: ' + e);
-      }
+      if (await deletePassword(state.selectedId)) closeDetailCard();
     });
   }
 
@@ -170,8 +159,14 @@ export function initDetailPanel() {
     }
   };
 
-  window.copyField = function(value, label) {
-    copyToClipboard(value, `${label}已复制`);
+  // 查看态复制：按元素 ID 取值，明文密码不进 HTML 属性（含反斜杠/换行的密码会破坏属性）
+  window.copyDetailField = function(elementId, label) {
+    const el = document.getElementById(elementId);
+    if (el) copyToClipboard(el.textContent, `${label}已复制`);
+  };
+
+  window.copyDetailPassword = function() {
+    copyToClipboard(window._currentPassword || '', '密码已复制');
   };
 
   window.copyInputValue = function(inputId, label) {
@@ -217,7 +212,7 @@ export function renderDetail(id) {
       <div class="field-label">用户名</div>
       <div class="field-value-wrapper">
         <div class="field-value" id="detailUsername">${escapeHtml(p.username || '—')}</div>
-        <button class="field-btn" onclick="copyField('${escapeQuotes(p.username || '')}', '用户名')" title="复制">
+        <button class="field-btn" onclick="copyDetailField('detailUsername', '用户名')" title="复制">
           <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
         </button>
       </div>
@@ -230,7 +225,7 @@ export function renderDetail(id) {
         <button class="field-btn" onclick="togglePasswordVisibility()" title="显示/隐藏">
           <svg id="eyeIcon" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
         </button>
-        <button class="field-btn" onclick="copyField('${escapeQuotes(p.password)}', '密码')" title="复制">
+        <button class="field-btn" onclick="copyDetailPassword()" title="复制">
           <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
         </button>
       </div>
@@ -394,13 +389,8 @@ export async function saveChanges() {
   }
 
   try {
-    const result = await updatePassword(state.selectedId, { name, icon, url, username, password, tags, notes, favorite: orig.favorite });
-    const idx = state.passwords.findIndex(x => x.id === state.selectedId);
-    if (idx >= 0) state.passwords[idx] = result;
-    renderers.renderPasswordList();
-    renderers.renderTagsCloud();
+    await updatePassword(state.selectedId, { name, icon, url, username, password, tags, notes, favorite: orig.favorite });
     renderDetail(state.selectedId);
-    showToast('已保存');
     return true;
   } catch (e) {
     showToast('保存失败: ' + e);

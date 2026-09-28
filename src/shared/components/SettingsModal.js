@@ -132,14 +132,6 @@ export function updateProviderUI(provider) {
   }
 }
 
-export function updateSyncUI() {
-  if (!state.appConfig) return;
-  const anySync = (state.appConfig.baidu_sync_enabled && state.appConfig.baidu_cookie) ||
-                  (state.appConfig.quark_sync_enabled && state.appConfig.quark_cookie);
-  const dot = document.querySelector('.status-dot');
-  if (dot) dot.classList.toggle('syncing', anySync);
-}
-
 // ========== 网盘详情展开 ==========
 
 function toggleProviderDetail(provider) {
@@ -182,7 +174,6 @@ async function toggleSync(provider) {
     const enabled = provider === 'quark' ? state.appConfig.quark_sync_enabled : state.appConfig.baidu_sync_enabled;
     showToast(providerName + '自动同步已' + (enabled ? '开启' : '关闭'));
     updateProviderUI(provider);
-    updateSyncUI();
   } catch (e) {
     showToast('保存配置失败: ' + e);
   }
@@ -207,12 +198,7 @@ async function manualDownload(provider) {
   try {
     const result = await syncNow(provider, 'download');
     showToast(result.message);
-    if (result.success) {
-      await loadPasswords();
-      renderers.updateCounts();
-      renderers.renderTagsCloud();
-      renderers.updateStorageInfo();
-    }
+    if (result.success) await loadPasswords();
   } catch (e) {
     showToast('恢复失败: ' + e);
   }
@@ -296,9 +282,6 @@ function initImportExport() {
           if (result.success) {
             showToast(result.message);
             await loadPasswords();
-            renderers.updateCounts();
-            renderers.renderTagsCloud();
-            renderers.updateStorageInfo();
           } else {
             showToast('导入失败: ' + result.message);
           }
@@ -337,14 +320,7 @@ export function listenSyncEvents() {
   });
   onSyncRestored(async () => {
     // 从云恢复完成，数据库已重新打开，刷新前端列表
-    try {
-      await loadPasswords();
-      renderers.updateCounts();
-      renderers.renderTagsCloud();
-      renderers.updateStorageInfo();
-    } catch (e) {
-      console.error('restored refresh failed:', e);
-    }
+    await loadPasswords();
   });
   onBaiduLoginSuccess(() => {
     reloadConfigAndUI();
