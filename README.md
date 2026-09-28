@@ -1,12 +1,20 @@
+<div align="center">
+
+<img src="docs/icon.svg" alt="Password Safer 图标" width="160"/>
+
 # Password Safer
 
-> 本地优先 · 端到端加密 · 双网盘云同步的 Windows 桌面密码保管箱
+**本地优先 · 端到端加密 · 双网盘云同步的 Windows 桌面密码保管箱**
 
 ![version](https://img.shields.io/badge/version-v2.1.0-cyan?style=flat-square)
 ![license](https://img.shields.io/badge/license-GPL%20v3-blue?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Android%20(Phase%202)-blueviolet?style=flat-square)
 ![tauri](https://img.shields.io/badge/Tauri-2.x-orange?style=flat-square)
 ![rust](https://img.shields.io/badge/Rust-edition%202021-dea584?style=flat-square)
+
+</div>
+
+<br/>
 
 Password Safer 是一款基于 **Tauri 2 + Rust** 构建的 Windows 桌面密码管理应用。所有密码数据以 **AES-256-GCM** 加密后存储在本地 JSON 文件中，密钥与数据库文件分离保存；支持**百度网盘**与**夸克网盘**双向/单向云同步，无需用户登录注册，开箱即用。
 
@@ -343,7 +351,6 @@ password-safer/
 | `quark_sync_enabled` | `false` | 是否启用夸克同步 |
 | `quark_sync_interval` | `300` | 自动同步间隔（秒） |
 | `quark_cookie_expires_at` | `0` | Cookie 过期时间戳 |
-| `quark_last_remote_mtime` | `0` | 上次同步时云端文件 mtime（双向同步用） |
 
 ### 通用设置
 
