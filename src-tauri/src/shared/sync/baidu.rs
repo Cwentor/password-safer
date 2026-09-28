@@ -1,6 +1,6 @@
 use super::SyncProvider;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// 百度网盘同步提供者（基于 BDUSS Cookie 走 web 端接口，非 OAuth）
 pub struct BaiduProvider {
@@ -59,7 +59,7 @@ impl BaiduProvider {
     }
 
     /// 计算整文件 md5、分片 md5 列表、首片 md5
-    fn file_hashes(path: &PathBuf) -> Result<(String, Vec<String>, String), String> {
+    fn file_hashes(path: &Path) -> Result<(String, Vec<String>, String), String> {
         use md5::{Digest, Md5};
         let data = std::fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
         let mut full = Md5::new();
@@ -78,11 +78,7 @@ impl BaiduProvider {
 }
 
 impl SyncProvider for BaiduProvider {
-    fn name(&self) -> &str {
-        "百度网盘"
-    }
-
-    fn upload(&self, local_path: &PathBuf, remote_path: &str) -> Result<(), String> {
+    fn upload(&self, local_path: &Path, remote_path: &str) -> Result<(), String> {
         let bdstoken = self.bdstoken()?;
         let dir = Self::parent_dir(remote_path);
 
@@ -185,7 +181,7 @@ impl SyncProvider for BaiduProvider {
         Ok(())
     }
 
-    fn download(&self, remote_path: &str, local_path: &PathBuf) -> Result<(), String> {
+    fn download(&self, remote_path: &str) -> Result<Vec<u8>, String> {
         let url = format!(
             "https://d.pcs.baidu.com/rest/2.0/pcs/file?method=download&path={}",
             urlenc(remote_path)
@@ -200,11 +196,9 @@ impl SyncProvider for BaiduProvider {
         if !resp.status().is_success() {
             return Err(format!("下载失败: HTTP {}", resp.status()));
         }
-        let bytes = resp
-            .bytes()
-            .map_err(|e| format!("读取下载内容失败: {}", e))?;
-        std::fs::write(local_path, &bytes).map_err(|e| format!("写入本地文件失败: {}", e))?;
-        Ok(())
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("读取下载内容失败: {}", e))
     }
 }
 

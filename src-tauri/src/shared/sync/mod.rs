@@ -1,65 +1,47 @@
 pub mod auth;
 pub mod baidu;
+pub mod engine;
 pub mod quark;
 
-use crate::shared::models::SyncResult;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// 同步提供者 trait
-/// 持有 Cookie 鉴权信息，只负责文件上传/下载，不关心 Cookie 来源
+/// 持有 Cookie 鉴权信息，只负责网盘上的文件传输，不关心 Cookie 来源、
+/// 不关心密码簿内容：下载返回字节，写入一律由调用方经单一入口完成
 pub trait SyncProvider: Send + Sync {
     /// 上传本地文件到云端，覆盖远程
-    fn upload(&self, local_path: &PathBuf, remote_path: &str) -> Result<(), String>;
-    /// 从云端下载文件到本地，覆盖本地
-    fn download(&self, remote_path: &str, local_path: &PathBuf) -> Result<(), String>;
-    /// 提供者名称
-    fn name(&self) -> &str;
+    fn upload(&self, local_path: &Path, remote_path: &str) -> Result<(), String>;
+    /// 从云端下载文件内容并返回字节（不落盘，由调用方决定如何写入）
+    fn download(&self, remote_path: &str) -> Result<Vec<u8>, String>;
     /// 获取远端文件最后修改时间（unix 秒），文件不存在返回 Ok(None)
     /// 默认实现返回 Err，表示该 provider 不支持
-    #[allow(dead_code)]
     fn remote_file_mtime(&self, _remote_path: &str) -> Result<Option<i64>, String> {
         Err("remote_file_mtime not supported".to_string())
     }
 }
 
-/// 执行上传：本地 db 文件 → 网盘
-pub fn sync_upload(
-    provider: &dyn SyncProvider,
-    local_path: &PathBuf,
-    remote_path: &str,
-) -> SyncResult {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    match provider.upload(local_path, remote_path) {
-        Ok(()) => SyncResult {
-            success: true,
-            message: format!("已上传到 {}", provider.name()),
-            synced_at: now,
-        },
-        Err(e) => SyncResult {
-            success: false,
-            message: format!("上传失败: {}", e),
-            synced_at: now,
-        },
+/// 按名称构造同步提供者与其 Cookie 校验器（按网盘分派的唯一位置）
+pub fn build_provider(
+    name: &str,
+    cookie: String,
+) -> Result<(Box<dyn SyncProvider>, Box<dyn auth::QrAuthenticator>), String> {
+    match name {
+        "baidu" => Ok((
+            Box::new(baidu::BaiduProvider::new(cookie)),
+            Box::new(auth::baidu::BaiduAuth::new()),
+        )),
+        "quark" => Ok((
+            Box::new(quark::QuarkProvider::new(cookie)),
+            Box::new(auth::quark::QuarkAuth::new()),
+        )),
+        _ => Err(format!("未知的同步提供者: {}", name)),
     }
 }
 
-/// 执行下载：网盘 → 本地 db 文件
-pub fn sync_download(
-    provider: &dyn SyncProvider,
-    remote_path: &str,
-    local_path: &PathBuf,
-) -> SyncResult {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    match provider.download(remote_path, local_path) {
-        Ok(()) => SyncResult {
-            success: true,
-            message: format!("已从 {} 下载", provider.name()),
-            synced_at: now,
-        },
-        Err(e) => SyncResult {
-            success: false,
-            message: format!("下载失败: {}", e),
-            synced_at: now,
-        },
+/// 本地密码簿文件有效性：文件存在且非空
+pub fn local_vault_valid(local_path: &Path) -> bool {
+    match std::fs::metadata(local_path) {
+        Ok(m) => m.len() > 0,
+        Err(_) => false,
     }
 }
