@@ -288,6 +288,8 @@ pub trait SyncProvider: Send + Sync {
 | 待决项 | 决定 | 落地 |
 |---|---|---|
 | master.key / 包裹件 | **全部取消：库密码派生密钥**（当日四次拍板定稿） | §2.8：Argon2id(库密码) 直接加密整库，信封自带盐与参数随库走；本机 keyring 缓存免输密码，新设备凭密码即用、零导入；忘记密码不可找回；云端泄露可离线爆破（强 KDF 参数 + 强制 ≥8 位缓解，改密码可选清理云端历史） |
+| legacy 远端 vault.json | **删除** | §2.7：genesis meta 确认可 list 后删除；失败补删重试；全设备一起升级 |
+| 冲突交互 | ~~v2 用户裁决~~ → **升级为 S1 自动并集 + 首页公告**（2026-11-01 二次拍板） | §六：冲突不阻塞同步，两版都保留，首页逐对裁决 |
 
 ## 六、评审修复与规格遗留（2026-11-01 双轴评审后）
 
@@ -320,6 +322,10 @@ pub trait SyncProvider: Send + Sync {
 - **S7 ✅ 已实现（形态优于预期）**：实测回退内容不匹配最新已知 head → 判为本机修改
   → **回退作为新 head 传播**（用户意图自动达成）；真歧义场景（回退恰为旧已知 head）
   apply 前归档兜底保留。测试 `rollback_to_old_head_propagates_as_push`。
-- **A7/C4**：随 S5 解决（较新判定用 modified_ms）；百度 precreate 秒传未利用（仅浪费带宽）→ 低优先级遗留。
-| legacy 远端 vault.json | **删除** | §2.7：genesis meta 确认可 list 后删除；失败补删重试；全设备一起升级 |
-| 冲突交互 | **v2 用户裁决** | §2.9：引擎只挂起不裁决，ResolveConflictModal 三选 + 逐条改选，含记录级合并 |
+- **A7 ✅ 已随 S5 解决**：较新判定已改用记录级 `modified_ms`（不再依赖 last_used + local_dirty_at）。
+- **C4 ⏳ 遗留（低优先级，纯带宽优化）**：百度 precreate 秒传未利用——precreate 请求已携带
+  `content-md5`/`slice-md5`（`baidu.rs:96-102`），但响应里 `return_type == 2`（服务端已有同内容、
+  秒传成功）被无视，代码无条件走完整分片上传 + create(rtype=3)。正确性无损（同内容同名覆盖
+  等价），仅崩溃恢复（blob 传完 meta 未传的下轮重试）等边角场景浪费带宽——夸克秒传命中
+  零流量，百度全量重传。修法：precreate 响应解析加 `return_type == 2 → return Ok(())`，
+  约 5-8 行 + 一条测试；顺手做即可，不阻塞任何验收。
