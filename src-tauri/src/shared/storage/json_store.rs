@@ -150,12 +150,26 @@ impl JsonStore {
         Ok((store, key))
     }
 
-    /// 换库密码：旧钥解密全库（含密码字段）→ 新参数新钥重加密 → 原子写。
+    /// v2 模式用已有派生钥打开（本机缓存路径，无需密码）
+    pub fn open_with_key(db_path: PathBuf, key: [u8; 32]) -> Result<Self, String> {
+        let bytes = std::fs::read(&db_path)
+            .map_err(|e| format!("读取 vault.json 失败: {}", e))?;
+        let env: VaultEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|_| "密码簿不是 v2 库密码加密格式".to_string())?;
+        let store = JsonStore {
+            db_path,
+            crypto: Crypto::from_key_bytes(key),
+            envelope_mode: true,
+            kdf_params: Some(env.kdf.clone()),
+            on_user_save: None,
+        };
+        store.load().map_err(|e| format!("缓存钥匙解锁失败: {}", e))?;
+        Ok(store)
+    }
+
+    /// 换库密码 / v1→v2 升级迁移：旧钥解密全库（含密码字段）→ 新参数新钥重加密 → 原子写。
     /// 返回新派生钥（缓存更新用）。任何一步失败都不动现有文件。
     pub fn re_encrypt(&mut self, new_password: &str) -> Result<[u8; 32], String> {
-        if !self.envelope_mode {
-            return Err("v1 密码簿请先升级为库密码模式".to_string());
-        }
         let mut data = self.load()?;
         let params = KdfParams::generate();
         let new_key = crypto::derive_key(new_password, &params)?;
@@ -172,12 +186,25 @@ impl JsonStore {
 
         let old_crypto = std::mem::replace(&mut self.crypto, new_crypto);
         self.kdf_params = Some(params);
+        let was_envelope = self.envelope_mode;
+        self.envelope_mode = true;
         if let Err(e) = self.save(&data) {
             // 回滚内存态（文件未被写坏：save 原子失败即保持旧内容）
             self.crypto = old_crypto;
+            self.envelope_mode = was_envelope;
             return Err(e);
         }
         Ok(new_key)
+    }
+
+    /// 校验库密码是否正确（派生钥与当前钥比对）
+    pub fn verify_password(&self, password: &str) -> bool {
+        match self.kdf_params.as_ref() {
+            Some(p) => crypto::derive_key(password, p)
+                .map(|k| k == self.crypto.key_bytes())
+                .unwrap_or(false),
+            None => false,
+        }
     }
 
     /// 主文件解密失败时尝试从 .bak 恢复：先验证 .bak 可解密可解析，再原子覆盖主文件

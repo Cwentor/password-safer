@@ -8,7 +8,8 @@ import { renderers } from '../lib/renderer.js';
 import { showToast } from './Toast.js';
 import { formatExpires } from '../lib/utils.js';
 import { loadConfig, reloadConfigAndUI, loadPasswords } from '../lib/dataLoader.js';
-import { saveConfig, syncNow, logout } from '../lib/api.js';
+import { saveConfig, syncNow, logout, getVaultStatus, lockVault } from '../lib/api.js';
+import { showVaultUnlockModal } from './VaultUnlockModal.js';
 import { startQrLogin } from './QrLoginModal.js';
 import { exportDb, importDb, saveFileDialog, openFileDialog } from '../lib/api.js';
 import {
@@ -53,8 +54,66 @@ export function initSettingsModal() {
 
   initSyncFields();
   initImportExport();
+  initVaultSecurity();
   registerSyncWindowGlobals();
   // listenSyncEvents() 由 desktop/index.js 的 init() 序列统一调用，避免重复注册
+}
+
+// ========== 库密码（安全页） ==========
+
+async function refreshVaultSecurity() {
+  const statusEl = document.getElementById('vaultPwdStatus');
+  const actionBtn = document.getElementById('vaultPwdAction');
+  const lockBtn = document.getElementById('vaultLockBtn');
+  if (!statusEl || !actionBtn) return;
+  try {
+    state.vaultStatus = await getVaultStatus();
+  } catch (_) { /* 保持上次状态 */ }
+  const st = state.vaultStatus;
+  if (!st) { statusEl.textContent = '状态未知'; return; }
+  if (st.format === 'none') {
+    statusEl.textContent = '尚未设置库密码（首启待设置）';
+    actionBtn.textContent = '设置库密码';
+    lockBtn.style.display = 'none';
+  } else if (st.format === 'v1') {
+    statusEl.textContent = 'master.key 模式 · 可升级为库密码（跨设备凭密码恢复）';
+    actionBtn.textContent = '升级为库密码';
+    lockBtn.style.display = 'none';
+  } else if (!st.unlocked) {
+    statusEl.textContent = '已锁定';
+    actionBtn.textContent = '解锁';
+    lockBtn.style.display = 'none';
+  } else {
+    statusEl.textContent = '库密码模式 · 已解锁';
+    actionBtn.textContent = '修改库密码';
+    lockBtn.style.display = '';
+  }
+}
+
+function initVaultSecurity() {
+  const actionBtn = document.getElementById('vaultPwdAction');
+  const lockBtn = document.getElementById('vaultLockBtn');
+  if (actionBtn) {
+    actionBtn.addEventListener('click', () => {
+      const st = state.vaultStatus || {};
+      const mode = st.format === 'none' ? 'create'
+        : st.format === 'v1' ? 'migrate'
+        : !st.unlocked ? 'unlock' : 'change';
+      showVaultUnlockModal(mode).then(() => refreshVaultSecurity());
+    });
+  }
+  if (lockBtn) {
+    lockBtn.addEventListener('click', async () => {
+      try {
+        await lockVault();
+        state.vaultStatus = { ...(state.vaultStatus || {}), unlocked: false };
+        showToast('密码簿已锁定');
+        refreshVaultSecurity();
+      } catch (e) {
+        showToast('锁定失败: ' + e);
+      }
+    });
+  }
 }
 
 export function openSettingsModal() {
@@ -98,6 +157,8 @@ export function populateSettingsForm() {
 
   setText('quarkLastSync', (state.syncState && state.syncState.quark && state.syncState.quark.last_sync) || '—');
   setText('baiduLastSync', (state.syncState && state.syncState.baidu && state.syncState.baidu.last_sync) || '—');
+
+  refreshVaultSecurity();
   setText('quarkExpires', formatExpires(state.appConfig.quark_cookie_expires_at));
   setText('baiduExpires', formatExpires(state.appConfig.baidu_cookie_expires_at));
 

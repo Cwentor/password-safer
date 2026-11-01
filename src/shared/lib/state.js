@@ -20,6 +20,9 @@ export const state = {
   // 云同步本地记账（last_sync 等，来自 get_sync_state）
   syncState: null,
 
+  // 密码簿状态（{format: none|v1|v2, unlocked}，来自 get_vault_status）
+  vaultStatus: null,
+
   // 详情内联编辑态
   editMode: false,
   editBuffer: null,           // {name, icon, url, username, password, tags, notes}

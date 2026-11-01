@@ -163,6 +163,32 @@ export function getSyncState() {
   return invoke('get_sync_state');
 }
 
+// ========== 库密码（v2 信封） ==========
+
+export function getVaultStatus() {
+  return invoke('get_vault_status');
+}
+
+export function unlockVault(password) {
+  return invoke('unlock_vault', { password });
+}
+
+export function setVaultPassword(password) {
+  return invoke('set_vault_password', { password });
+}
+
+export function changeVaultPassword(oldPassword, newPassword) {
+  return invoke('change_vault_password', { oldPassword, newPassword });
+}
+
+export function migrateVaultToPassword(password) {
+  return invoke('migrate_vault_to_password', { password });
+}
+
+export function lockVault() {
+  return invoke('lock_vault');
+}
+
 export function logout(provider) {
   return invoke('logout', { provider });
 }

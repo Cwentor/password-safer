@@ -15,9 +15,9 @@ use tauri::{Emitter, Manager, State};
 
 /// 应用全局状态
 pub struct AppState {
-    /// JSON 存储实例（每次操作都重新读取文件，无需 close/reopen）；
+    /// JSON 存储实例；None = 密码簿锁定（v2 无本机缓存）或待建库（首启）。
     /// 套 Arc 是为了让云同步引擎的 VaultAccess 能持引用走单一写入口
-    pub database: Arc<Mutex<shared::storage::json_store::JsonStore>>,
+    pub database: Arc<Mutex<Option<shared::storage::json_store::JsonStore>>>,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
     /// Cookie 即将过期提醒是否已发送（避免重复提醒，按网盘各记一个）
@@ -25,11 +25,25 @@ pub struct AppState {
     pub baidu_cookie_warn_sent: std::sync::atomic::AtomicBool,
 }
 
-/// 密码簿文件访问的生产实现：写入一律经 Mutex<JsonStore> 单一入口，
+impl AppState {
+    /// 锁住数据库槽位；`as_ref()/as_mut()` 为 None 即密码簿锁定/待建库
+    fn db(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<shared::storage::json_store::JsonStore>>, String>
+    {
+        self.database
+            .lock()
+            .map_err(|e| format!("数据库锁异常: {}", e))
+    }
+}
+
+const LOCKED_MSG: &str = "密码簿已锁定，请先解锁";
+
+/// 密码簿文件访问的生产实现：写入一律经 Mutex 单一入口，
 /// 供云同步引擎下载后替换本地密码簿使用
 struct VaultAccess {
     db_path: PathBuf,
-    database: Arc<Mutex<shared::storage::json_store::JsonStore>>,
+    database: Arc<Mutex<Option<shared::storage::json_store::JsonStore>>>,
 }
 
 impl engine::VaultIo for VaultAccess {
@@ -50,7 +64,9 @@ impl engine::VaultIo for VaultAccess {
     }
 
     fn replace(&self, bytes: &[u8]) -> Result<(), String> {
-        self.database.lock().unwrap().replace_raw(bytes)
+        let mut g = self.database.lock().map_err(|e| e.to_string())?;
+        let store = g.as_mut().ok_or(LOCKED_MSG)?;
+        store.replace_raw(bytes)
     }
 }
 
@@ -67,6 +83,30 @@ impl session::SyncStateIo for SyncStateAccess {
     fn save(&self, st: &SyncState) -> Result<(), String> {
         st.save()
     }
+}
+
+/// 给（重新打开的）store 注册用户写回调：刷新 sync_state.local_dirty_at
+fn attach_user_save_callback(store: &mut shared::storage::json_store::JsonStore, data_dir: &Path) {
+    let sync_state_path = data_dir.join("sync_state.json");
+    store.set_on_user_save(Box::new(move || {
+        match SyncState::load_or_create(sync_state_path.clone()) {
+            Ok(mut st) => {
+                st.local_dirty_at = chrono::Local::now().timestamp();
+                if let Err(e) = st.save() {
+                    eprintln!("[sync_state] 刷新 local_dirty_at 失败: {}", e);
+                }
+            }
+            Err(e) => eprintln!("[sync_state] 刷新 local_dirty_at 读取失败: {}", e),
+        }
+    }));
+}
+
+/// 库密码最低要求（拍板：≥8 位；强度提示由前端展示）
+fn check_password_strength(p: &str) -> Result<(), String> {
+    if p.chars().count() < 8 {
+        return Err("库密码至少需要 8 位".to_string());
+    }
+    Ok(())
 }
 
 /// 当前本地时间戳字符串
@@ -108,49 +148,53 @@ fn provider_display(provider: &str) -> &'static str {
 /// 获取所有密码
 #[tauri::command]
 fn get_all_passwords(state: State<'_, Arc<AppState>>) -> Result<Vec<PasswordDto>, String> {
-    state.database.lock().unwrap().get_all()
+    state
+        .db()?
+        .as_ref()
+        .ok_or(LOCKED_MSG)?
+        .get_all()
 }
 
 /// 新增密码
 #[tauri::command]
 fn add_password(data: PasswordInput, state: State<'_, Arc<AppState>>) -> Result<PasswordDto, String> {
-    state.database.lock().unwrap().insert(&data)
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.insert(&data)
 }
 
 /// 更新密码
 #[tauri::command]
 fn update_password(id: i64, data: PasswordInput, state: State<'_, Arc<AppState>>) -> Result<PasswordDto, String> {
-    state.database.lock().unwrap().update(id, &data)
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.update(id, &data)
 }
 
 /// 删除密码
 #[tauri::command]
 fn delete_password(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.lock().unwrap().delete(id)
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.delete(id)
 }
 
 /// 切换收藏
 #[tauri::command]
 fn toggle_favorite(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.lock().unwrap().toggle_favorite(id)
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.toggle_favorite(id)
 }
 
 /// 更新最后使用时间
 #[tauri::command]
 fn update_last_used(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.lock().unwrap().update_last_used(id)
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.update_last_used(id)
 }
 
 /// 获取配置
 #[tauri::command]
 fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
-    state.database.lock().unwrap().load_config()
+    state.db()?.as_ref().ok_or(LOCKED_MSG)?.load_config()
 }
 
 /// 保存配置
 #[tauri::command]
 fn save_config(config: AppConfig, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.database.lock().unwrap().save_config(&config)
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.save_config(&config)
 }
 
 /// 立即同步（上传或下载）；方向由用户在界面上指定。
@@ -162,7 +206,7 @@ async fn sync_now(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<SyncResult, String> {
-    let config = state.database.lock().unwrap().load_config()?;
+    let config = state.db()?.as_ref().ok_or(LOCKED_MSG)?.load_config()?;
     let (cookie, remote_path) = match provider.as_str() {
         "baidu" => (config.baidu_cookie.clone(), config.baidu_remote_path.clone()),
         "quark" => (config.quark_cookie.clone(), config.quark_remote_path.clone()),
@@ -292,7 +336,7 @@ async fn qr_poll(
             message,
         }),
         QrLoginStatus::Confirmed { cookie, expires_at } => {
-            let mut config = state.database.lock().unwrap().load_config()?;
+            let mut config = state.db()?.as_mut().ok_or(LOCKED_MSG)?.load_config()?;
             match provider_key.as_str() {
                 "baidu" => {
                     config.baidu_cookie = cookie;
@@ -306,7 +350,7 @@ async fn qr_poll(
                 }
                 _ => {}
             }
-            state.database.lock().unwrap().save_config(&config)?;
+            state.db()?.as_mut().ok_or(LOCKED_MSG)?.save_config(&config)?;
             Ok(QrPollResult {
                 status: "confirmed".to_string(),
                 message: format!("{} 登录成功", provider_key),
@@ -322,7 +366,7 @@ fn logout(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let mut config = state.database.lock().unwrap().load_config()?;
+    let mut config = state.db()?.as_mut().ok_or(LOCKED_MSG)?.load_config()?;
     match provider.as_str() {
         "baidu" => {
             config.baidu_cookie = String::new();
@@ -336,12 +380,16 @@ fn logout(
         }
         _ => return Err("未知的提供者".to_string()),
     }
-    state.database.lock().unwrap().save_config(&config)?;
+    state.db()?.as_mut().ok_or(LOCKED_MSG)?.save_config(&config)?;
 
     // 移动端：若所有同步均已停用，取消常驻通知
     #[cfg(mobile)]
     {
-        let cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
+        let cfg = state
+            .db()?
+            .as_ref()
+            .map(|s| s.load_config().unwrap_or_default())
+            .unwrap_or_default();
         let any_sync = (cfg.baidu_sync_enabled && !cfg.baidu_cookie.is_empty())
             || (cfg.quark_sync_enabled && !cfg.quark_cookie.is_empty());
         if !any_sync {
@@ -380,27 +428,30 @@ fn import_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<Impor
     };
 
     // 单一写入口：先验证可解密、可解析，再原子替换；验证不过不会破坏现有数据
-    match state.database.lock().unwrap().replace_raw(&bytes) {
-        Ok(()) => {
-            let imported_count = state
-                .database
-                .lock()
-                .unwrap()
-                .get_all()
-                .map(|v| v.len())
-                .unwrap_or(0);
-            Ok(ImportResult {
-                success: true,
-                message: format!("成功导入，共 {} 条密码记录", imported_count),
-                imported_count,
-            })
+    let import_result = {
+        let g = state.db()?;
+        match g.as_ref().ok_or(LOCKED_MSG)?.replace_raw(&bytes) {
+            Ok(()) => {
+                let imported_count = g
+                    .as_ref()
+                    .ok_or(LOCKED_MSG)?
+                    .get_all()
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                Ok(ImportResult {
+                    success: true,
+                    message: format!("成功导入，共 {} 条密码记录", imported_count),
+                    imported_count,
+                })
+            }
+            Err(e) => Ok(ImportResult {
+                success: false,
+                message: format!("导入失败: {}", e),
+                imported_count: 0,
+            }),
         }
-        Err(e) => Ok(ImportResult {
-            success: false,
-            message: format!("导入失败: {}", e),
-            imported_count: 0,
-        }),
-    }
+    };
+    import_result
 }
 
 /// 导出数据库文件到指定路径（复制在锁内进行，不与写入并发）
@@ -424,12 +475,118 @@ fn get_db_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, Str
     let size = std::fs::metadata(&state.db_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let count = state.database.lock().unwrap().get_all().map(|v| v.len()).unwrap_or(0);
+    let count = state
+        .db()?
+        .as_ref()
+        .ok_or(LOCKED_MSG)?
+        .get_all()
+        .map(|v| v.len())
+        .unwrap_or(0);
     Ok(serde_json::json!({
         "path": state.db_path.to_string_lossy(),
         "size": size,
         "count": count,
     }))
+}
+
+// ========== 密码簿锁定 / 库密码（v2） ==========
+
+/// 密码簿状态：format = none（待设库密码）| v1（master.key 模式）| v2（库密码模式）；
+/// unlocked = 存储槽位是否有库（v2 无缓存时为 false，前端弹解锁框）
+#[tauri::command]
+fn get_vault_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let format = shared::storage::json_store::vault_format(&state.db_path);
+    let unlocked = state.db()?.as_ref().is_some();
+    Ok(serde_json::json!({ "format": format, "unlocked": unlocked }))
+}
+
+/// 解锁 v2 密码簿（新设备 / 无本机缓存时）：派生 → 验证 → 缓存 → 入槽
+#[tauri::command]
+fn unlock_vault(password: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let (mut store, key) =
+        shared::storage::json_store::JsonStore::open_with_password(state.db_path.clone(), &password)?;
+    attach_user_save_callback(&mut store, &state.data_dir);
+    // 缓存失败非致命：本次会话已解锁，重启后需重输密码
+    if let Err(e) = shared::storage::key_cache::cache_key(&key) {
+        eprintln!("[vault] 派生钥缓存失败（不影响本次解锁）: {}", e);
+    }
+    *state.db()? = Some(store);
+    Ok(())
+}
+
+/// 首启建库：设置库密码并创建空库（仅当无密码簿文件时允许）
+#[tauri::command]
+fn set_vault_password(password: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    check_password_strength(&password)?;
+    if shared::storage::json_store::vault_format(&state.db_path) != "none" {
+        return Err("密码簿已存在，如需更换库密码请使用修改功能".to_string());
+    }
+    let (mut store, key) =
+        shared::storage::json_store::JsonStore::create_with_password(state.db_path.clone(), &password)?;
+    attach_user_save_callback(&mut store, &state.data_dir);
+    if let Err(e) = shared::storage::key_cache::cache_key(&key) {
+        eprintln!("[vault] 派生钥缓存失败（不影响本次会话）: {}", e);
+    }
+    *state.db()? = Some(store);
+    Ok(())
+}
+
+/// 修改库密码：验证旧密码 → 全库换钥 → 更新本机缓存
+#[tauri::command]
+fn change_vault_password(
+    old_password: String,
+    new_password: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    check_password_strength(&new_password)?;
+    let new_key = {
+        let mut g = state.db()?;
+        let store = g.as_mut().ok_or(LOCKED_MSG)?;
+        if !store.verify_password(&old_password) {
+            return Err("当前库密码不正确".to_string());
+        }
+        store.re_encrypt(&new_password)?
+    };
+    // 旧缓存已失效：先清再写，写失败则保持清空（下次启动输密码解锁，安全侧）
+    shared::storage::key_cache::clear_cache();
+    if let Err(e) = shared::storage::key_cache::cache_key(&new_key) {
+        eprintln!("[vault] 新派生钥缓存失败（下次启动需输密码）: {}", e);
+    }
+    Ok(())
+}
+
+/// v1 → v2 升级迁移：为 master.key 时代的密码簿设置库密码（全库换钥），
+/// 成功后 master.key 归档为 .retired 保留
+#[tauri::command]
+fn migrate_vault_to_password(password: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    check_password_strength(&password)?;
+    let new_key = {
+        let mut g = state.db()?;
+        let store = g.as_mut().ok_or(LOCKED_MSG)?;
+        if shared::storage::json_store::vault_format(&state.db_path) != "v1" {
+            return Err("仅 master.key 模式的密码簿需要迁移".to_string());
+        }
+        store.re_encrypt(&password)?
+    };
+    // master.key 归档（不删除，保留回退排查能力）
+    let key_path = state.data_dir.join("master.key");
+    if key_path.exists() {
+        let retired = state.data_dir.join("master.key.retired");
+        if let Err(e) = std::fs::rename(&key_path, &retired) {
+            eprintln!("[vault] master.key 归档失败（不影响迁移）: {}", e);
+        }
+    }
+    if let Err(e) = shared::storage::key_cache::cache_key(&new_key) {
+        eprintln!("[vault] 派生钥缓存失败（下次启动需输密码）: {}", e);
+    }
+    Ok(())
+}
+
+/// 显式锁定：清空内存中的库（本机缓存保留，解锁免输密码）
+#[tauri::command]
+fn lock_vault(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    *state.db()? = None;
+    Ok(())
 }
 
 /// 读取云同步本地记账（last_sync 等展示信息；sync_state.json 不上云）
@@ -507,14 +664,18 @@ fn apply_sync_report(
         }
         engine::Outcome::NotLoggedIn => {}
         engine::Outcome::CookieExpired => {
-            // Cookie 失效：关闭自动同步，通知前端重新扫码
-            let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
-            match provider {
-                "baidu" => cfg.baidu_sync_enabled = false,
-                "quark" => cfg.quark_sync_enabled = false,
-                _ => {}
+            // Cookie 失效：关闭自动同步，通知前端重新扫码（锁定时无从读配置，跳过）
+            if let Ok(mut g) = state.database.lock() {
+                if let Some(store) = g.as_mut() {
+                    let mut cfg = store.load_config().unwrap_or_default();
+                    match provider {
+                        "baidu" => cfg.baidu_sync_enabled = false,
+                        "quark" => cfg.quark_sync_enabled = false,
+                        _ => {}
+                    }
+                    let _ = store.save_config(&cfg);
+                }
             }
-            let _ = state.database.lock().unwrap().save_config(&cfg);
             let _ = app.emit(
                 "sync://expired",
                 serde_json::json!({
@@ -549,7 +710,15 @@ fn apply_sync_report(
 fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let config = state.database.lock().unwrap().load_config().unwrap_or_default();
+            // 锁定/待建库时配置不可用：空配置 → 两网盘均视为未启用，本轮空转。
+            // MutexGuard 不能跨 await：在同步段取完配置即刻释放
+            let config = match state.database.lock() {
+                Ok(g) => match g.as_ref() {
+                    Some(store) => store.load_config().unwrap_or_default(),
+                    None => AppConfig::default(),
+                },
+                Err(_) => AppConfig::default(),
+            };
             let now_secs = chrono::Local::now().timestamp();
 
             for name in ["baidu", "quark"] {
@@ -704,6 +873,12 @@ pub fn run() {
         generate_password,
         get_db_info,
         get_sync_state,
+        get_vault_status,
+        unlock_vault,
+        set_vault_password,
+        change_vault_password,
+        migrate_vault_to_password,
+        lock_vault,
         desktop::auth::quark::open_quark_login,
         desktop::auth::quark::save_quark_cookie,
         desktop::auth::baidu::open_baidu_login,
@@ -728,6 +903,12 @@ pub fn run() {
         generate_password,
         get_db_info,
         get_sync_state,
+        get_vault_status,
+        unlock_vault,
+        set_vault_password,
+        change_vault_password,
+        migrate_vault_to_password,
+        lock_vault,
         mobile::auth::quark::open_quark_login,
         mobile::auth::baidu::open_baidu_login,
     ]);
@@ -754,31 +935,38 @@ pub fn run() {
                     migrate_from_old_data_dir(&data_dir);
 
                     let db_path = data_dir.join("vault.json");
-                    let key_path = data_dir.join("master.key");
 
-                    // 初始化加密器
-                    let crypto = shared::crypto::Crypto::from_key_file(&key_path)?;
-
-                    // 初始化 JSON 存储（双重加密：密码字段加密 + 文件整体加密）
-                    let mut database =
-                        shared::storage::json_store::JsonStore::open(db_path.clone(), crypto)?;
+                    // 启动分流（§2.8）：none=待建库（前端引导设库密码）；
+                    // v1=master.key 模式照常打开（待迁移）；v2=本机缓存免解锁，无缓存进入锁定态
+                    let database = match shared::storage::json_store::vault_format(&db_path) {
+                        "none" => None,
+                        "v1" => {
+                            let key_path = data_dir.join("master.key");
+                            let crypto = shared::crypto::Crypto::from_key_file(&key_path)?;
+                            let mut store = shared::storage::json_store::JsonStore::open(db_path.clone(), crypto)?;
+                            attach_user_save_callback(&mut store, &data_dir);
+                            Some(store)
+                        }
+                        _ => match shared::storage::key_cache::load_cached_key() {
+                            Some(key) => {
+                                let mut store = shared::storage::json_store::JsonStore::open_with_key(
+                                    db_path.clone(),
+                                    key,
+                                )?;
+                                attach_user_save_callback(&mut store, &data_dir);
+                                eprintln!("[vault] 已用本机缓存解锁密码簿");
+                                Some(store)
+                            }
+                            None => {
+                                eprintln!("[vault] 无本机缓存，密码簿进入锁定态，等待输入库密码");
+                                None
+                            }
+                        },
+                    };
 
                     // 初始化同步记账（不存在则创建并生成 device_id）
                     let sync_state_path = data_dir.join("sync_state.json");
-                    SyncState::load_or_create(sync_state_path.clone())?;
-
-                    // 用户写密码簿时刷新 local_dirty_at（同步写路径 replace_raw 不触发）
-                    database.set_on_user_save(Box::new(move || {
-                        match SyncState::load_or_create(sync_state_path.clone()) {
-                            Ok(mut st) => {
-                                st.local_dirty_at = chrono::Local::now().timestamp();
-                                if let Err(e) = st.save() {
-                                    eprintln!("[sync_state] 刷新 local_dirty_at 失败: {}", e);
-                                }
-                            }
-                            Err(e) => eprintln!("[sync_state] 刷新 local_dirty_at 读取失败: {}", e),
-                        }
-                    }));
+                    SyncState::load_or_create(sync_state_path)?;
 
                     let state = Arc::new(AppState {
                         database: Arc::new(Mutex::new(database)),
