@@ -47,6 +47,10 @@ pub struct Manifest {
     pub supersedes: Vec<String>,
     /// 语义路径 → blob 指针（BTreeMap 保证序列化顺序稳定）
     pub files: BTreeMap<String, FileEntry>,
+    /// 产生本 head 的库钥匙指纹（信封盐，非机密；拍板 S4——
+    /// 不下载 blob 即可探测"库密码已在其他设备更换"）
+    #[serde(default)]
+    pub key_salt: Option<String>,
 }
 
 /// 内容寻址：blob 名 = sha256 十六进制（密文哈希，不含明文信息）
@@ -82,6 +86,7 @@ impl Manifest {
             device_id: device_id.to_string(),
             supersedes: Vec::new(),
             files: BTreeMap::new(),
+            key_salt: None,
         }
     }
 

@@ -31,6 +31,10 @@ pub struct PasswordRecord {
     pub strength: i32,
     pub created: String,
     pub last_used: String,
+    /// 最后修改时间（unix 毫秒；冲突合并的"较新"判据，拍板 S5。
+    /// 旧数据缺省 0 → 退化用 last_used 字符串比较）
+    #[serde(default)]
+    pub modified_ms: i64,
 }
 
 impl Default for StoreData {
@@ -312,6 +316,11 @@ impl JsonStore {
         self.on_user_save = Some(f);
     }
 
+    /// 密码簿文件路径（会话测试替身用）
+    pub fn db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
     /// 读取并解密 JSON 文件
     pub fn load(&self) -> Result<StoreData, String> {
         let bytes = std::fs::read(&self.db_path)
@@ -374,6 +383,31 @@ impl JsonStore {
         &self.crypto
     }
 
+    /// 本库钥匙指纹（v2 信封的盐；None = v1 模式）
+    pub fn key_salt_b64(&self) -> Option<String> {
+        self.kdf_params.as_ref().map(|p| p.salt_b64.clone())
+    }
+
+    /// 冲突自动并集（拍板 S1）：解密远端字节、与本库按 id 合并（同 id 内容
+    /// 不同则两版都保留，云端版换新 id）、落盘，返回冲突记录对。
+    /// 任何失败（远端解不开、写盘失败）都不动现有文件。
+    pub fn merge_union_remote(
+        &self,
+        remote_bytes: &[u8],
+        config_take_remote: bool,
+    ) -> Result<Vec<crate::shared::sync::merge::MergePair>, String> {
+        let remote_data = decode_store(remote_bytes, &self.crypto)
+            .map_err(|_| "远端版本无法用当前库密码解密（可能已在其他设备更换库密码）".to_string())?;
+        let local_data = self.load()?;
+        let (merged, pairs) = crate::shared::sync::merge::merge_union_keep_both(
+            local_data,
+            remote_data,
+            config_take_remote,
+        );
+        self.save(&merged)?;
+        Ok(pairs)
+    }
+
     /// 将 PasswordRecord 转换为 PasswordDto（解密密码字段）
     fn record_to_dto(&self, r: &PasswordRecord) -> PasswordDto {
         record_to_dto(&self.crypto, r)
@@ -413,6 +447,7 @@ impl JsonStore {
             strength,
             created: now.clone(),
             last_used: now,
+            modified_ms: chrono::Local::now().timestamp_millis(),
         };
 
         let dto = self.record_to_dto(&record);
@@ -442,6 +477,7 @@ impl JsonStore {
         record.notes = input.notes.clone().unwrap_or_default();
         record.favorite = input.favorite.unwrap_or(false);
         record.strength = strength;
+        record.modified_ms = chrono::Local::now().timestamp_millis();
         // 保留原 created，不更新 last_used（保持原值）
 
         let dto = self.record_to_dto(record);

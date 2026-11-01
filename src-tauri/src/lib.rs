@@ -68,6 +68,28 @@ impl engine::VaultIo for VaultAccess {
         let store = g.as_mut().ok_or(LOCKED_MSG)?;
         store.replace_raw(bytes)
     }
+
+    fn merge_union(
+        &self,
+        remote_bytes: &[u8],
+        config_take_remote: bool,
+    ) -> Result<Vec<shared::sync::merge::MergePair>, String> {
+        let g = self.database.lock().map_err(|e| e.to_string())?;
+        let store = g.as_ref().ok_or(LOCKED_MSG)?;
+        store.merge_union_remote(remote_bytes, config_take_remote)
+    }
+
+    fn key_salt_b64(&self) -> Option<String> {
+        let g = self.database.lock().ok()?;
+        g.as_ref().and_then(|store| store.key_salt_b64())
+    }
+
+    fn record_count(&self) -> Option<usize> {
+        let g = self.database.lock().ok()?;
+        g.as_ref()
+            .and_then(|store| store.load().ok())
+            .map(|d| d.passwords.len())
+    }
 }
 
 /// 同步记账访问的生产实现（sync_state.json）
@@ -661,12 +683,17 @@ async fn adopt_remote_key(
             eprintln!("[vault] 收养后派生钥缓存失败（下次启动需输密码）: {}", e);
         }
 
-        // 记账对齐：last_heads 收敛到该 head、清挂起——下轮同步自然收敛
+        // 记账对齐：last_heads 收敛到该 head；本网盘的冲突公告与换盐标记
+        // 一并清掉——下轮同步自然收敛
         let mut st = SyncState::load_or_create(sync_state_path)?;
         if let Some(p) = st.provider_mut(&provider_key) {
             p.last_heads = vec![head_name];
         }
-        st.conflict_pending = None;
+        st.conflict_pairs
+            .retain(|p| p.get("provider").and_then(|v| v.as_str()) != Some(provider_key.as_str()));
+        if st.key_mismatch.as_deref() == Some(provider_key.as_str()) {
+            st.key_mismatch = None;
+        }
         st.save()?;
         Ok(())
     })
@@ -757,49 +784,6 @@ async fn cleanup_cloud_history(state: State<'_, Arc<AppState>>) -> Result<serde_
 
 // ========== 冲突解决（阶段 5） ==========
 
-/// 拉取远端最新 head 的密码簿数据（冲突详情与解决共用；网络 I/O，须在阻塞线程调用）
-fn fetch_winner_data(
-    provider_key: &str,
-    remote_path: &str,
-    cookie: &str,
-    crypto: &shared::crypto::Crypto,
-) -> Result<(String, shared::storage::json_store::StoreData, i64), String> {
-    use shared::sync::manifest;
-    let (provider, _validator) = shared::sync::build_provider(provider_key, cookie.to_string())?;
-    let metas = session::fetch_metas(provider.as_ref(), remote_path)?;
-    let heads = manifest::resolve_heads(&metas);
-    if heads.is_empty() {
-        return Err("远端已无任何版本".to_string());
-    }
-    let head_metas: Vec<(String, shared::sync::manifest::Manifest)> = metas
-        .iter()
-        .filter(|(n, _)| heads.contains(n))
-        .cloned()
-        .collect();
-    let (head_name, head_manifest) = manifest::newest(&head_metas)
-        .ok_or("未找到最新 head")?
-        .clone();
-    let entry = head_manifest
-        .files
-        .get("vault.json")
-        .ok_or("head meta 缺少 vault.json 条目")?;
-    if entry.deleted {
-        return Err("云端最新版本为已删除状态".to_string());
-    }
-    let bytes = provider
-        .as_ref()
-        .download(&format!("{}/blobs/{}.bin", base_of(remote_path), entry.blob))?;
-    let sha = shared::sync::manifest::sha256_hex(&bytes);
-    if sha != entry.blob {
-        return Err("远端 blob 校验失败".to_string());
-    }
-    let data = shared::storage::json_store::decode_store(&bytes, crypto).map_err(|_| {
-        // 评审 A1：给前端一个可识别的信号，触发"输入云端库密码接管"流程
-        "远端版本无法用当前库密码解密（可能已在其他设备更换库密码）".to_string()
-    })?;
-    Ok((head_name, data, head_manifest.updated_at))
-}
-
 /// legacy 密码簿路径的父目录（与 session::base_dir 一致）
 fn base_of(remote_path: &str) -> String {
     let trimmed = remote_path.trim_start_matches('/');
@@ -809,218 +793,172 @@ fn base_of(remote_path: &str) -> String {
     }
 }
 
-/// 冲突挂起详情：解密本地当前库与远端最新 head 的库，按记录 id 对齐供前端展示
+/// 冲突公告详情（拍板 S1）：从本地记账读取自动并集产生的记录对，
+/// 取当前记录数据供首页逐对裁决。纯本地操作，不发网络请求。
 #[tauri::command]
-async fn get_conflict_details(
+fn get_conflict_details(
     provider: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    let database = state.database.clone();
-    let sync_state_path = state.data_dir.join("sync_state.json");
-    let provider_key = provider.clone();
+    let st = SyncState::load_or_create(state.data_dir.join("sync_state.json"))?;
+    let pairs: Vec<serde_json::Value> = st
+        .conflict_pairs
+        .iter()
+        .filter(|p| p.get("provider").and_then(|v| v.as_str()) == Some(provider.as_str()))
+        .cloned()
+        .collect();
+    if pairs.is_empty() {
+        return Err("当前没有待处理的冲突公告".to_string());
+    }
 
-    let details = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
-        let st = SyncState::load_or_create(sync_state_path)?;
-        if st.conflict_pending.is_none() {
-            return Err("当前没有待处理的同步冲突".to_string());
-        }
-        // 取 Cookie 与远端路径（锁定时无法读取配置）
-        let (cookie, remote_path) = {
-            let g = database.lock().map_err(|e| e.to_string())?;
-            let store = g.as_ref().ok_or(LOCKED_MSG)?;
-            let cfg = store.load_config()?;
-            match provider_key.as_str() {
-                "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
-                "quark" => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
-                _ => return Err(format!("未知的同步提供者: {}", provider_key)),
-            }
-        };
-        if cookie.is_empty() {
-            return Err("尚未扫码登录，无法读取云端版本".to_string());
-        }
+    let g = state.db()?;
+    let store = g.as_ref().ok_or(LOCKED_MSG)?;
+    let data = store.load()?;
+    let crypto = store.crypto().clone_key();
+    drop(g);
 
-        let g = database.lock().map_err(|e| e.to_string())?;
-        let store = g.as_ref().ok_or(LOCKED_MSG)?;
-        let crypto = store.crypto().clone_key();
-        drop(g);
-
-        let (head_name, remote_data, head_updated_at) =
-            fetch_winner_data(&provider_key, &remote_path, &cookie, &crypto)?;
-        let local_data = {
-            let g = database.lock().map_err(|e| e.to_string())?;
-            g.as_ref().ok_or(LOCKED_MSG)?.load()?
-        };
-
-        // 按 id 对齐
-        use std::collections::HashMap;
-        let local_map: HashMap<i64, &_> =
-            local_data.passwords.iter().map(|r| (r.id, r)).collect();
-        let remote_map: HashMap<i64, &_> =
-            remote_data.passwords.iter().map(|r| (r.id, r)).collect();
-
-        let only_local: Vec<_> = local_map
+    let find = |id: i64| -> Option<shared::models::PasswordDto> {
+        data.passwords
             .iter()
-            .filter(|(id, _)| !remote_map.contains_key(id))
-            .map(|(_, r)| shared::storage::json_store::record_to_dto(&crypto, r))
-            .collect();
-        let only_remote: Vec<_> = remote_map
-            .iter()
-            .filter(|(id, _)| !local_map.contains_key(id))
-            .map(|(_, r)| shared::storage::json_store::record_to_dto(&crypto, r))
-            .collect();
-        let both: Vec<_> = local_map
-            .iter()
-            .filter(|(id, lr)| {
-                remote_map
-                    .get(id)
-                    .map(|rr| shared::sync::merge::records_differ(lr, rr))
-                    .unwrap_or(false)
-            })
-            .map(|(id, lr)| {
-                let rr = remote_map.get(id).unwrap();
-                serde_json::json!({
-                    "local": shared::storage::json_store::record_to_dto(&crypto, lr),
-                    "remote": shared::storage::json_store::record_to_dto(&crypto, rr),
-                    "newer": if shared::sync::merge::prefer_local(lr, rr) { "local" } else { "remote" },
-                })
-            })
-            .collect();
+            .find(|r| r.id == id)
+            .map(|r| shared::storage::json_store::record_to_dto(&crypto, r))
+    };
 
-        Ok(serde_json::json!({
-            "provider": provider_key,
-            "head": head_name,
-            "head_updated_at": head_updated_at,
-            "only_local": only_local,
-            "only_remote": only_remote,
-            "both": both,
-        }))
-    })
-    .await
-    .map_err(|e| format!("任务异常: {}", e))?;
+    let detailed: Vec<serde_json::Value> = pairs
+        .iter()
+        .filter_map(|p| {
+            let local_id = p.get("local_id")?.as_i64()?;
+            let remote_id = p.get("remote_id")?.as_i64()?;
+            Some(serde_json::json!({
+                "provider": p.get("provider")?,
+                "local_id": local_id,
+                "remote_id": remote_id,
+                "name": p.get("name")?,
+                "remote_newer": p.get("remote_newer")?,
+                "detected_at": p.get("detected_at")?,
+                "local": find(local_id),
+                "remote": find(remote_id),
+            }))
+        })
+        .collect();
 
-    details
+    Ok(serde_json::json!({ "provider": provider, "pairs": detailed }))
 }
 
-/// 应用冲突裁决：按策略/逐条选择合并两侧 → 落盘 → 强制推送为新 head（清挂起）
+/// 应用逐对裁决（拍板 S1）：selections = { "<云端副本id>": "local"|"remote" }。
+/// 选 local → 删云端副本；选 remote → 删本机版（云端副本已带内容）。
+/// 全部落盘后推送新 head 并清掉已处理的公告。
 #[tauri::command]
 async fn resolve_conflict(
     provider: String,
-    strategy: String,
     selections: serde_json::Value,
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
     let db_path = state.db_path.clone();
     let database = state.database.clone();
-    let data_dir = state.data_dir.clone();
+    let sync_state_path = state.data_dir.join("sync_state.json");
     let provider_key = provider.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        use shared::sync::merge::{merge_vaults, Choice};
-        let sync_state_path = data_dir.join("sync_state.json");
-        let st = SyncState::load_or_create(sync_state_path.clone())?;
-        if st.conflict_pending.is_none() {
-            return Err("当前没有待处理的同步冲突".to_string());
+        let mut st = SyncState::load_or_create(sync_state_path.clone())?;
+        let sel_map = selections
+            .as_object()
+            .ok_or("selections 必须是对象")?;
+        // 解析裁决：remote_id -> 保留哪一侧
+        let mut decisions: Vec<(i64, bool)> = Vec::new(); // (remote_id, keep_remote)
+        for (k, v) in sel_map {
+            let remote_id = k.parse::<i64>().map_err(|_| format!("非法的记录 id: {}", k))?;
+            let keep_remote = match v.as_str() {
+                Some("remote") => true,
+                Some("local") => false,
+                other => return Err(format!("非法的裁决值: {:?}", other)),
+            };
+            decisions.push((remote_id, keep_remote));
         }
-        let local_dirty_at = st.local_dirty_at;
-
-        // Cookie / 远端路径
-        let (cookie, remote_path) = {
-            let g = database.lock().map_err(|e| e.to_string())?;
-            let store = g.as_ref().ok_or(LOCKED_MSG)?;
-            let cfg = store.load_config()?;
-            match provider_key.as_str() {
-                "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
-                "quark" => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
-                _ => return Err(format!("未知的同步提供者: {}", provider_key)),
-            }
-        };
-
-        // 解密远端最新 head
-        let (_head_name, remote_data, head_updated_at) = {
-            let g = database.lock().map_err(|e| e.to_string())?;
-            let store = g.as_ref().ok_or(LOCKED_MSG)?;
-            let crypto = store.crypto().clone_key();
-            drop(g);
-            fetch_winner_data(&provider_key, &remote_path, &cookie, &crypto)?
-        };
-
-        // 本地数据先读出（策略 choice 需要两侧 id 全集）
-        let local_data = {
-            let g = database.lock().map_err(|e| e.to_string())?;
-            g.as_ref().ok_or(LOCKED_MSG)?.load()?
-        };
-
-        // 合并：全用本地/全用云端 = 对两侧全部差异记录统一取舍（评审 C1：
-        // 此前这两个策略丢弃了选择，导致三个按钮结果相同）；
-        // custom/merge 用前端逐条选择，缺省按较新者
-        let mut choices: std::collections::HashMap<i64, Choice> = std::collections::HashMap::new();
-        let uniform = match strategy.as_str() {
-            "local" => Some(Choice::Local),
-            "remote" => Some(Choice::Remote),
-            _ => None,
-        };
-        if let Some(ch) = uniform {
-            for r in local_data.passwords.iter().chain(remote_data.passwords.iter()) {
-                choices.insert(r.id, ch);
-            }
-        } else if let Some(obj) = selections.as_object() {
-            for (k, v) in obj {
-                if let (Ok(id), Some(c)) = (k.parse::<i64>(), v.as_str()) {
-                    if let Some(ch) = Choice::parse(c) {
-                        choices.insert(id, ch);
-                    }
-                }
-            }
+        if decisions.is_empty() {
+            return Err("没有任何裁决".to_string());
         }
-        // config 整体取较新侧：local_dirty_at 是秒、head updated_at 是毫秒（评审 🟠4）
-        let config_take_local = match strategy.as_str() {
-            "local" => true,
-            "remote" => false,
-            _ => local_dirty_at * 1000 >= head_updated_at,
-        };
 
-        let merged = {
+        // 公告里的 local_id / remote_id 就是两版记录各自的 id：
+        // 选 local → 删 remote_id 记录；选 remote → 删 local_id 记录
+        let pair_map: std::collections::HashMap<i64, i64> = st
+            .conflict_pairs
+            .iter()
+            .filter(|p| p.get("provider").and_then(|v| v.as_str()) == Some(provider_key.as_str()))
+            .filter_map(|p| {
+                Some((
+                    p.get("remote_id")?.as_i64()?,
+                    p.get("local_id")?.as_i64()?,
+                ))
+            })
+            .collect();
+
+        let resolved;
+        {
             let mut g = database.lock().map_err(|e| e.to_string())?;
             let store = g.as_mut().ok_or(LOCKED_MSG)?;
-            let merged = merge_vaults(local_data, remote_data, config_take_local, &choices);
-            store.save(&merged)?;
-            merged
-        };
-
-        // 强制推送（push_manual：supersedes 全部 heads，清挂起）
-        let (provider_inst, validator) = shared::sync::build_provider(&provider_key, cookie.clone())?;
-        let vault = VaultAccess { db_path, database: database.clone() };
-        let sync_state = SyncStateAccess { path: sync_state_path.clone() };
-        let report = engine::run_manual(engine::ManualInputs {
-            provider: provider_inst.as_ref(),
-            validator: Some(validator.as_ref()),
-            cookie: &cookie,
-            remote_path: &remote_path,
-            provider_key: &provider_key,
-            direction: engine::Direction::Upload,
-            vault: &vault,
-            sync_state: &sync_state,
-        });
-
-        // 合并结果已按用户裁决落盘：无论推送成败都清挂起——推送失败时
-        // 本地内容与新 head 不同，下轮自动同步按普通 push 路径重试（评审 A6）
-        {
-            let mut st = SyncState::load_or_create(sync_state_path.clone())?;
-            st.conflict_pending = None;
-            let _ = st.save();
+            let mut data = store.load()?;
+            let mut delete_ids: Vec<i64> = Vec::new();
+            for (remote_id, keep_remote) in &decisions {
+                let local_id = pair_map
+                    .get(remote_id)
+                    .ok_or_else(|| format!("找不到记录对（云端副本 {}）", remote_id))?;
+                delete_ids.push(if *keep_remote { *local_id } else { *remote_id });
+            }
+            data.passwords.retain(|r| !delete_ids.contains(&r.id));
+            store.save(&data)?;
+            resolved = delete_ids.len();
         }
+
+        // 清掉本网盘已处理的公告（其余网盘的保留）
+        st.conflict_pairs
+            .retain(|p| p.get("provider").and_then(|v| v.as_str()) != Some(provider_key.as_str()));
+        st.save()?;
+
+        // 推送裁决结果（push_manual：supersedes 全部 heads；未绑定/失败留下轮重试）
+        let report = {
+            let (cookie, remote_path) = {
+                let g = database.lock().map_err(|e| e.to_string())?;
+                let store = g.as_ref().ok_or(LOCKED_MSG)?;
+                let cfg = store.load_config()?;
+                match provider_key.as_str() {
+                    "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
+                    "quark" => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
+                    _ => return Err(format!("未知的同步提供者: {}", provider_key)),
+                }
+            };
+            if cookie.is_empty() {
+                None
+            } else {
+                let (provider_inst, validator) =
+                    shared::sync::build_provider(&provider_key, cookie.clone())?;
+                let vault = VaultAccess { db_path, database: database.clone() };
+                let sync_state = SyncStateAccess { path: sync_state_path.clone() };
+                Some(engine::run_manual(engine::ManualInputs {
+                    provider: provider_inst.as_ref(),
+                    validator: Some(validator.as_ref()),
+                    cookie: &cookie,
+                    remote_path: &remote_path,
+                    provider_key: &provider_key,
+                    direction: engine::Direction::Upload,
+                    vault: &vault,
+                    sync_state: &sync_state,
+                }))
+            }
+        };
 
         let _ = app.emit(
             "sync://conflict-resolved",
             serde_json::json!({ "provider": provider_key }),
         );
-        let msg = match report.outcome {
-            engine::Outcome::Uploaded => format!("冲突已解决：合并了 {} 条记录并已上传", merged.passwords.len()),
-            engine::Outcome::Failed(e) => format!("冲突已合并到本地，但推送失败（{}）；下次同步将自动重试", e),
-            _ => "冲突已解决".to_string(),
+        let push_msg = match report.map(|r| r.outcome) {
+            Some(engine::Outcome::Uploaded) => "并已上传".to_string(),
+            Some(engine::Outcome::Failed(e)) => format!("（推送失败：{}；下轮自动同步将重试）", e),
+            Some(_) => "（未推送：尚未绑定网盘，绑定后自动同步）".to_string(),
+            None => "（未绑定网盘，绑定后自动同步）".to_string(),
         };
-        Ok(msg)
+        Ok(format!("已裁决 {} 对冲突{}", resolved, push_msg))
     })
     .await
     .map_err(|e| format!("任务异常: {}", e))??;

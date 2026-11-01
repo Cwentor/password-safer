@@ -1,34 +1,24 @@
-//! 冲突记录级合并（纯函数）：两侧解密后的 StoreData 按密码记录 id 对齐取舍。
+//! 冲突记录级合并（纯函数）：两侧解密后的 StoreData 按密码记录 id 对齐。
 //!
-//! 语义（拍板 v2）：
-//! - passwords 按 id 取**并集**：仅一侧存在的记录一律保留——StoreData 没有墓碑，
-//!   无法区分"本侧删除"与"另一侧新建"，误复活好过误删除；
-//! - 双侧同 id 但内容不同的记录按调用方给的选择取舍，缺省取较新者
-//!   （last_used 大者优先，相同取本地）；
-//! - config（Cookie、设置等）不逐字段合并，整体取调用方指定的较新侧。
+//! 语义（拍板 S1 重构）：冲突**不再挂起阻塞同步**——同 id 内容不同的记录
+//! **两个版本都保留**（云端版分配新 id），合并结果立即推送为新 head，
+//! 记录对返回给调用方写进 sync_state 公告，由用户在首页逐对裁决删留。
+//! 仅一侧存在的记录一律保留（StoreData 无墓碑，误复活好过误删除）；
+//! config 不逐字段合并，整体取调用方指定的侧。
 
 use crate::shared::storage::json_store::{PasswordRecord, StoreData};
 use std::collections::HashMap;
 
-/// 单条冲突记录的取舍
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Choice {
-    Local,
-    Remote,
+/// 一对冲突记录：本机版保留原 id，云端版已分配新 id
+#[derive(Debug, Clone)]
+pub struct MergePair {
+    pub local: PasswordRecord,
+    pub remote: PasswordRecord,
+    /// 云端版是否较新（公告展示提示用）
+    pub remote_newer: bool,
 }
 
-impl Choice {
-    /// 从 "local"/"remote" 字符串解析（前端 selections 用）
-    pub fn parse(s: &str) -> Option<Choice> {
-        match s {
-            "local" => Some(Choice::Local),
-            "remote" => Some(Choice::Remote),
-            _ => None,
-        }
-    }
-}
-
-/// 记录级差异（不含 id 与 next_id 等簿记字段）
+/// 记录级差异（不含 id 与簿记字段）
 pub fn records_differ(a: &PasswordRecord, b: &PasswordRecord) -> bool {
     a.name != b.name
         || a.icon != b.icon
@@ -41,84 +31,90 @@ pub fn records_differ(a: &PasswordRecord, b: &PasswordRecord) -> bool {
         || a.strength != b.strength
 }
 
-/// 较新者判定：last_used 字符串按字典序（YYYY-MM-DD）比较，相同取本地
-pub fn prefer_local(a: &PasswordRecord, b: &PasswordRecord) -> bool {
-    a.last_used >= b.last_used
+/// 较新判定（拍板 S5）：modified_ms 大者新；一方为 0（旧数据）退化用
+/// last_used 字符串比较；仍相同视为本机新。
+pub fn remote_is_newer(local: &PasswordRecord, remote: &PasswordRecord) -> bool {
+    if local.modified_ms > 0 && remote.modified_ms > 0 {
+        return remote.modified_ms > local.modified_ms;
+    }
+    remote.last_used > local.last_used
 }
 
-/// 合并两侧密码簿。
-/// `choices`：双侧同 id 且内容不同时的取舍；缺失的 id 用缺省规则（较新者胜）。
-/// `config_take_local`：config 整体取本地（false 取云端）。
-pub fn merge_vaults(
+/// 并集合并（两版都保留）：返回合并结果与冲突记录对。
+/// 云端版记录在本机版之后追加，id 从现有最大 +1 起顺延。
+pub fn merge_union_keep_both(
     local: StoreData,
     remote: StoreData,
-    config_take_local: bool,
-    choices: &HashMap<i64, Choice>,
-) -> StoreData {
-    let mut merged_ids: Vec<i64> = Vec::new();
+    config_take_remote: bool,
+) -> (StoreData, Vec<MergePair>) {
+    let mut next_id = local
+        .passwords
+        .iter()
+        .map(|r| r.id)
+        .chain(remote.passwords.iter().map(|r| r.id))
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(local.next_id.max(1));
     let mut by_id: HashMap<i64, PasswordRecord> = HashMap::new();
-
     for r in local.passwords {
-        merged_ids.push(r.id);
         by_id.insert(r.id, r);
     }
+
+    let mut pairs = Vec::new();
     for r in remote.passwords {
-        match by_id.get_mut(&r.id) {
+        let conflict = match by_id.get(&r.id) {
             None => {
-                // 仅云端存在：保留（并集语义）
-                merged_ids.push(r.id);
+                // 仅云端存在：直接收编（非冲突，不进公告）
                 by_id.insert(r.id, r);
+                None
             }
             Some(local_r) => {
-                // 双侧同 id：内容相同取本地原样；不同按选择/缺省较新者
                 if records_differ(local_r, &r) {
-                    let take = match choices.get(&r.id) {
-                        Some(Choice::Local) => true,
-                        Some(Choice::Remote) => false,
-                        None => prefer_local(local_r, &r),
-                    };
-                    if !take {
-                        *local_r = r;
-                    }
+                    // 双侧同 id 内容不同：两版都保留，云端版换新 id
+                    let local_r = local_r.clone();
+                    let mut copy = r.clone();
+                    copy.id = next_id;
+                    next_id += 1;
+                    let remote_newer = remote_is_newer(&local_r, &copy);
+                    Some((local_r, copy, remote_newer))
+                } else {
+                    None
                 }
             }
+        };
+        if let Some((local_r, copy, remote_newer)) = conflict {
+            by_id.insert(copy.id, copy.clone());
+            pairs.push(MergePair {
+                local: local_r,
+                remote: copy,
+                remote_newer,
+            });
         }
     }
 
-    // 稳定输出：按 id 升序
-    let mut passwords: Vec<PasswordRecord> = merged_ids
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .filter_map(|id| by_id.remove(&id))
-        .collect();
+    let mut passwords: Vec<PasswordRecord> = by_id.into_values().collect();
     passwords.sort_by_key(|r| r.id);
 
-    // next_id 覆盖两侧所有 id
-    let next_id = passwords
-        .iter()
-        .map(|r| r.id)
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(1);
-
-    StoreData {
-        passwords,
-        config: if config_take_local {
-            local.config
-        } else {
-            remote.config
+    (
+        StoreData {
+            passwords,
+            config: if config_take_remote {
+                remote.config
+            } else {
+                local.config
+            },
+            version: local.version,
+            next_id,
         },
-        version: local.version,
-        next_id,
-    }
+        pairs,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn record(id: i64, name: &str, last_used: &str) -> PasswordRecord {
+    fn record(id: i64, name: &str, modified_ms: i64) -> PasswordRecord {
         PasswordRecord {
             id,
             name: name.to_string(),
@@ -131,7 +127,8 @@ mod tests {
             favorite: false,
             strength: 2,
             created: "2026-01-01".to_string(),
-            last_used: last_used.to_string(),
+            last_used: "2026-01-01".to_string(),
+            modified_ms,
         }
     }
 
@@ -145,72 +142,58 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_union_keeps_both() {
-        let m = merge_vaults(
-            vault(vec![record(1, "仅本地", "2026-01-01")]),
-            vault(vec![record(2, "仅云端", "2026-01-02")]),
-            true,
-            &HashMap::new(),
+    fn disjoint_union_keeps_both_without_pairs() {
+        let (m, pairs) = merge_union_keep_both(
+            vault(vec![record(1, "仅本地", 10)]),
+            vault(vec![record(2, "仅云端", 20)]),
+            false,
         );
         let ids: Vec<i64> = m.passwords.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![1, 2]);
+        assert!(pairs.is_empty(), "仅一侧存在的记录不是冲突");
     }
 
     #[test]
-    fn identical_records_take_local() {
-        let m = merge_vaults(
-            vault(vec![record(1, "同名", "2026-01-01")]),
-            vault(vec![record(1, "同名", "2026-01-01")]),
+    fn identical_records_merge_silently() {
+        let (m, pairs) = merge_union_keep_both(
+            vault(vec![record(1, "同名", 10)]),
+            vault(vec![record(1, "同名", 10)]),
             true,
-            &HashMap::new(),
         );
         assert_eq!(m.passwords.len(), 1);
-        assert_eq!(m.passwords[0].password_encrypted, "enc-同名");
+        assert!(pairs.is_empty());
     }
 
     #[test]
-    fn differing_record_default_prefers_newer() {
-        let m = merge_vaults(
-            vault(vec![record(1, "旧", "2026-01-01")]),
-            vault(vec![record(1, "新", "2026-02-01")]),
-            true,
-            &HashMap::new(),
+    fn conflicting_record_keeps_both_versions() {
+        let (m, pairs) = merge_union_keep_both(
+            vault(vec![record(1, "本机版", 100)]),
+            vault(vec![record(1, "云端版", 200)]),
+            false,
         );
-        assert_eq!(m.passwords[0].name, "新");
+        assert_eq!(m.passwords.len(), 2);
+        assert_eq!(pairs.len(), 1);
+        let p = &pairs[0];
+        // 本机版保留原 id，云端版拿新 id
+        assert_eq!(p.local.id, 1);
+        assert_eq!(p.remote.id, m.next_id - 1);
+        assert_eq!(p.remote.name, "云端版");
+        // 云端 modified_ms 更大 → 标记云端较新
+        assert!(p.remote_newer);
+        // 两版内容都在
+        assert!(m.passwords.iter().any(|r| r.password_encrypted == "enc-本机版"));
+        assert!(m.passwords.iter().any(|r| r.password_encrypted == "enc-云端版"));
     }
 
     #[test]
-    fn differing_record_tie_prefers_local() {
-        let m = merge_vaults(
-            vault(vec![record(1, "本地", "2026-01-01")]),
-            vault(vec![record(1, "云端", "2026-01-01")]),
-            true,
-            &HashMap::new(),
-        );
-        assert_eq!(m.passwords[0].name, "本地");
-    }
-
-    #[test]
-    fn explicit_choice_overrides_default() {
-        let mut choices = HashMap::new();
-        choices.insert(1, Choice::Local);
-        let m = merge_vaults(
-            vault(vec![record(1, "旧但用户选了它", "2026-01-01")]),
-            vault(vec![record(1, "新", "2026-02-01")]),
-            true,
-            &choices,
-        );
-        assert_eq!(m.passwords[0].name, "旧但用户选了它");
-
-        let mut choices = HashMap::new();
-        choices.insert(1, Choice::Remote);
-        let m = merge_vaults(
-            vault(vec![record(1, "本地", "2026-01-01")]),
-            vault(vec![record(1, "云端覆盖", "2026-01-01")]),
-            true,
-            &choices,
-        );
-        assert_eq!(m.passwords[0].name, "云端覆盖");
+    fn newer_judgement_falls_back_to_last_used_for_legacy() {
+        // 旧数据 modified_ms = 0 → 退化用 last_used
+        let mut l = record(1, "旧数据本机", 0);
+        l.last_used = "2026-01-01".to_string();
+        let mut r = record(1, "旧数据云端", 0);
+        r.last_used = "2026-02-01".to_string();
+        let (_, pairs) = merge_union_keep_both(vault(vec![l]), vault(vec![r]), false);
+        assert!(pairs[0].remote_newer);
     }
 
     #[test]
@@ -220,28 +203,34 @@ mod tests {
         let mut remote = vault(vec![]);
         remote.config.auto_lock_minutes = 22;
 
-        assert_eq!(merge_vaults(local.clone(), remote.clone(), true, &HashMap::new()).config.auto_lock_minutes, 11);
-        assert_eq!(merge_vaults(local, remote, false, &HashMap::new()).config.auto_lock_minutes, 22);
+        assert_eq!(
+            merge_union_keep_both(local.clone(), remote.clone(), true).0.config.auto_lock_minutes,
+            22
+        );
+        assert_eq!(
+            merge_union_keep_both(local, remote, false).0.config.auto_lock_minutes,
+            11
+        );
     }
 
     #[test]
     fn next_id_covers_all_records() {
-        let m = merge_vaults(
-            vault(vec![record(1, "a", "2026-01-01")]),
-            vault(vec![record(7, "b", "2026-01-01")]),
-            true,
-            &HashMap::new(),
+        let (m, _) = merge_union_keep_both(
+            vault(vec![record(1, "a", 1)]),
+            vault(vec![record(7, "b", 1), record(1, "冲突副本", 2)]),
+            false,
         );
-        assert_eq!(m.next_id, 8);
+        // 冲突副本拿 id 8，next_id 随之指向 9
+        assert_eq!(m.next_id, 9);
+        assert!(m.passwords.iter().any(|r| r.id == 8 && r.name == "冲突副本"));
     }
 
     #[test]
     fn empty_sides_degrade_gracefully() {
-        let m = merge_vaults(vault(vec![]), vault(vec![]), true, &HashMap::new());
+        let (m, pairs) = merge_union_keep_both(vault(vec![]), vault(vec![]), true);
         assert!(m.passwords.is_empty());
-        assert_eq!(m.next_id, 1);
-
-        let m = merge_vaults(vault(vec![record(3, "x", "2026-01-01")]), vault(vec![]), true, &HashMap::new());
-        assert_eq!(m.passwords.len(), 1);
+        assert!(pairs.is_empty());
+        // 无任何记录时回退到 local.next_id（vault() 里是 100）
+        assert_eq!(m.next_id, 100);
     }
 }

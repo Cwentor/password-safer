@@ -58,6 +58,24 @@ pub trait VaultIo: Send + Sync {
     fn read(&self) -> Result<Vec<u8>, String>;
     /// 用下载到的内容替换本地密码簿（实现须先验证再原子替换）
     fn replace(&self, bytes: &[u8]) -> Result<(), String>;
+    /// 冲突自动并集（拍板 S1）：解密远端字节与本库按 id 合并、两版都保留、
+    /// 落盘并返回冲突记录对。实现须保证失败时不动现有文件。
+    fn merge_union(
+        &self,
+        _remote_bytes: &[u8],
+        _config_take_remote: bool,
+    ) -> Result<Vec<super::merge::MergePair>, String> {
+        Err("merge_union not supported".to_string())
+    }
+    /// 本库钥匙指纹（v2 信封的盐；None = v1 或未知）。meta 带上它后可
+    /// 在不下载 blob 的前提下探测"库密码已在其他设备更换"（拍板 S4）
+    fn key_salt_b64(&self) -> Option<String> {
+        None
+    }
+    /// 本库记录数（None = 未知）。genesis 判"空库新设备优先收养 legacy"用
+    fn record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 一次同步的结局

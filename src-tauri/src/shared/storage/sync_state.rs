@@ -31,9 +31,14 @@ pub struct SyncState {
     /// 百度网盘分账
     #[serde(default)]
     pub baidu: ProviderSyncState,
-    /// 冲突挂起状态（冲突裁决阶段使用）
+    /// 冲突公告：自动并集后待用户裁决的记录对（每项含 provider/local_id/remote_id/
+    /// name/newer_side/detected_at）。**不再阻塞自动同步**——冲突当场并集入 head，
+    /// 这里只记录"哪些记录存在两版"供首页公告与逐对裁决（拍板 S1）。
     #[serde(default)]
-    pub conflict_pending: Option<serde_json::Value>,
+    pub conflict_pairs: Vec<serde_json::Value>,
+    /// 钥匙不匹配标记（远端 head 的盐与本机不同，需输入云端库密码收养；拍板 S4）
+    #[serde(default)]
+    pub key_mismatch: Option<String>,
     /// legacy 远端 vault.json 待补删标记
     #[serde(default)]
     pub legacy_pending_delete: bool,
@@ -69,7 +74,8 @@ impl SyncState {
             local_dirty_at: 0,
             quark: ProviderSyncState::default(),
             baidu: ProviderSyncState::default(),
-            conflict_pending: None,
+            conflict_pairs: Vec::new(),
+            key_mismatch: None,
             legacy_pending_delete: false,
             path: PathBuf::new(),
         }

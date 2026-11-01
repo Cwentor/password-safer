@@ -1,7 +1,7 @@
 // ============================================
-// 冲突 UI：挂起横幅 + 裁决弹窗（自挂载，不依赖静态节点）
-// 横幅：sync://conflict 事件显示，sync://conflict-resolved 隐藏；
-// 弹窗：解密两侧按记录 id 对齐展示，快捷三选 + 逐条改选。
+// 冲突 UI（拍板 S1 重构）：首页公告横幅 + 逐对裁决弹窗（自挂载）
+// 后台冲突已自动并集（两版都保留）且同步不阻塞；横幅提示"哪些数据存在
+// 两版"，用户逐对选择保留哪个；key_mismatch 时横幅直达"输入云端库密码接管"。
 // ============================================
 
 import { showToast } from './Toast.js';
@@ -14,14 +14,12 @@ import { loadConfig, loadPasswords } from '../lib/dataLoader.js';
 import { renderers } from '../lib/renderer.js';
 import { showVaultUnlockModal } from './VaultUnlockModal.js';
 
-const PROVIDER_NAMES = { quark: '夸克网盘', baidu: '百度网盘' };
-
 let bannerEl = null;
 let modalEl = null;
 let currentProvider = null;
 let details = null;
 
-// ---------- 横幅 ----------
+// ---------- 横幅（首页公告入口） ----------
 
 function ensureBannerDom() {
   if (bannerEl) return;
@@ -34,19 +32,28 @@ function ensureBannerDom() {
     'font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.2)';
   bannerEl.innerHTML = `
     <span id="conflictBannerText">检测到同步冲突</span>
-    <button class="primary-btn" id="conflictBannerBtn" style="padding:4px 12px;font-size:12px">处理冲突</button>`;
+    <button class="primary-btn" id="conflictBannerBtn" style="padding:4px 12px;font-size:12px">处理</button>`;
   document.body.appendChild(bannerEl);
   document.getElementById('conflictBannerBtn').addEventListener('click', () => {
+    // 钥匙不匹配时横幅由 adopt 流程写定 provider
     const provider = currentProvider || 'quark';
+    const isKeyMismatch = bannerEl.dataset.keyMismatch === '1';
+    if (isKeyMismatch) {
+      showVaultUnlockModal('adopt', { provider }).then((ok) => {
+        if (ok) hideBanner();
+      });
+      return;
+    }
     showResolveConflictModal(provider);
   });
 }
 
-function showBanner(provider) {
+function showBanner(text, provider, keyMismatch = false) {
   ensureBannerDom();
   currentProvider = provider;
-  document.getElementById('conflictBannerText').textContent =
-    (PROVIDER_NAMES[provider] || '网盘') + ' 同步冲突待处理：两侧均有修改，需要你决定保留哪个版本';
+  bannerEl.dataset.keyMismatch = keyMismatch ? '1' : '0';
+  document.getElementById('conflictBannerText').textContent = text;
+  document.getElementById('conflictBannerBtn').textContent = keyMismatch ? '输入库密码' : '处理冲突';
   bannerEl.style.display = 'flex';
 }
 
@@ -54,35 +61,57 @@ function hideBanner() {
   if (bannerEl) bannerEl.style.display = 'none';
 }
 
+/** 依据 sync_state 显示对应横幅（事件与启动检查共用） */
+function refreshBannerFromState(st, fallbackProvider) {
+  if (st && st.key_mismatch) {
+    showBanner('库密码已在其他设备更换，需要输入云端库密码接管', st.key_mismatch, true);
+  } else if (st && (st.conflict_pairs || []).length > 0) {
+    showBanner(
+      `${st.conflict_pairs.length} 条记录在多设备间产生了不同版本（已自动保留两版），请在使用前处理`,
+      (st.conflict_pairs[0] && st.conflict_pairs[0].provider) || fallbackProvider || 'quark',
+    );
+  } else {
+    showBanner('检测到同步冲突', fallbackProvider || 'quark');
+  }
+}
+
 /** 注册冲突事件监听（两个入口的 init 各调一次） */
 export function initConflictWatcher() {
   onSyncConflict((e) => {
     const p = (e.payload && e.payload.provider) || 'quark';
-    showBanner(p);
-    showToast((e.payload && e.payload.message) || '检测到同步冲突');
+    const msg = (e.payload && e.payload.message) || '检测到同步冲突';
+    showToast(msg);
+    import('../lib/api.js').then(({ getSyncState }) => {
+      getSyncState()
+        .then((st) => refreshBannerFromState(st, p))
+        .catch(() => showBanner(msg, p));
+    });
   });
   onSyncConflictResolved(() => hideBanner());
-  // 启动时若有历史挂起（sync_state.conflict_pending）也显示横幅
+  // 启动时检查历史公告（用户打开应用先看到待决断的冲突）
   import('../lib/api.js').then(({ getSyncState }) => {
-    getSyncState().then((st) => {
-      if (st && st.conflict_pending) {
-        showBanner(st.conflict_pending.provider || 'quark');
-      }
-    }).catch(() => {});
+    getSyncState()
+      .then((st) => {
+        if (st && ((st.conflict_pairs || []).length > 0 || st.key_mismatch)) {
+          refreshBannerFromState(st, 'quark');
+        }
+      })
+      .catch(() => {});
   });
 }
 
-// ---------- 裁决弹窗 ----------
+// ---------- 逐对裁决弹窗 ----------
 
 function recordCard(dto, side, defaultSide) {
   const checked = defaultSide === side ? 'checked' : '';
-  // 记录名/用户名来自本地库与云端 DTO，必须转义（评审 🔴1：防存储型 XSS 直达 invoke 命令面）
+  // 记录名/用户名来自本地库与云端 DTO，必须转义（防存储型 XSS 直达 invoke 命令面）
+  const idFor = dto ? dto.id : 'none';
   return `
     <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;background:var(--bg-secondary,#f5f5f5)">
-      <input type="radio" name="sel-${dto.id}" value="${side}" data-id="${dto.id}" ${checked}>
+      <input type="radio" name="pair-${idFor}" value="${side}" ${checked}>
       <div style="flex:1;min-width:0">
-        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(dto.icon || '🔑')} ${escapeHtml(dto.name)}</div>
-        <div style="font-size:11px;color:var(--text-secondary)">${escapeHtml(dto.username || '—')} · 更新于 ${escapeHtml(dto.last_used || '—')}</div>
+        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((dto && dto.icon) || '🔑')} ${escapeHtml((dto && dto.name) || '（已不存在）')}</div>
+        <div style="font-size:11px;color:var(--text-secondary)">${escapeHtml((dto && dto.username) || '—')} · 更新于 ${escapeHtml((dto && dto.last_used) || '—')}</div>
       </div>
     </div>`;
 }
@@ -95,7 +124,7 @@ function ensureModalDom() {
   modalEl.innerHTML = `
     <div class="modal" style="max-width:520px;max-height:80vh;display:flex;flex-direction:column">
       <div class="modal-header">
-        <span class="modal-title">解决同步冲突</span>
+        <span class="modal-title">处理冲突记录</span>
         <button class="icon-btn" id="rcClose">✕</button>
       </div>
       <div class="modal-body" id="rcBody" style="flex:1;overflow:auto"></div>
@@ -108,89 +137,58 @@ function ensureModalDom() {
   document.getElementById('rcClose').addEventListener('click', () => modalEl.classList.remove('show'));
 }
 
-function sectionTitle(text) {
-  return `<div style="font-size:12px;font-weight:700;margin:10px 0 6px">${text}</div>`;
-}
-
 function renderDetails(provider) {
   const body = document.getElementById('rcBody');
   const footer = document.getElementById('rcFooter');
-  const ol = details.only_local || [];
-  const or = details.only_remote || [];
-  const both = details.both || [];
+  const pairs = details.pairs || [];
 
-  let html = '';
-  html += sectionTitle(`仅本地存在（${ol.length}）——保留不动`);
-  html += ol.length
-    ? ol.map((d) => recordCard(d, 'local', 'local')).join('')
-    : '<div style="font-size:11px;color:var(--text-secondary)">无</div>';
-  html += sectionTitle(`仅云端存在（${or.length}）——保留不动`);
-  html += or.length
-    ? or.map((d) => recordCard(d, 'remote', 'remote')).join('')
-    : '<div style="font-size:11px;color:var(--text-secondary)">无</div>';
-  html += sectionTitle(`两侧都有修改（${both.length}）——选择保留哪个版本`);
-  html += both.length
-    ? both
-        .map((pair) => {
-          const newer = pair.newer || 'local';
-          return `
-            <div style="margin-bottom:8px">
-              <div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">${escapeHtml(pair.local.name)}</div>
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
-                ${recordCard(pair.local, 'local', newer)}
-                ${recordCard(pair.remote, 'remote', newer)}
-              </div>
-            </div>`;
-        })
-        .join('')
-    : '<div style="font-size:11px;color:var(--text-secondary)">无</div>';
+  let html =
+    '<div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px">' +
+    '以下记录在多设备间出现了不同版本（已自动保留两版，同步未受影响）。' +
+    '请为每一对选择要保留的版本，落选版本将被删除。</div>';
+  html += pairs
+    .map((p, idx) => {
+      const newerHint = p.remote_newer ? '云端版较新' : '本机版较新';
+      // radio 组名用 local_id（唯一），选中值与 remote_id 一起提交
+      return `
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">#${idx + 1} · ${escapeHtml(p.name || '')}（${escapeHtml(newerHint)}）</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+          ${recordCard(p.local, 'local', p.remote_newer ? 'remote' : 'local')}
+          ${recordCard(p.remote, 'remote', p.remote_newer ? 'remote' : 'local')}
+        </div>
+      </div>`;
+    })
+    .join('');
   body.innerHTML = html;
 
-  footer.innerHTML = `
-    <button class="secondary-btn" id="rcLocal">全部用本地</button>
-    <button class="secondary-btn" id="rcRemote">全部用云端</button>
-    <button class="primary-btn" id="rcMerge">智能合并（逐条取较新）</button>`;
-
-  const collectSelections = (strategy) => {
-    const sel = {};
-    both.forEach((pair) => {
-      const id = pair.local.id;
-      if (strategy === 'custom') {
-        const checked = body.querySelector(`input[name="sel-${id}"]:checked`);
-        if (checked) sel[id] = checked.value;
-      } else if (strategy === 'local') {
-        sel[id] = 'local';
-      } else if (strategy === 'remote') {
-        sel[id] = 'remote';
-      }
+  footer.innerHTML = `<button class="primary-btn" id="rcApply">应用裁决</button>`;
+  document.getElementById('rcApply').addEventListener('click', async () => {
+    // selections 以云端副本 id（remote_id）为键：选 local → 删云端副本；选 remote → 删本机版
+    const selections = {};
+    pairs.forEach((p) => {
+      const checked = body.querySelector(`input[name="pair-${p.local.id}"]:checked`);
+      if (checked) selections[p.remote_id] = checked.value;
     });
-    return sel;
-  };
-
-  const doResolve = async (strategy) => {
-    const selections = collectSelections(strategy === 'merge' ? 'custom' : strategy);
     try {
-      const r = await resolveConflict(provider, strategy, selections);
-      showToast((r && r.message) || '冲突已解决');
+      const r = await resolveConflict(provider, selections);
+      showToast((r && r.message) || '冲突已处理');
       modalEl.classList.remove('show');
       hideBanner();
       await loadConfig();
       await loadPasswords();
       renderers.populateSettingsForm();
     } catch (e) {
-      showToast('解决冲突失败: ' + e);
+      showToast('处理失败: ' + e);
     }
-  };
-  document.getElementById('rcLocal').addEventListener('click', () => doResolve('local'));
-  document.getElementById('rcRemote').addEventListener('click', () => doResolve('remote'));
-  document.getElementById('rcMerge').addEventListener('click', () => doResolve('merge'));
+  });
 }
 
 export async function showResolveConflictModal(provider) {
   ensureModalDom();
   currentProvider = provider;
   document.getElementById('rcBody').innerHTML =
-    '<div style="font-size:12px;color:var(--text-secondary)">正在解密两侧版本…</div>';
+    '<div style="font-size:12px;color:var(--text-secondary)">正在读取冲突公告…</div>';
   document.getElementById('rcFooter').innerHTML = '';
   modalEl.classList.add('show');
   try {
@@ -198,15 +196,6 @@ export async function showResolveConflictModal(provider) {
     renderDetails(provider);
   } catch (e) {
     document.getElementById('rcBody').innerHTML =
-      `<div style="font-size:12px;color:var(--text-secondary)">读取冲突详情失败：${escapeHtml(String(e))}</div>
-      <div style="margin-top:10px"><button class="secondary-btn" id="rcAdopt">输入云端库密码接管</button></div>`;
-    const adoptBtn = document.getElementById('rcAdopt');
-    if (adoptBtn) {
-      adoptBtn.addEventListener('click', async () => {
-        modalEl.classList.remove('show');
-        const ok = await showVaultUnlockModal('adopt', { provider });
-        if (ok) showResolveConflictModal(provider);
-      });
-    }
+      `<div style="font-size:12px;color:var(--text-secondary)">读取冲突公告失败：${escapeHtml(String(e))}</div>`;
   }
 }

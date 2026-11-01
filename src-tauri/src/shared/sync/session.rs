@@ -9,10 +9,11 @@
 //! 再传 meta（提交点）。meta 传完而本地记账未更新的，下轮 list 会看到自己的
 //! head 并收敛到 last_heads——全流程幂等。
 //!
-//! 冲突策略（拍板 v2）：引擎只挂起不裁决。本地有未推送修改且远端出现新 head、
-//! 或远端 fork 时，本地内容先以 `kind:"backup"` 的 meta 钉进远端命名空间
-//! （可被任何设备找回），`conflict_pending` 置位后自动同步周期直接跳过，
-//! 等待用户在裁决 UI 里选择；手动上传/下载视为用户裁决（清挂起后执行）。
+//! 冲突策略（拍板 S1 重构）：冲突**不阻塞同步**——本地未推送修改遇远端新 head、
+//! 或远端 fork 时，立即把全部 head 内容与本库做并集合并（同 id 冲突两版都保留，
+//! 云端版换新 id），推送一个 supersedes 全部 heads 的新 head，记录对写进
+//! `conflict_pairs` 公告，用户在首页逐对裁决删留。钥匙指纹（S4）探测与
+//! 解密失败兜底会把 `key_mismatch` 置位，引导"输入云端库密码接管"。
 
 use super::engine::VaultIo;
 use super::manifest::{self, FileEntry, Manifest, MetaKind};
@@ -224,9 +225,10 @@ fn push_new_head(
     let bytes = local.bytes.as_ref().unwrap();
     // 第一段：blob（幂等，孤儿无害）
     upload_blob(i, i.vault.path(), &sha)?;
-    // 第二段：meta = 提交点
+    // 第二段：meta = 提交点（带上钥匙指纹，供其他设备不下载 blob 即探测换盐）
     let mut m = Manifest::new_head(&st.device_id, i.now_ms);
     m.supersedes = heads.clone();
+    m.key_salt = i.vault.key_salt_b64();
     m.files.insert(
         LEGACY_FILE_NAME.to_string(),
         FileEntry {
@@ -240,7 +242,6 @@ fn push_new_head(
     write_meta(i, &m, &name)?;
 
     set_heads(st, i.provider_key, vec![name]);
-    st.conflict_pending = None;
     i.sync_state.save(st)?;
     Ok(SessionReport {
         outcome: SessionOutcome::Pushed,
@@ -288,34 +289,6 @@ fn pin_bytes_as_backup(
     let name = manifest::new_filename(&st.device_id, backup_ms);
     write_meta(i, &m, &name)?;
     Ok(sha)
-}
-
-/// 冲突挂起：本地内容（若有）先以 backup meta 钉进远端命名空间，再置 pending
-fn park(
-    i: &SessionInputs,
-    st: &mut SyncState,
-    heads: Vec<String>,
-    local: &LocalSnapshot,
-    reason: &str,
-) -> Result<SessionReport, String> {
-    let mut backup_blob = None;
-    if local.valid {
-        let sha = pin_bytes_as_backup(i, st, local.bytes.as_ref().unwrap())?;
-        backup_blob = Some(sha);
-    }
-    st.conflict_pending = Some(serde_json::json!({
-        "provider": i.provider_key,
-        "remote_heads": heads,
-        "backup_blob": backup_blob,
-        "detected_at": i.now_ms,
-        "reason": reason,
-    }));
-    i.sync_state.save(st)?;
-    Ok(SessionReport {
-        outcome: SessionOutcome::ConflictPending,
-        message: format!("{}：自动同步已暂停，待处理", reason),
-        downloaded: false,
-    })
 }
 
 // ---------- legacy 迁移 ----------
@@ -376,6 +349,10 @@ fn genesis(
             push_new_head(i, st, Vec::new(), local)
         }
         (true, true) => {
+            // 本库为空（新设备先建库后绑盘）→ 数据优先，直接收养 legacy
+            if i.vault.record_count() == Some(0) {
+                return adopt_legacy(i, st);
+            }
             // 本地与 legacy 都有数据：mtime 新者先落地（规格沉默处的务实裁决）
             let legacy_mtime = legacy.unwrap().mtime;
             let local_mtime = i.vault.local_mtime().unwrap_or(0);
@@ -451,7 +428,6 @@ fn apply_head(
         .ok_or_else(|| format!("head meta {} 缺少 {} 条目", head, LEGACY_FILE_NAME))?;
     if entry.deleted {
         set_heads(st, i.provider_key, heads);
-        st.conflict_pending = None;
         i.sync_state.save(st)?;
         return Ok(SessionReport {
             outcome: SessionOutcome::Skipped,
@@ -464,23 +440,36 @@ fn apply_head(
     if sha != entry.blob {
         return Err(format!("远端 blob 校验失败（期望 {}）", entry.blob));
     }
+    // 拍板 S7(b)：本地内容恰好等于某个**较旧的**已知 head = 用户可能刚做了回退
+    // （普通未同步设备应停在最新已知 head 上）→ 应用云端前先归档本地内容
+    let known = known_heads(st, i.provider_key);
+    let local = snapshot(i);
+    let mut archived = false;
+    if local.valid {
+        let newest_known = newest_head_vault_entry(metas, &known).map(|e| e.blob);
+        let matches_known = local_matches_known(metas, &known, local.sha.as_deref().unwrap_or(""));
+        let at_newest_known = newest_known.as_deref() == local.sha.as_deref();
+        if matches_known && !at_newest_known {
+            pin_bytes_as_backup(i, st, local.bytes.as_ref().unwrap())?;
+            archived = true;
+        }
+    }
+    let _ = archived;
     if let Err(e) = i.vault.replace(&bytes) {
-        // 本地钥解不开云端新版本：库密码可能已在其他设备更换（评审 A1）→
-        // 转冲突挂起，走"输入云端库密码接管"路径，而不是报错死循环
+        // 本地钥解不开云端新版本：库密码可能已在其他设备更换（拍板 S4 探测的
+        // 兜底路径）→ 置钥匙不匹配标记，走"输入云端库密码接管"，不报错死循环
         if e.contains("解密失败") {
-            let local = snapshot(i);
-            return park(
-                i,
-                st,
-                heads,
-                &local,
-                "本地无法解密云端新版本（库密码可能已在其他设备更换）",
-            );
+            st.key_mismatch = Some(i.provider_key.to_string());
+            i.sync_state.save(st)?;
+            return Ok(SessionReport {
+                outcome: SessionOutcome::ConflictPending,
+                message: "本地无法解密云端新版本（库密码可能已在其他设备更换）".to_string(),
+                downloaded: false,
+            });
         }
         return Err(e);
     }
     set_heads(st, i.provider_key, heads);
-    st.conflict_pending = None;
     i.sync_state.save(st)?;
     Ok(SessionReport {
         outcome: SessionOutcome::Applied,
@@ -502,17 +491,11 @@ fn apply_head(
 ///   - 远端有新 head → 冲突挂起
 /// - 本地干净 → 应用远端新 head
 pub fn sync_auto(i: &SessionInputs) -> Result<SessionReport, String> {
+    // 注意（拍板 S1）：冲突公告**不阻塞**自动同步——冲突当场并集入 head，
+    // 公告列表只记录"哪些记录存在两版"供用户裁决
     let mut st = i.sync_state.load()?;
     try_pending_legacy_delete(i, &mut st);
     i.sync_state.save(&st)?;
-
-    if st.conflict_pending.is_some() {
-        return Ok(SessionReport {
-            outcome: SessionOutcome::ConflictPending,
-            message: "存在待处理的同步冲突，自动同步已暂停".to_string(),
-            downloaded: false,
-        });
-    }
 
     let metas = fetch_metas(i.provider, i.remote_path)?;
     let heads = manifest::resolve_heads(&metas);
@@ -522,8 +505,31 @@ pub fn sync_auto(i: &SessionInputs) -> Result<SessionReport, String> {
     if heads.is_empty() {
         return genesis(i, &mut st, &local);
     }
+
+    // 拍板 S4：不下载 blob 即探测换盐——head meta 的钥匙指纹与本库不同
+    // （或本机是 v1/未知而远端已声明指纹）→ 走收养流程，合并无从谈起
+    let head_metas: Vec<(String, Manifest)> = metas
+        .iter()
+        .filter(|(n, _)| heads.contains(n))
+        .cloned()
+        .collect();
+    if let Some((_, newest)) = manifest::newest(&head_metas) {
+        if let Some(remote_salt) = &newest.key_salt {
+            if i.vault.key_salt_b64().as_ref() != Some(remote_salt) {
+                st.key_mismatch = Some(i.provider_key.to_string());
+                i.sync_state.save(&st)?;
+                return Ok(SessionReport {
+                    outcome: SessionOutcome::ConflictPending,
+                    message: "库密码已在其他设备更换，请输入云端库密码接管".to_string(),
+                    downloaded: false,
+                });
+            }
+        }
+    }
+
     if heads.len() > 1 {
-        return park(i, &mut st, heads, &local, "检测到远端版本分叉");
+        // 远端分叉：所有 head 内容并集（两版都保留），公告待裁决
+        return auto_union(i, &mut st, &metas, &heads, &local);
     }
     let head = heads[0].clone();
 
@@ -532,7 +538,6 @@ pub fn sync_auto(i: &SessionInputs) -> Result<SessionReport, String> {
         .ok_or_else(|| format!("head meta {} 缺少 {} 条目", head, LEGACY_FILE_NAME))?;
     if local.valid && local.sha.as_deref() == Some(head_entry.blob.as_str()) {
         set_heads(&mut st, i.provider_key, heads);
-        st.conflict_pending = None;
         i.sync_state.save(&st)?;
         return Ok(SessionReport {
             outcome: SessionOutcome::Skipped,
@@ -549,12 +554,79 @@ pub fn sync_auto(i: &SessionInputs) -> Result<SessionReport, String> {
             // 远端无新东西 → 正常 push（supersedes 当前 head）
             return push_new_head(i, &mut st, heads, &local);
         }
-        // 两边都动了 → 挂起
-        return park(i, &mut st, heads, &local, "本地与云端均有未合并的修改");
+        // 两边都动了 → 自动并集（两版都保留），公告待裁决
+        return auto_union(i, &mut st, &metas, &heads, &local);
     }
 
     // 本地干净（或为空）：应用远端最新
     apply_head(i, &mut st, &metas, &head, heads)
+}
+
+/// 冲突自动并集（拍板 S1）：把全部 head 的内容逐一与本库并集合并
+/// （同 id 冲突两版都保留），推送一个 supersedes 全部 heads 的新 head，
+/// 冲突记录对写进公告。同步从此不被冲突阻塞。
+fn auto_union(
+    i: &SessionInputs,
+    st: &mut SyncState,
+    metas: &[(String, Manifest)],
+    heads: &[String],
+    local: &LocalSnapshot,
+) -> Result<SessionReport, String> {
+    let head_metas: Vec<(String, Manifest)> = metas
+        .iter()
+        .filter(|(n, _)| heads.contains(n))
+        .cloned()
+        .collect();
+    let (_, newest) = manifest::newest(&head_metas).ok_or("未找到最新 head")?;
+    let newest_updated_at = newest.updated_at;
+    // config 整体取较新侧（local_dirty_at 秒 × 1000 对比 head 毫秒）
+    let config_take_remote = local
+        .valid
+        .then(|| st.local_dirty_at * 1000 < newest_updated_at)
+        .unwrap_or(true);
+
+    let mut merged_heads = Vec::new();
+    let mut pairs_total = 0usize;
+    for head in heads {
+        let entry = head_vault_entry(metas, head)
+            .ok_or_else(|| format!("head meta {} 缺少 {} 条目", head, LEGACY_FILE_NAME))?;
+        if entry.deleted {
+            continue;
+        }
+        let bytes = i
+            .provider
+            .download(&blob_path(i.remote_path, &entry.blob))?;
+        let sha = manifest::sha256_hex(&bytes);
+        if sha != entry.blob {
+            return Err(format!("远端 blob 校验失败（期望 {}）", entry.blob));
+        }
+        let pairs = i.vault.merge_union(&bytes, config_take_remote)?;
+        for p in pairs {
+            st.conflict_pairs.push(serde_json::json!({
+                "provider": i.provider_key,
+                "local_id": p.local.id,
+                "remote_id": p.remote.id,
+                "name": p.local.name,
+                "remote_newer": p.remote_newer,
+                "detected_at": i.now_ms,
+            }));
+            pairs_total += 1;
+        }
+        merged_heads.push(head.clone());
+    }
+    if merged_heads.is_empty() {
+        return Err("全部 head 均为已删除状态".to_string());
+    }
+
+    // 合并后的本库内容作为新 head 推上去（supersedes 全部旧 head）
+    let local_after = snapshot(i);
+    push_new_head(i, st, heads.to_vec(), &local_after)?;
+
+    Ok(SessionReport {
+        outcome: SessionOutcome::ConflictPending,
+        message: format!("检测到 {} 处冲突，已自动保留两版，待处理", pairs_total),
+        downloaded: true,
+    })
 }
 
 fn unknown_heads(heads: &[String], known: &[String]) -> Vec<String> {
@@ -581,7 +653,6 @@ pub fn push_manual(i: &SessionInputs) -> Result<SessionReport, String> {
     if let Some(entry) = newest_head_vault_entry(&metas, &heads) {
         if entry.blob == local.sha.clone().unwrap() {
             set_heads(&mut st, i.provider_key, heads);
-            st.conflict_pending = None;
             i.sync_state.save(&st)?;
             return Ok(SessionReport {
                 outcome: SessionOutcome::Skipped,
@@ -629,14 +700,19 @@ fn park_backup_only(i: &SessionInputs, st: &SyncState, local: &LocalSnapshot) ->
     Ok(())
 }
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::models::PasswordInput;
+    use crate::shared::storage::json_store::JsonStore;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     const NOW_MS: i64 = 1_700_000_000_000;
+    const TEST_PW: &str = "会话测试库密码123";
 
     /// 测试用唯一序号（并行测试的临时文件/目录绝不重名）
     fn unique_seq() -> u64 {
@@ -731,50 +807,97 @@ mod tests {
         }
     }
 
-    /// 真实临时文件的密码簿替身（upload 需要读本地文件）
-    struct TestVault {
-        path: PathBuf,
+    /// 加密存储替身：真实 JsonStore（merge_union / key_salt 可用）。
+    /// 记录操作一律经 store，字节视图由 store 落盘内容决定。
+    struct StoreVault {
+        store: JsonStore,
     }
 
-    impl TestVault {
+    impl StoreVault {
         fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
             let dir = std::env::temp_dir().join(format!(
-                "ps-sess-{}-{}-{}-{}",
+                "ps-sess2-{}-{}-{}",
                 std::process::id(),
                 tag,
-                nanos,
                 unique_seq()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            TestVault {
-                path: dir.join("vault.json"),
-            }
+            let (store, _k) =
+                JsonStore::create_with_password(dir.join("vault.json"), TEST_PW).unwrap();
+            StoreVault { store }
         }
-        fn write(&self, bytes: &[u8]) {
-            std::fs::write(&self.path, bytes).unwrap();
+        fn add(&self, name: &str) -> i64 {
+            self.store
+                .insert(&PasswordInput {
+                    name: name.to_string(),
+                    icon: None,
+                    url: None,
+                    username: Some("user".to_string()),
+                    password: format!("pw-{}", name),
+                    tags: None,
+                    notes: None,
+                    favorite: Some(false),
+                })
+                .unwrap()
+                .id
+        }
+        /// 修改已有记录（产生同 id 不同内容的冲突源）
+        fn modify(&self, id: i64, name: &str) {
+            self.store
+                .update(
+                    id,
+                    &PasswordInput {
+                        name: name.to_string(),
+                        icon: None,
+                        url: None,
+                        username: Some("user".to_string()),
+                        password: format!("pw-{}-new", name),
+                        tags: None,
+                        notes: None,
+                        favorite: Some(false),
+                    },
+                )
+                .unwrap();
+        }
+        fn names(&self) -> Vec<String> {
+            self.store
+                .get_all()
+                .unwrap()
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
         }
     }
 
-    impl VaultIo for TestVault {
+    impl VaultIo for StoreVault {
         fn path(&self) -> &Path {
-            &self.path
+            self.store.db_path()
         }
         fn local_mtime(&self) -> Option<i64> {
-            std::fs::metadata(&self.path)
+            std::fs::metadata(self.store.db_path())
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
         }
         fn read(&self) -> Result<Vec<u8>, String> {
-            std::fs::read(&self.path).map_err(|e| e.to_string())
+            std::fs::read(self.store.db_path()).map_err(|e| e.to_string())
         }
         fn replace(&self, bytes: &[u8]) -> Result<(), String> {
-            std::fs::write(&self.path, bytes).map_err(|e| e.to_string())
+            self.store.replace_raw(bytes)
+        }
+        fn merge_union(
+            &self,
+            remote_bytes: &[u8],
+            config_take_remote: bool,
+        ) -> Result<Vec<crate::shared::sync::merge::MergePair>, String> {
+            self.store.merge_union_remote(remote_bytes, config_take_remote)
+        }
+        fn key_salt_b64(&self) -> Option<String> {
+            self.store.key_salt_b64()
+        }
+        fn record_count(&self) -> Option<usize> {
+            Some(self.store.load().map(|d| d.passwords.len()).unwrap_or(0))
         }
     }
 
@@ -784,7 +907,7 @@ mod tests {
     impl MemState {
         fn new(tag: &str) -> Self {
             let p = std::env::temp_dir().join(format!(
-                "ps-sess-state-{}-{}.json",
+                "ps-sess2-state-{}-{}.json",
                 std::process::id(),
                 tag
             ));
@@ -807,7 +930,7 @@ mod tests {
 
     fn inputs<'a>(
         cloud: &'a FakeCloud,
-        vault: &'a TestVault,
+        vault: &'a StoreVault,
         state: &'a MemState,
         now_ms: i64,
     ) -> SessionInputs<'a> {
@@ -821,12 +944,47 @@ mod tests {
         }
     }
 
-    /// 直接以"另一设备"身份向远端写一个 head（绕过本机会话）
-    fn remote_push(cloud: &FakeCloud, device: &str, ms: i64, supersedes: &[String], content: &[u8]) {
-        let sha = manifest::sha256_hex(content);
-        cloud.put(&blob_path("/VAULT/vault.json", &sha), content);
+    /// 以"另一设备"身份向远端写一个 head：内容用同密码的临时库构造
+    /// （这样本机 merge_union / replace 才能解密），meta 带该库的钥匙指纹。
+    /// names 为空 → 内容为空库。
+    fn remote_push(
+        cloud: &FakeCloud,
+        device: &str,
+        ms: i64,
+        supersedes: &[String],
+        names: &[&str],
+        password: Option<&str>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "ps-sess2-remote-{}-{}-{}-{}",
+            std::process::id(),
+            device,
+            ms,
+            unique_seq()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pw = password.unwrap_or(TEST_PW);
+        let (store, _) = JsonStore::create_with_password(dir.join("content.json"), pw).unwrap();
+        for n in names {
+            store
+                .insert(&PasswordInput {
+                    name: n.to_string(),
+                    icon: None,
+                    url: None,
+                    username: Some("user".to_string()),
+                    password: format!("pw-{}", n),
+                    tags: None,
+                    notes: None,
+                    favorite: Some(false),
+                })
+                .unwrap();
+        }
+        let content = std::fs::read(store.db_path()).unwrap();
+        let sha = manifest::sha256_hex(&content);
+        cloud.put(&blob_path("/VAULT/vault.json", &sha), &content);
         let mut m = Manifest::new_head(device, ms);
         m.supersedes = supersedes.to_vec();
+        m.key_salt = store.key_salt_b64();
         m.files.insert(
             "vault.json".to_string(),
             FileEntry {
@@ -837,19 +995,95 @@ mod tests {
             },
         );
         let name = manifest::new_filename(device, ms);
-        let tmp = std::env::temp_dir().join(format!(
-            "ps-test-push-{}-{}-{}.json",
+        let tmp = dir.join("meta.json");
+        std::fs::write(&tmp, m.serialize().unwrap()).unwrap();
+        cloud
+            .upload(&tmp, &meta_path("/VAULT/vault.json", &name))
+            .unwrap();
+    }
+
+    /// 同谱系推送：克隆**本机库文件**（继承盐与既有记录）→ 变更 → 上传。
+    /// 模拟"另一台共享同一钥匙体系的设备"（真实世界中各设备经收养共享盐）。
+    fn remote_push_lineage(
+        cloud: &FakeCloud,
+        vault: &StoreVault,
+        device: &str,
+        ms: i64,
+        supersedes: &[String],
+        mutate: impl FnOnce(&JsonStore),
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "ps-sess2-lineage-{}-{}-{}-{}",
+            std::process::id(),
             device,
             ms,
             unique_seq()
         ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clone_path = dir.join("content.json");
+        std::fs::copy(vault.store.db_path(), &clone_path).unwrap();
+        let (store, _) = JsonStore::open_with_password(clone_path.clone(), TEST_PW).unwrap();
+        mutate(&store);
+        let content = std::fs::read(store.db_path()).unwrap();
+        let sha = manifest::sha256_hex(&content);
+        cloud.put(&blob_path("/VAULT/vault.json", &sha), &content);
+        let mut m = Manifest::new_head(device, ms);
+        m.supersedes = supersedes.to_vec();
+        m.key_salt = store.key_salt_b64();
+        m.files.insert(
+            "vault.json".to_string(),
+            FileEntry {
+                blob: sha,
+                size: content.len() as i64,
+                updated_at: ms,
+                deleted: false,
+            },
+        );
+        let name = manifest::new_filename(device, ms);
+        let tmp = dir.join("meta.json");
         std::fs::write(&tmp, m.serialize().unwrap()).unwrap();
-        cloud.upload(&tmp, &meta_path("/VAULT/vault.json", &name)).unwrap();
-        let _ = std::fs::remove_file(&tmp);
+        cloud
+            .upload(&tmp, &meta_path("/VAULT/vault.json", &name))
+            .unwrap();
+    }
+
+    /// 写一个 legacy 整文件：克隆本机库（继承盐）并追加一条记录
+    fn remote_push_legacy(cloud: &FakeCloud, vault: &StoreVault, mtime: i64) {
+        let dir = std::env::temp_dir().join(format!(
+            "ps-sess2-legacy-{}-{}",
+            std::process::id(),
+            unique_seq()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clone_path = dir.join("legacy.json");
+        std::fs::copy(vault.store.db_path(), &clone_path).unwrap();
+        let (store, _) = JsonStore::open_with_password(clone_path, TEST_PW).unwrap();
+        store
+            .insert(&PasswordInput {
+                name: "legacy 记录".to_string(),
+                icon: None,
+                url: None,
+                username: None,
+                password: "pw-legacy".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+        let content = std::fs::read(store.db_path()).unwrap();
+        cloud.put_with_mtime("/VAULT/vault.json", &content, mtime);
     }
 
     fn meta_dir_of() -> String {
         meta_dir("/VAULT/vault.json")
+    }
+
+    fn blobs_dir_of() -> String {
+        blobs_dir("/VAULT/vault.json")
+    }
+
+    fn pairs_of(state: &MemState) -> Vec<serde_json::Value> {
+        state.0.lock().unwrap().conflict_pairs.clone()
     }
 
     // ---- genesis / legacy 迁移 ----
@@ -857,8 +1091,8 @@ mod tests {
     #[test]
     fn genesis_push_fresh_remote() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("genesis");
-        vault.write(b"local v1");
+        let vault = StoreVault::new("genesis");
+        vault.add("本地记录");
         let state = MemState::new("genesis");
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
@@ -867,69 +1101,57 @@ mod tests {
         let dev = state.device_id();
         let meta_name = format!("meta_{}_{}.json", NOW_MS, dev);
         let meta = Manifest::parse(
-            &cloud.get(&format!("{}/{}", meta_dir_of(), meta_name)).unwrap(),
+            &cloud
+                .get(&format!("{}/{}", meta_dir_of(), meta_name))
+                .unwrap(),
         )
         .unwrap();
-        let sha = manifest::sha256_hex(b"local v1");
-        assert_eq!(meta.files.get("vault.json").unwrap().blob, sha);
-        assert!(meta.supersedes.is_empty());
-        assert!(cloud.has(&format!("{}/{}.bin", blobs_dir("/VAULT/vault.json"), sha)));
+        assert!(meta.files.contains_key("vault.json"));
+        assert_eq!(meta.key_salt, vault.key_salt_b64());
         assert_eq!(state.0.lock().unwrap().quark.last_heads, vec![meta_name]);
-        assert!(!state.0.lock().unwrap().legacy_pending_delete);
     }
 
     #[test]
-    fn genesis_adopt_legacy_when_local_invalid() {
+    fn genesis_adopt_legacy_when_local_empty() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("adopt"); // 本地无文件
+        let vault = StoreVault::new("adopt"); // 空库 ≈ 新设备
         let state = MemState::new("adopt");
-        cloud.put_with_mtime("/VAULT/vault.json", b"legacy bytes", 100);
+        remote_push_legacy(&cloud, &vault, 100);
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::GenesisMigrated);
         assert!(r.downloaded);
-        assert_eq!(vault.read().unwrap(), b"legacy bytes");
-        // legacy 已删除
         assert!(!cloud.has("/VAULT/vault.json"));
-        // genesis head 指向 legacy 内容
-        let dev = state.device_id();
-        let meta = Manifest::parse(
-            &cloud
-                .get(&format!("{}/meta_{}_{}.json", meta_dir_of(), NOW_MS, dev))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            meta.files.get("vault.json").unwrap().blob,
-            manifest::sha256_hex(b"legacy bytes")
-        );
+        assert_eq!(vault.names(), vec!["legacy 记录"]);
+        // 收养路径：legacy 字节本身就是 genesis blob，天然保留（无需额外归档；
+        // 归档只在"本地胜出"分支需要——那条路径里 legacy 否则会凭空消失）
+        assert_eq!(cloud.count_in_dir(&meta_dir_of()), 1);
     }
 
     #[test]
     fn genesis_local_wins_when_legacy_older() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("localwin");
-        vault.write(b"local newer");
+        let vault = StoreVault::new("localwin");
+        vault.add("本机较新记录");
         let state = MemState::new("localwin");
-        cloud.put_with_mtime("/VAULT/vault.json", b"legacy old", 1);
+        remote_push_legacy(&cloud, &vault, 1);
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::GenesisMigrated);
-        assert_eq!(vault.read().unwrap(), b"local newer");
+        assert_eq!(vault.names(), vec!["本机较新记录"]);
         assert!(!cloud.has("/VAULT/vault.json"));
     }
 
     #[test]
     fn legacy_pending_delete_retried_next_cycle() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("relegacy");
-        vault.write(b"v1");
+        let vault = StoreVault::new("relegacy");
+        vault.add("v1");
         let state = MemState::new("relegacy");
-        cloud.put("/VAULT/vault.json", b"legacy");
+        remote_push_legacy(&cloud, &vault, 1);
         state.0.lock().unwrap().legacy_pending_delete = true;
 
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
-        // 补删完成
         assert!(!cloud.has("/VAULT/vault.json"));
         assert!(!state.0.lock().unwrap().legacy_pending_delete);
     }
@@ -939,8 +1161,8 @@ mod tests {
     #[test]
     fn second_cycle_skips_when_nothing_changed() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("skip2");
-        vault.write(b"v1");
+        let vault = StoreVault::new("skip2");
+        vault.add("v1");
         let state = MemState::new("skip2");
 
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
@@ -954,33 +1176,44 @@ mod tests {
     #[test]
     fn pull_applies_new_remote_head_when_local_clean() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("pull");
-        vault.write(b"v1");
+        let vault = StoreVault::new("pull");
+        vault.add("v1记录");
         let state = MemState::new("pull");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
         let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        remote_push(&cloud, "other", NOW_MS + 1000, &[head1], b"v2");
+        remote_push_lineage(&cloud, &vault, "other", NOW_MS + 1000, &[head1], |s| {
+            s.insert(&PasswordInput {
+                name: "云端新记录".to_string(),
+                icon: None,
+                url: None,
+                username: Some("user".to_string()),
+                password: "pw-云端新记录".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+        });
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::Applied);
         assert!(r.downloaded);
-        assert_eq!(vault.read().unwrap(), b"v2");
-        assert_eq!(state.0.lock().unwrap().quark.last_heads.len(), 1);
+        assert!(vault.names().contains(&"云端新记录".to_string()));
+        assert!(vault.names().contains(&"v1记录".to_string()));
     }
 
     #[test]
     fn push_new_content_when_remote_unchanged() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("push2");
-        vault.write(b"v1");
+        let vault = StoreVault::new("push2");
+        let id = vault.add("v1记录");
         let state = MemState::new("push2");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
-        vault.write(b"v2 local edit");
+        vault.modify(id, "本机修改版");
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 1000)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::Pushed);
-        // 链条：head2 supersedes head1
         let dev = state.device_id();
         let meta2 = Manifest::parse(
             &cloud
@@ -990,33 +1223,32 @@ mod tests {
         .unwrap();
         let head1 = format!("meta_{}_{}.json", NOW_MS, dev);
         assert_eq!(meta2.supersedes, vec![head1]);
-        // 本地内容不被拉取覆盖
-        assert_eq!(vault.read().unwrap(), b"v2 local edit");
     }
 
     #[test]
     fn crash_after_blob_before_meta_recovers() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("orphan");
-        vault.write(b"v1");
+        let vault = StoreVault::new("orphan");
+        vault.add("v1");
         let state = MemState::new("orphan");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
-        vault.write(b"v2");
-        // 模拟崩溃：只留下孤儿 blob，没有 meta
-        let sha2 = manifest::sha256_hex(b"v2");
-        cloud.put(&blob_path("/VAULT/vault.json", &sha2), b"v2");
+        vault.modify(1, "v2本地");
+        // 模拟崩溃：只留孤儿 blob（合法库内容，sha 对应），没有 meta
+        let content = vault.read().unwrap();
+        let sha2 = manifest::sha256_hex(&content);
+        cloud.put(&blob_path("/VAULT/vault.json", &sha2), &content);
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 1000)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::Pushed);
-        assert!(cloud.has(&format!("{}/{}.bin", blobs_dir("/VAULT/vault.json"), sha2)));
+        assert!(cloud.has(&format!("{}/{}.bin", blobs_dir_of(), sha2)));
     }
 
     #[test]
     fn multi_provider_isolation() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("multi");
-        vault.write(b"v1");
+        let vault = StoreVault::new("multi");
+        vault.add("v1");
         let state = MemState::new("multi");
 
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
@@ -1024,94 +1256,190 @@ mod tests {
         assert!(state.0.lock().unwrap().baidu.last_heads.is_empty());
     }
 
-    // ---- 冲突挂起 ----
+    // ---- 冲突自动并集（拍板 S1）----
 
     #[test]
-    fn conflict_parks_when_both_sides_changed() {
+    fn conflict_auto_unions_when_both_sides_changed() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("conflict");
-        vault.write(b"v1");
-        let state = MemState::new("conflict");
+        let vault = StoreVault::new("union");
+        let id = vault.add("原始记录");
+        let state = MemState::new("union");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
         let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        remote_push(&cloud, "other", NOW_MS + 1000, &[head1], b"v2");
-        vault.write(b"local edit");
+        // 另一设备改同一条记录（同 id 不同内容）
+        remote_push_lineage(&cloud, &vault, "other", NOW_MS + 1000, &[head1.clone()], |s| {
+            s.update(
+                id,
+                &PasswordInput {
+                    name: "云端修改版".to_string(),
+                    icon: None,
+                    url: None,
+                    username: Some("user".to_string()),
+                    password: "pw-云端修改版".to_string(),
+                    tags: None,
+                    notes: None,
+                    favorite: Some(false),
+                },
+            )
+            .unwrap();
+        });
+        // 本机也改同一条
+        vault.modify(id, "本机修改版");
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::ConflictPending);
-        // 本地内容未被覆盖
-        assert_eq!(vault.read().unwrap(), b"local edit");
-        // 备份已钉进远端（backup meta 文件名带序号，按内容查找；blob 为本地内容哈希）
-        let local_sha = manifest::sha256_hex(b"local edit");
-        assert!(cloud.has(&format!("{}/{}.bin", blobs_dir("/VAULT/vault.json"), local_sha)));
-        let backup_found = cloud
-            .files
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(p, _)| FakeCloud::parent(p) == meta_dir_of())
-            .filter_map(|(p, (b, _))| {
-                Manifest::parse(b)
-                    .ok()
-                    .map(|m| (p.clone(), m))
-            })
-            .any(|(_, m)| m.kind == MetaKind::Backup && m.files.get("vault.json").map(|e| e.blob == local_sha).unwrap_or(false));
-        assert!(backup_found, "应存在指向本地内容的 backup meta");
-        // 挂起状态置位
-        assert!(state.0.lock().unwrap().conflict_pending.is_some());
+        // 两版都保留：本机版原 id + 云端版新 id
+        let names = vault.names();
+        assert!(names.contains(&"本机修改版".to_string()), "{:?}", names);
+        assert!(names.contains(&"云端修改版".to_string()), "{:?}", names);
+        // 公告记录了这一对
+        let pairs = pairs_of(&state);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0]["local_id"], id);
+        assert_ne!(pairs[0]["remote_id"], id);
+        // 冲突已收敛进新 head（genesis + head2 + 并集 head）
+        assert_eq!(cloud.count_in_dir(&meta_dir_of()), 3);
     }
 
     #[test]
-    fn fork_parks_even_when_local_clean() {
+    fn fork_auto_unions_all_heads() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("fork");
-        vault.write(b"v1");
+        let vault = StoreVault::new("fork");
+        vault.add("v1");
         let state = MemState::new("fork");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
         let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        remote_push(&cloud, "devA", NOW_MS + 1000, &[head1.clone()], b"vA");
-        remote_push(&cloud, "devB", NOW_MS + 1000, &[head1], b"vB");
+        remote_push_lineage(&cloud, &vault, "devA", NOW_MS + 1000, &[head1.clone()], |s| {
+            s.insert(&PasswordInput {
+                name: "A记录".to_string(),
+                icon: None,
+                url: None,
+                username: Some("user".to_string()),
+                password: "pw-A".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+        });
+        remote_push_lineage(&cloud, &vault, "devB", NOW_MS + 1000, &[head1], |s| {
+            s.insert(&PasswordInput {
+                name: "B记录".to_string(),
+                icon: None,
+                url: None,
+                username: Some("user".to_string()),
+                password: "pw-B".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+        });
 
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::ConflictPending);
-        assert_eq!(vault.read().unwrap(), b"v1");
+        let names = vault.names();
+        assert!(names.contains(&"A记录".to_string()), "{:?}", names);
+        assert!(names.contains(&"B记录".to_string()), "{:?}", names);
+        // A、B 各自在 id2 插入记录 → 构成一对真冲突（两版都保留）
+        assert_eq!(state.0.lock().unwrap().conflict_pairs.len(), 1);
     }
 
     #[test]
-    fn parked_cycle_skips_without_new_writes() {
+    fn announcement_does_not_block_following_cycles() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("parked");
-        vault.write(b"v1");
-        let state = MemState::new("parked");
+        let vault = StoreVault::new("noblock");
+        let id = vault.add("v1");
+        let state = MemState::new("noblock");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
         let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        remote_push(&cloud, "other", NOW_MS + 1000, &[head1], b"v2");
-        vault.write(b"local edit");
+        remote_push_lineage(&cloud, &vault, "other", NOW_MS + 1000, &[head1.clone()], |s| {
+            s.update(
+                id,
+                &PasswordInput {
+                    name: "云端修改版".to_string(),
+                    icon: None,
+                    url: None,
+                    username: Some("user".to_string()),
+                    password: "pw-云端修改版".to_string(),
+                    tags: None,
+                    notes: None,
+                    favorite: Some(false),
+                },
+            )
+            .unwrap();
+        });
+        vault.modify(id, "本机修改版");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
-        let metas_before = cloud.count_in_dir(&meta_dir_of());
+        assert!(!pairs_of(&state).is_empty());
 
-        // 挂起中的周期：不再产生新的远端写入
+        // 拍板 S1：公告不阻塞——下一轮无变化即 Skipped，不重复产生公告
+        let metas_before = cloud.count_in_dir(&meta_dir_of());
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 3000)).unwrap();
-        assert_eq!(r.outcome, SessionOutcome::ConflictPending);
+        assert_eq!(r.outcome, SessionOutcome::Skipped);
         assert_eq!(cloud.count_in_dir(&meta_dir_of()), metas_before);
+        assert_eq!(pairs_of(&state).len(), 1);
     }
 
-    // ---- 完整性校验 ----
+    // ---- 换盐探测（拍板 S4）与解密兜底 ----
+
+    #[test]
+    fn key_salt_mismatch_sets_key_mismatch_flag() {
+        let cloud = FakeCloud::new();
+        let vault = StoreVault::new("salt");
+        vault.add("v1");
+        let state = MemState::new("salt");
+        sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
+
+        let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
+        // 另一设备用**不同密码**（不同盐）推送
+        remote_push(
+            &cloud,
+            "other",
+            NOW_MS + 1000,
+            &[head1],
+            &["别家设备的数据"],
+            Some("另一台设备的库密码456"),
+        );
+
+        let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
+        assert_eq!(r.outcome, SessionOutcome::ConflictPending);
+        assert_eq!(state.0.lock().unwrap().key_mismatch.as_deref(), Some("quark"));
+        // 本地内容未被破坏
+        assert_eq!(vault.names(), vec!["v1"]);
+    }
 
     #[test]
     fn apply_rejects_corrupt_blob() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("corrupt");
-        vault.write(b"v1");
+        let vault = StoreVault::new("corrupt");
+        vault.add("v1");
         let state = MemState::new("corrupt");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
         let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        // 另一设备声明 blob=sha(b"v2")，但实际存的是坏字节
-        let sha2 = manifest::sha256_hex(b"v2");
+        // 另一设备声明 blob=sha(合法内容)，但实际存的是坏字节
+        let good = {
+            let dir = std::env::temp_dir().join(format!("ps-corrupt-{}", unique_seq()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (s, _) = JsonStore::create_with_password(dir.join("c.json"), TEST_PW).unwrap();
+            s.insert(&PasswordInput {
+                name: "云端记录".to_string(),
+                icon: None,
+                url: None,
+                username: None,
+                password: "pw".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+            std::fs::read(s.db_path()).unwrap()
+        };
+        let sha2 = manifest::sha256_hex(&good);
         cloud.put(&blob_path("/VAULT/vault.json", &sha2), b"corrupted bytes");
         let mut m2 = Manifest::new_head("other", NOW_MS + 1000);
         m2.supersedes = vec![head1];
@@ -1125,7 +1453,7 @@ mod tests {
             },
         );
         let name = manifest::new_filename("other", NOW_MS + 1000);
-        let tmp = std::env::temp_dir().join(format!("ps-test-corrupt-meta-{}.json", unique_seq()));
+        let tmp = std::env::temp_dir().join(format!("ps-corrupt-meta-{}.json", unique_seq()));
         std::fs::write(&tmp, m2.serialize().unwrap()).unwrap();
         cloud
             .upload(&tmp, &meta_path("/VAULT/vault.json", &name))
@@ -1135,69 +1463,98 @@ mod tests {
         let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000));
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("校验失败"));
-        // 本地未被破坏
-        assert_eq!(vault.read().unwrap(), b"v1");
+        assert_eq!(vault.names(), vec!["v1"]);
     }
 
-    // ---- 手动同步（视为用户裁决） ----
+    // ---- 回退传播（拍板 S7b：回退内容不匹配已知 head → 视作修改直接 push）----
+
+    #[test]
+    fn rollback_to_old_head_propagates_as_push() {
+        let cloud = FakeCloud::new();
+        let vault = StoreVault::new("rollback");
+        vault.add("v1记录");
+        let state = MemState::new("rollback");
+        sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
+        let head1_bytes = vault.read().unwrap();
+
+        let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
+        remote_push_lineage(&cloud, &vault, "other", NOW_MS + 1000, &[head1], |s| {
+            s.insert(&PasswordInput {
+                name: "v2云端记录".to_string(),
+                icon: None,
+                url: None,
+                username: Some("user".to_string()),
+                password: "pw-v2".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+        });
+        // 本机应用到 head2
+        sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
+        assert!(vault.names().contains(&"v2云端记录".to_string()));
+
+        // 用户"回退"：把本地内容换成 head1 的字节。它不匹配最新已知 head
+        //（head2）→ 判为本机有未推送修改 → 回退作为新 head 传播出去
+        vault.replace(&head1_bytes).unwrap();
+        let r = sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 3000)).unwrap();
+        assert_eq!(r.outcome, SessionOutcome::Pushed);
+        assert_eq!(vault.names(), vec!["v1记录"]);
+        // 远端有了 v1 内容的新 blob（回退版本可从 head 链找回）
+        let v1_sha = manifest::sha256_hex(&head1_bytes);
+        assert!(cloud.has(&format!("{}/{}.bin", blobs_dir_of(), v1_sha)));
+    }
+
+    // ---- 手动同步 ----
 
     #[test]
     fn manual_download_backs_up_then_applies() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("mdl");
-        vault.write(b"v1");
+        let vault = StoreVault::new("mdl");
+        vault.add("v1记录");
         let state = MemState::new("mdl");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 
         let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        remote_push(&cloud, "other", NOW_MS + 1000, &[head1], b"v2");
-        vault.write(b"local edit");
+        remote_push_lineage(&cloud, &vault, "other", NOW_MS + 1000, &[head1], |s| {
+            s.insert(&PasswordInput {
+                name: "v2云端记录".to_string(),
+                icon: None,
+                url: None,
+                username: Some("user".to_string()),
+                password: "pw-v2".to_string(),
+                tags: None,
+                notes: None,
+                favorite: Some(false),
+            })
+            .unwrap();
+        });
+        vault.add("本机新增记录");
 
         let r = pull_manual(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
         assert_eq!(r.outcome, SessionOutcome::Applied);
-        assert_eq!(vault.read().unwrap(), b"v2");
-        // 本地修改有备份
-        let local_sha = manifest::sha256_hex(b"local edit");
-        assert!(cloud.has(&format!("{}/{}.bin", blobs_dir("/VAULT/vault.json"), local_sha)));
-        // 挂起被清除
-        assert!(state.0.lock().unwrap().conflict_pending.is_none());
-    }
-
-    #[test]
-    fn manual_upload_resolves_pending_and_pushes() {
-        let cloud = FakeCloud::new();
-        let vault = TestVault::new("mul");
-        vault.write(b"v1");
-        let state = MemState::new("mul");
-        sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
-
-        let head1 = state.0.lock().unwrap().quark.last_heads[0].clone();
-        remote_push(&cloud, "other", NOW_MS + 1000, &[head1.clone()], b"v2");
-        vault.write(b"local edit");
-        sync_auto(&inputs(&cloud, &vault, &state, NOW_MS + 2000)).unwrap();
-        assert!(state.0.lock().unwrap().conflict_pending.is_some());
-
-        let r = push_manual(&inputs(&cloud, &vault, &state, NOW_MS + 3000)).unwrap();
-        assert_eq!(r.outcome, SessionOutcome::Pushed);
-        // 挂起清除，新 head supersedes 两个已知 head
-        assert!(state.0.lock().unwrap().conflict_pending.is_none());
-        let dev = state.device_id();
-        let meta3 = Manifest::parse(
-            &cloud
-                .get(&format!("{}/meta_{}_{}.json", meta_dir_of(), NOW_MS + 3000, dev))
-                .unwrap(),
-        )
-        .unwrap();
-        let head2 = format!("meta_{}_{}.json", NOW_MS + 1000, "other");
-        // backup 不算 head、head1 已被 head2 supersed → 集合里只剩 head2
-        assert_eq!(meta3.supersedes, vec![head2]);
+        // lineage 内容含 v1+v2 两条；本机新增被覆盖（有 backup）
+        assert!(vault.names().contains(&"v1记录".to_string()));
+        assert!(vault.names().contains(&"v2云端记录".to_string()));
+        assert!(!vault.names().contains(&"本机新增记录".to_string()));
+        // 本机新增有 backup 归档
+        let backup_found = cloud
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| FakeCloud::parent(p) == meta_dir_of())
+            .filter_map(|(p, (b, _))| Manifest::parse(b).ok().map(|m| (p.clone(), m)))
+            .any(|(_, m)| m.kind == MetaKind::Backup);
+        assert!(backup_found, "手动下载前应有 backup 归档");
     }
 
     #[test]
     fn manual_upload_skips_when_cloud_already_newest() {
         let cloud = FakeCloud::new();
-        let vault = TestVault::new("mup");
-        vault.write(b"v1");
+        let vault = StoreVault::new("mup");
+        vault.add("v1");
         let state = MemState::new("mup");
         sync_auto(&inputs(&cloud, &vault, &state, NOW_MS)).unwrap();
 

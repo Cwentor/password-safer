@@ -259,8 +259,8 @@ export function getConflictDetails(provider) {
   return invoke('get_conflict_details', { provider });
 }
 
-export function resolveConflict(provider, strategy, selections) {
-  return invoke('resolve_conflict', { provider, strategy, selections });
+export function resolveConflict(provider, selections) {
+  return invoke('resolve_conflict', { provider, selections });
 }
 
 export function onSyncConflict(handler) {

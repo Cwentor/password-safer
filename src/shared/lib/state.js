@@ -59,6 +59,7 @@ export const DEFAULT_SYNC_STATE = {
   local_dirty_at: 0,
   quark: { last_heads: [], last_sync: '' },
   baidu: { last_heads: [], last_sync: '' },
-  conflict_pending: null,
+  conflict_pairs: [],
+  key_mismatch: null,
   legacy_pending_delete: false
 };
