@@ -8,7 +8,7 @@ mod mobile;
 use shared::models::*;
 use shared::storage::sync_state::SyncState;
 use shared::sync::auth::{baidu::BaiduAuth, quark::QuarkAuth, QrAuthenticator, QrLoginSession, QrLoginStatus};
-use shared::sync::engine;
+use shared::sync::{engine, session};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
@@ -45,8 +45,27 @@ impl engine::VaultIo for VaultAccess {
             .map(|d| d.as_secs() as i64)
     }
 
+    fn read(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.db_path).map_err(|e| format!("读取密码簿失败: {}", e))
+    }
+
     fn replace(&self, bytes: &[u8]) -> Result<(), String> {
         self.database.lock().unwrap().replace_raw(bytes)
+    }
+}
+
+/// 同步记账访问的生产实现（sync_state.json）
+struct SyncStateAccess {
+    path: PathBuf,
+}
+
+impl session::SyncStateIo for SyncStateAccess {
+    fn load(&self) -> Result<SyncState, String> {
+        SyncState::load_or_create(self.path.clone())
+    }
+
+    fn save(&self, st: &SyncState) -> Result<(), String> {
+        st.save()
     }
 }
 
@@ -168,6 +187,7 @@ async fn sync_now(
     let database = state.database.clone();
     let provider_key = provider.clone();
     let is_download = direction == "download";
+    let sync_state_path = state.data_dir.join("sync_state.json");
 
     let report = tauri::async_runtime::spawn_blocking(move || {
         let (provider, validator) = match shared::sync::build_provider(&provider_key, cookie.clone()) {
@@ -175,17 +195,22 @@ async fn sync_now(
             Err(e) => return engine::SyncReport::new(engine::Outcome::Failed(e)),
         };
         let vault = VaultAccess { db_path, database };
+        let sync_state = SyncStateAccess {
+            path: sync_state_path,
+        };
         engine::run_manual(engine::ManualInputs {
             provider: provider.as_ref(),
             validator: Some(validator.as_ref()),
             cookie: &cookie,
             remote_path: &remote_path,
+            provider_key: &provider_key,
             direction: if is_download {
                 engine::Direction::Download
             } else {
                 engine::Direction::Upload
             },
             vault: &vault,
+            sync_state: &sync_state,
         })
     })
     .await
@@ -205,6 +230,11 @@ async fn sync_now(
     let (success, message) = match &report.outcome {
         engine::Outcome::Uploaded => (true, format!("已上传到 {}", provider_display(&provider))),
         engine::Outcome::Downloaded => (true, format!("已从 {} 下载", provider_display(&provider))),
+        engine::Outcome::GenesisMigrated => (true, "已完成云端旧版密码簿迁移".to_string()),
+        engine::Outcome::ConflictPending => (
+            false,
+            "检测到同步冲突，自动同步已暂停，请在设置中处理".to_string(),
+        ),
         engine::Outcome::CookieExpired => (false, "登录已失效，请重新扫码".to_string()),
         engine::Outcome::Failed(e) => (false, e.clone()),
         engine::Outcome::Skipped | engine::Outcome::NotLoggedIn => (false, "无需同步".to_string()),
@@ -444,7 +474,10 @@ fn apply_sync_report(
     }
 
     match report.outcome {
-        engine::Outcome::Uploaded | engine::Outcome::Downloaded | engine::Outcome::Skipped => {
+        engine::Outcome::Uploaded
+        | engine::Outcome::Downloaded
+        | engine::Outcome::Skipped
+        | engine::Outcome::GenesisMigrated => {
             if report.record_sync {
                 record_last_sync(state, provider);
             }
@@ -458,6 +491,19 @@ fn apply_sync_report(
                     eprintln!("[mobile] 同步完成通知失败: {}", e);
                 }
             }
+        }
+        engine::Outcome::ConflictPending => {
+            // 冲突挂起：记账照常（远端可达、Cookie 有效），通知前端挂起待裁决
+            if report.record_sync {
+                record_last_sync(state, provider);
+            }
+            let _ = app.emit(
+                "sync://conflict",
+                serde_json::json!({
+                    "provider": provider,
+                    "message": format!("{} 检测到同步冲突，自动同步已暂停", provider_display(provider))
+                }),
+            );
         }
         engine::Outcome::NotLoggedIn => {}
         engine::Outcome::CookieExpired => {
@@ -542,15 +588,20 @@ fn start_sync_scheduler(state: Arc<AppState>, app: tauri::AppHandle) {
                         db_path: st.db_path.clone(),
                         database: st.database.clone(),
                     };
+                    let sync_state = SyncStateAccess {
+                        path: st.data_dir.join("sync_state.json"),
+                    };
                     engine::run_cycle(engine::CycleInputs {
                         provider: provider.as_ref(),
                         validator: validator.as_ref(),
                         cookie: &cookie,
                         remote_path: &remote,
+                        provider_key: name,
                         cookie_expires_at: expires_at,
                         warn_sent,
                         now_secs,
                         vault: &vault,
+                        sync_state: &sync_state,
                     })
                 })
                 .await

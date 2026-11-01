@@ -404,40 +404,6 @@ impl QuarkProvider {
         Ok(None)
     }
 
-    /// 递归查找文件，返回 (fid, update_time)（最多 3 层）
-    fn find_file_meta(&self, pdir_fid: &str, fname: &str, depth: u8) -> Result<Option<(String, i64)>, String> {
-        if depth > 3 {
-            return Ok(None);
-        }
-        let body = json!({
-            "pdir_fid": pdir_fid,
-            "_page": 1,
-            "_size": 200,
-            "_fetch_total": 1,
-            "_fetch_sub_dirs": "1",
-            "_sort": "file_type:asc,updated_at:desc"
-        });
-        let resp = self.api_post("file/sort", &body)?;
-        if let Some(list) = resp["data"]["list"].as_array() {
-            for item in list {
-                let ft = item["file_type"].as_i64().unwrap_or(0);
-                if ft == 1 && item["file_name"].as_str() == Some(fname) {
-                    let fid = item["fid"].as_str().unwrap_or("").to_string();
-                    let mtime = item["update_time"].as_i64().unwrap_or(0);
-                    return Ok(Some((fid, mtime)));
-                }
-                if ft == 0 {
-                    if let Some(sub_fid) = item["fid"].as_str() {
-                        if let Ok(Some(found)) = self.find_file_meta(sub_fid, fname, depth + 1) {
-                            return Ok(Some(found));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// 逐级查找目录 fid（只查不建）；任一级不存在返回 Ok(None)
     fn find_dir_fid(&self, remote_dir: &str) -> Result<Option<String>, String> {
         let trimmed = remote_dir.trim_start_matches('/');
@@ -538,17 +504,6 @@ impl QuarkProvider {
                 eprintln!("[quark] delete: {} 不存在，视为已删", remote_path);
                 Ok(())
             }
-        }
-    }
-
-    /// 获取远端文件的最后修改时间（unix 秒）
-    /// 文件不存在时返回 Ok(None)
-    pub fn remote_file_mtime(&self, remote_path: &str) -> Result<Option<i64>, String> {
-        let trimmed = remote_path.trim_start_matches('/');
-        let fname = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
-        match self.find_file_meta("0", &fname, 0)? {
-            Some((_fid, mtime)) => Ok(Some(mtime)),
-            None => Ok(None),
         }
     }
 
@@ -1139,10 +1094,6 @@ impl SyncProvider for QuarkProvider {
 
     fn delete(&self, remote_path: &str) -> Result<(), String> {
         self.delete_one(remote_path)
-    }
-
-    fn remote_file_mtime(&self, remote_path: &str) -> Result<Option<i64>, String> {
-        QuarkProvider::remote_file_mtime(self, remote_path)
     }
 }
 

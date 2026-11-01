@@ -3,12 +3,11 @@ pub mod baidu;
 pub mod engine;
 pub mod manifest;
 pub mod quark;
+pub mod session;
 
 use std::path::Path;
 
 /// 远端目录条目（list 返回；mtime 仅展示用，方向判定不依赖它）
-// 【allow(dead_code)：阶段 3 session 接线后移除】
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteFile {
     pub name: String,
@@ -31,18 +30,9 @@ pub trait SyncProvider: Send + Sync {
     /// 从云端下载文件内容并返回字节（不落盘，由调用方决定如何写入）
     fn download(&self, remote_path: &str) -> Result<Vec<u8>, String>;
     /// 列出远端目录一层内容（分页内部消化）；目录不存在返回空列表
-    // 【allow(dead_code)：阶段 3 session 接线后移除】
-    #[allow(dead_code)]
     fn list(&self, remote_dir: &str) -> Result<Vec<RemoteFile>, String>;
     /// 删除远端单个文件（幂等：目标不存在视为成功）
-    #[allow(dead_code)]
     fn delete(&self, remote_path: &str) -> Result<(), String>;
-    /// 获取远端文件最后修改时间（unix 秒），文件不存在返回 Ok(None)
-    /// 默认实现返回 Err，表示该 provider 不支持。
-    /// 【过渡】旧整文件同步流程专用，追加式同步落地后随 decide_direction 一并移除
-    fn remote_file_mtime(&self, _remote_path: &str) -> Result<Option<i64>, String> {
-        Err("remote_file_mtime not supported".to_string())
-    }
 }
 
 /// 按名称构造同步提供者与其 Cookie 校验器（按网盘分派的唯一位置）
@@ -60,13 +50,5 @@ pub fn build_provider(
             Box::new(auth::quark::QuarkAuth::new()),
         )),
         _ => Err(format!("未知的同步提供者: {}", name)),
-    }
-}
-
-/// 本地密码簿文件有效性：文件存在且非空
-pub fn local_vault_valid(local_path: &Path) -> bool {
-    match std::fs::metadata(local_path) {
-        Ok(m) => m.len() > 0,
-        Err(_) => false,
     }
 }

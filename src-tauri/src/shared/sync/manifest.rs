@@ -6,9 +6,6 @@
 //! 没有服务器分配版本号，并发 push 天然产生 fork，由调用方做冲突裁决；
 //! `kind: "backup"` 的 meta 永不参与 head 解析（冲突备份的可寻址载体）。
 
-// 【allow(dead_code)：阶段 3 session 接线后移除】
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -161,15 +158,12 @@ pub fn resolve_heads(metas: &[(String, Manifest)]) -> Vec<String> {
     result
 }
 
-/// 在一组 meta 里按 (updated_at, device_id) 取最新
+/// 在一组 meta 里按 (updated_at, device_id) 取最新条目（名字 + Manifest）
 /// （fork 的展示与合并默认侧用；确定性裁决，同组输入任何客户端结果一致）
-pub fn newest<'a>(metas: &'a [(String, Manifest)]) -> Option<&'a Manifest> {
-    metas
-        .iter()
-        .max_by(|a, b| {
-            (a.1.updated_at, a.1.device_id.clone()).cmp(&(b.1.updated_at, b.1.device_id.clone()))
-        })
-        .map(|(_, m)| m)
+pub fn newest<'a>(metas: &'a [(String, Manifest)]) -> Option<&'a (String, Manifest)> {
+    metas.iter().max_by(|a, b| {
+        (a.1.updated_at, a.1.device_id.clone()).cmp(&(b.1.updated_at, b.1.device_id.clone()))
+    })
 }
 
 fn is_sha256_hex(s: &str) -> bool {
@@ -311,7 +305,8 @@ mod tests {
             head("meta_1_a.json", 1000, "devA", &[]),
             head("meta_2_b.json", 2000, "devB", &[]),
         ];
-        assert_eq!(newest(&metas).unwrap().device_id, "devB");
+        assert_eq!(newest(&metas).unwrap().1.device_id, "devB");
+        assert_eq!(newest(&metas).unwrap().0, "meta_2_b.json");
     }
 
     #[test]
@@ -320,7 +315,7 @@ mod tests {
             head("meta_1_a.json", 2000, "devB", &[]),
             head("meta_2_b.json", 2000, "devC", &[]),
         ];
-        assert_eq!(newest(&metas).unwrap().device_id, "devC");
+        assert_eq!(newest(&metas).unwrap().1.device_id, "devC");
     }
 
     #[test]

@@ -84,7 +84,16 @@ impl SyncState {
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("替换 sync_state 失败: {}", e))
     }
 
-    /// 按网盘名取分账（未知网盘返回 None）
+    /// 按网盘名取分账（不可变；未知网盘返回 None）
+    pub fn provider(&self, name: &str) -> Option<&ProviderSyncState> {
+        match name {
+            "quark" => Some(&self.quark),
+            "baidu" => Some(&self.baidu),
+            _ => None,
+        }
+    }
+
+    /// 按网盘名取分账（可变；未知网盘返回 None）
     pub fn provider_mut(&mut self, name: &str) -> Option<&mut ProviderSyncState> {
         match name {
             "quark" => Some(&mut self.quark),
