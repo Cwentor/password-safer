@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod baidu;
 pub mod engine;
+pub mod manifest;
 pub mod quark;
 
 use std::path::Path;
