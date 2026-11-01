@@ -9,8 +9,10 @@ import {
   getConflictDetails, resolveConflict,
   onSyncConflict, onSyncConflictResolved,
 } from '../lib/api.js';
+import { escapeHtml } from '../lib/utils.js';
 import { loadConfig, loadPasswords } from '../lib/dataLoader.js';
 import { renderers } from '../lib/renderer.js';
+import { showVaultUnlockModal } from './VaultUnlockModal.js';
 
 const PROVIDER_NAMES = { quark: '夸克网盘', baidu: '百度网盘' };
 
@@ -74,12 +76,13 @@ export function initConflictWatcher() {
 
 function recordCard(dto, side, defaultSide) {
   const checked = defaultSide === side ? 'checked' : '';
+  // 记录名/用户名来自本地库与云端 DTO，必须转义（评审 🔴1：防存储型 XSS 直达 invoke 命令面）
   return `
     <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;background:var(--bg-secondary,#f5f5f5)">
       <input type="radio" name="sel-${dto.id}" value="${side}" data-id="${dto.id}" ${checked}>
       <div style="flex:1;min-width:0">
-        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${dto.icon || '🔑'} ${dto.name}</div>
-        <div style="font-size:11px;color:var(--text-secondary)">${dto.username || '—'} · 更新于 ${dto.last_used || '—'}</div>
+        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(dto.icon || '🔑')} ${escapeHtml(dto.name)}</div>
+        <div style="font-size:11px;color:var(--text-secondary)">${escapeHtml(dto.username || '—')} · 更新于 ${escapeHtml(dto.last_used || '—')}</div>
       </div>
     </div>`;
 }
@@ -132,7 +135,7 @@ function renderDetails(provider) {
           const newer = pair.newer || 'local';
           return `
             <div style="margin-bottom:8px">
-              <div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">${pair.local.name}</div>
+              <div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">${escapeHtml(pair.local.name)}</div>
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
                 ${recordCard(pair.local, 'local', newer)}
                 ${recordCard(pair.remote, 'remote', newer)}
@@ -195,6 +198,15 @@ export async function showResolveConflictModal(provider) {
     renderDetails(provider);
   } catch (e) {
     document.getElementById('rcBody').innerHTML =
-      `<div style="font-size:12px;color:var(--text-secondary)">读取冲突详情失败：${e}</div>`;
+      `<div style="font-size:12px;color:var(--text-secondary)">读取冲突详情失败：${escapeHtml(String(e))}</div>
+      <div style="margin-top:10px"><button class="secondary-btn" id="rcAdopt">输入云端库密码接管</button></div>`;
+    const adoptBtn = document.getElementById('rcAdopt');
+    if (adoptBtn) {
+      adoptBtn.addEventListener('click', async () => {
+        modalEl.classList.remove('show');
+        const ok = await showVaultUnlockModal('adopt', { provider });
+        if (ok) showResolveConflictModal(provider);
+      });
+    }
   }
 }

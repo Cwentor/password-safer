@@ -124,19 +124,22 @@ impl JsonStore {
             // 验证可解密
             match store.load() {
                 Ok(_) => eprintln!("[json_store] vault.json 加载验证成功"),
-                Err(e) => store.recover_from_bak(&e)?,
+                Err(e) => store.restore_from_bak(&e)?,
             }
         }
         Ok(store)
     }
 
     /// v2 模式打开：解析信封头 → 派生密钥 → 验证解密。
+    /// 主文件损坏到信封都无法解析时，用 .bak 的信封参数派生并恢复（评审 A3）。
     /// 返回 (store, 派生钥)（派生钥供本机凭据库缓存）
     pub fn open_with_password(db_path: PathBuf, password: &str) -> Result<(Self, [u8; 32]), String> {
         let bytes = std::fs::read(&db_path)
             .map_err(|e| format!("读取 vault.json 失败: {}", e))?;
-        let env: VaultEnvelope = serde_json::from_slice(&bytes)
-            .map_err(|_| "密码簿不是 v2 库密码加密格式".to_string())?;
+        let env: VaultEnvelope = match serde_json::from_slice(&bytes) {
+            Ok(env) => env,
+            Err(_) => return Self::open_v2_from_bak(db_path, password),
+        };
         let key = crypto::derive_key(password, &env.kdf)?;
         let crypto = Crypto::from_key_bytes(key);
         let store = JsonStore {
@@ -146,8 +149,35 @@ impl JsonStore {
             kdf_params: Some(env.kdf.clone()),
             on_user_save: None,
         };
-        store.load().map_err(|e| format!("库密码解锁失败: {}", e))?;
+        if let Err(e) = store.load() {
+            store.restore_from_bak(&e)?;
+        }
         eprintln!("[json_store] vault.json 已用库密码解锁");
+        Ok((store, key))
+    }
+
+    /// 主文件损坏（信封不可解析）时的 .bak 恢复路径：用 .bak 自己的信封参数
+    /// 派生钥匙，验证可解后经临时文件原子恢复主文件。
+    fn open_v2_from_bak(db_path: PathBuf, password: &str) -> Result<(Self, [u8; 32]), String> {
+        let bak_path = db_path.with_extension("json.bak");
+        let bytes = std::fs::read(&bak_path)
+            .map_err(|_| "vault.json 已损坏且无可用 .bak".to_string())?;
+        let env: VaultEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|_| "vault.json 与 .bak 均不是 v2 库密码加密格式".to_string())?;
+        let key = crypto::derive_key(password, &env.kdf)?;
+        let store = JsonStore {
+            db_path: db_path.clone(),
+            crypto: Crypto::from_key_bytes(key),
+            envelope_mode: true,
+            kdf_params: Some(env.kdf.clone()),
+            on_user_save: None,
+        };
+        decode_store(&bytes, &store.crypto)
+            .map_err(|_| "库密码不正确（.bak 亦无法解密）".to_string())?;
+        let tmp = db_path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| format!(".bak 恢复写入失败: {}", e))?;
+        std::fs::rename(&tmp, &db_path).map_err(|e| format!(".bak 恢复替换失败: {}", e))?;
+        eprintln!("[json_store] vault.json 已从 .bak 恢复（主文件损坏）");
         Ok((store, key))
     }
 
@@ -182,7 +212,9 @@ impl JsonStore {
             kdf_params: Some(env.kdf.clone()),
             on_user_save: None,
         };
-        store.load().map_err(|e| format!("缓存钥匙解锁失败: {}", e))?;
+        if let Err(e) = store.load() {
+            store.restore_from_bak(&e)?;
+        }
         Ok(store)
     }
 
@@ -204,16 +236,46 @@ impl JsonStore {
         }
 
         let old_crypto = std::mem::replace(&mut self.crypto, new_crypto);
+        let old_params = self.kdf_params.clone();
         self.kdf_params = Some(params);
         let was_envelope = self.envelope_mode;
         self.envelope_mode = true;
         if let Err(e) = self.save(&data) {
-            // 回滚内存态（文件未被写坏：save 原子失败即保持旧内容）
+            // 回滚全部内存态（文件未被写坏：save 原子失败即保持旧内容）
             self.crypto = old_crypto;
+            self.kdf_params = old_params;
             self.envelope_mode = was_envelope;
             return Err(e);
         }
         Ok(new_key)
+    }
+
+    /// 收养远端信封：用**远端信封的盐与参数** + 用户输入的密码验证远端字节，
+    /// 验证通过后把本库整体切换到远端钥匙体系并原样落盘远端字节。
+    /// 用于：新设备接管云端数据、其他设备改过库密码后的重新对齐（评审 A1）。
+    /// 成功后本地文件与远端 head 同字节，后续同步自然收敛。
+    pub fn adopt_remote_envelope(&mut self, remote_bytes: &[u8], password: &str) -> Result<(), String> {
+        let env: VaultEnvelope = serde_json::from_slice(remote_bytes)
+            .map_err(|_| "远端数据不是 v2 库密码加密格式".to_string())?;
+        let key = crypto::derive_key(password, &env.kdf)?;
+        let new_crypto = Crypto::from_key_bytes(key);
+        // 用远端钥验证远端内容可解可解析（密码错误的唯一判定点）
+        let _: StoreData = decode_store(remote_bytes, &new_crypto)
+            .map_err(|_| "库密码不正确：无法解密云端版本".to_string())?;
+
+        let old_crypto = std::mem::replace(&mut self.crypto, new_crypto);
+        let old_params = self.kdf_params.clone();
+        let was_envelope = self.envelope_mode;
+        self.kdf_params = Some(env.kdf.clone());
+        self.envelope_mode = true;
+        if let Err(e) = self.write_atomic(remote_bytes) {
+            self.crypto = old_crypto;
+            self.kdf_params = old_params;
+            self.envelope_mode = was_envelope;
+            return Err(e);
+        }
+        eprintln!("[json_store] 已收养远端信封（本库切换到云端钥匙体系）");
+        Ok(())
     }
 
     /// 校验库密码是否正确（派生钥与当前钥比对）
@@ -226,15 +288,18 @@ impl JsonStore {
         }
     }
 
-    /// 主文件解密失败时尝试从 .bak 恢复：先验证 .bak 可解密可解析，再原子覆盖主文件
-    fn recover_from_bak(&self, main_err: &str) -> Result<(), String> {
+    /// 主文件解密失败时尝试从 .bak 恢复（v1/v2 共用）：先验证 .bak 可用当前
+    /// 钥匙解密解析，再经临时文件原子覆盖主文件——全程不触碰 .bak，
+    /// 保住唯一的好备份（评审 Standards #5）。
+    fn restore_from_bak(&self, main_err: &str) -> Result<(), String> {
         let bak_path = self.db_path.with_extension("json.bak");
         let bytes = std::fs::read(&bak_path)
             .map_err(|_| format!("vault.json 解密失败（{}）且无可用 .bak", main_err))?;
         decode_store(&bytes, &self.crypto)
             .map_err(|e| format!("vault.json 解密失败（{}）且 .bak 不可用（{}）", main_err, e))?;
-        std::fs::write(&self.db_path, bytes)
-            .map_err(|e| format!(".bak 恢复写入失败: {}", e))?;
+        let tmp = self.db_path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| format!(".bak 恢复写入失败: {}", e))?;
+        std::fs::rename(&tmp, &self.db_path).map_err(|e| format!(".bak 恢复替换失败: {}", e))?;
         // 覆盖后复核一次，确保主文件恢复可用
         self.load()
             .map_err(|e| format!(".bak 恢复后复核失败: {}", e))?;
@@ -690,6 +755,52 @@ mod tests {
         assert!(store.replace_raw(&v1_bytes).is_err());
         assert_eq!(before, std::fs::read(&store.db_path).unwrap());
         assert_eq!(store.get_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v2_open_recovers_from_bak_when_main_corrupted() {
+        let dir = temp_dir("v2-bak");
+        let db_path = dir.join("vault.json");
+        let (store, _k) = JsonStore::create_with_password(db_path.clone(), "库密码12345").unwrap();
+        store.insert(&sample_input("第一版", "abc123456")).unwrap();
+        store.insert(&sample_input("第二版", "xyz987654")).unwrap();
+        drop(store);
+        // 此时 .bak 持有"第一版"，主文件损坏 → 库密码路径同样能回退（评审 A3）
+        std::fs::write(&db_path, b"corrupted").unwrap();
+        let (store2, _) = JsonStore::open_with_password(db_path, "库密码12345").unwrap();
+        let all = store2.get_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "第一版");
+    }
+
+    #[test]
+    fn adopt_remote_envelope_switches_key_system() {
+        let dir = temp_dir("adopt");
+        // 设备 A：库密码甲，有一条数据
+        let a_path = dir.join("a.json");
+        let (a, _ka) = JsonStore::create_with_password(a_path.clone(), "甲的库密码123").unwrap();
+        a.insert(&sample_input("A的数据", "abc123456")).unwrap();
+        let remote_bytes = std::fs::read(&a_path).unwrap();
+        drop(a);
+        drop(a_path);
+
+        // 设备 B：自己的库密码乙（新设备先建库的场景）
+        let b_path = dir.join("b.json");
+        let (mut b, _kb) = JsonStore::create_with_password(b_path.clone(), "乙的库密码456").unwrap();
+
+        // 收养：用甲的库密码验证并切换到云端钥匙体系
+        b.adopt_remote_envelope(&remote_bytes, "甲的库密码123").unwrap();
+        assert_eq!(b.get_all().unwrap()[0].password, "abc123456");
+        // 本地文件与远端同字节（内容寻址收敛的前提）
+        assert_eq!(std::fs::read(&b_path).unwrap(), remote_bytes);
+        // 错误密码被拒
+        let (mut b2, _) = JsonStore::create_with_password(dir.join("c.json"), "乙的库密码456").unwrap();
+        assert!(b2.adopt_remote_envelope(&remote_bytes, "错的密码0000").is_err());
+        drop(b);
+
+        // 收养后重启：新钥匙体系下用甲的库密码可打开
+        let (b3, _) = JsonStore::open_with_password(b_path, "甲的库密码123").unwrap();
+        assert_eq!(b3.get_all().unwrap().len(), 1);
     }
 
     #[test]

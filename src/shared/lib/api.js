@@ -189,6 +189,16 @@ export function lockVault() {
   return invoke('lock_vault');
 }
 
+// 收养云端钥匙体系：用远端信封的盐验证密码并切换本库钥匙（新设备接管/换密码对齐）
+export function adoptRemoteKey(provider, password) {
+  return invoke('adopt_remote_key', { provider, password });
+}
+
+// 清理云端历史版本（保留当前 head，防旧密码泄露导致历史回读）
+export function cleanupCloudHistory() {
+  return invoke('cleanup_cloud_history');
+}
+
 export function logout(provider) {
   return invoke('logout', { provider });
 }

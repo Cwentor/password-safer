@@ -206,88 +206,12 @@ async fn sync_now(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<SyncResult, String> {
-    let config = state.db()?.as_ref().ok_or(LOCKED_MSG)?.load_config()?;
-    let (cookie, remote_path) = match provider.as_str() {
-        "baidu" => (config.baidu_cookie.clone(), config.baidu_remote_path.clone()),
-        "quark" => (config.quark_cookie.clone(), config.quark_remote_path.clone()),
-        _ => {
-            return Ok(SyncResult {
-                success: false,
-                message: format!("未知的同步提供者: {}", provider),
-                synced_at: now_ts(),
-            });
-        }
+    let dir = if direction == "download" {
+        engine::Direction::Download
+    } else {
+        engine::Direction::Upload
     };
-
-    if cookie.is_empty() {
-        return Ok(SyncResult {
-            success: false,
-            message: "尚未扫码登录，请先在设置中扫码绑定".to_string(),
-            synced_at: now_ts(),
-        });
-    }
-
-    let db_path = state.db_path.clone();
-    let database = state.database.clone();
-    let provider_key = provider.clone();
-    let is_download = direction == "download";
-    let sync_state_path = state.data_dir.join("sync_state.json");
-
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        let (provider, validator) = match shared::sync::build_provider(&provider_key, cookie.clone()) {
-            Ok(x) => x,
-            Err(e) => return engine::SyncReport::new(engine::Outcome::Failed(e)),
-        };
-        let vault = VaultAccess { db_path, database };
-        let sync_state = SyncStateAccess {
-            path: sync_state_path,
-        };
-        engine::run_manual(engine::ManualInputs {
-            provider: provider.as_ref(),
-            validator: Some(validator.as_ref()),
-            cookie: &cookie,
-            remote_path: &remote_path,
-            provider_key: &provider_key,
-            direction: if is_download {
-                engine::Direction::Download
-            } else {
-                engine::Direction::Upload
-            },
-            vault: &vault,
-            sync_state: &sync_state,
-        })
-    })
-    .await
-    .map_err(|e| format!("同步任务失败: {}", e))?;
-
-    // 同步成功则更新本地记账（不再写进密码簿）
-    if report.record_sync {
-        record_last_sync(&state, &provider);
-    }
-
-    // 下载成功后通知前端刷新（JSON 文件无需 reopen，下次 load() 自动读取新内容）
-    if report.downloaded {
-        let _ = app.emit("sync://restored", ());
-        eprintln!("[sync] vault.json downloaded, emit sync://restored");
-    }
-
-    let (success, message) = match &report.outcome {
-        engine::Outcome::Uploaded => (true, format!("已上传到 {}", provider_display(&provider))),
-        engine::Outcome::Downloaded => (true, format!("已从 {} 下载", provider_display(&provider))),
-        engine::Outcome::GenesisMigrated => (true, "已完成云端旧版密码簿迁移".to_string()),
-        engine::Outcome::ConflictPending => (
-            false,
-            "检测到同步冲突，自动同步已暂停，请在设置中处理".to_string(),
-        ),
-        engine::Outcome::CookieExpired => (false, "登录已失效，请重新扫码".to_string()),
-        engine::Outcome::Failed(e) => (false, e.clone()),
-        engine::Outcome::Skipped | engine::Outcome::NotLoggedIn => (false, "无需同步".to_string()),
-    };
-    Ok(SyncResult {
-        success,
-        message,
-        synced_at: now_ts(),
-    })
+    perform_manual_sync(&provider, dir, &state, &app).await
 }
 
 /// 启动扫码登录，返回二维码图片与轮询票据
@@ -556,9 +480,14 @@ fn change_vault_password(
 }
 
 /// v1 → v2 升级迁移：为 master.key 时代的密码簿设置库密码（全库换钥），
-/// 成功后 master.key 归档为 .retired 保留
+/// 成功后 master.key 归档为 .retired 保留，并立即推送新 head
+/// （评审 A5：避免空窗期内远端 legacy 较新而被 v2 本地解不开）
 #[tauri::command]
-fn migrate_vault_to_password(password: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn migrate_vault_to_password(
+    password: String,
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     check_password_strength(&password)?;
     let new_key = {
         let mut g = state.db()?;
@@ -579,7 +508,83 @@ fn migrate_vault_to_password(password: String, state: State<'_, Arc<AppState>>) 
     if let Err(e) = shared::storage::key_cache::cache_key(&new_key) {
         eprintln!("[vault] 派生钥缓存失败（下次启动需输密码）: {}", e);
     }
+    // 立即推送 v2 内容为新 head（评审 A5；对每个已绑定网盘 best-effort，
+    // 未绑定或失败都不阻塞迁移，推送留给下轮自动同步）
+    let cfg = state.db()?.as_ref().ok_or(LOCKED_MSG)?.load_config()?;
+    for name in ["baidu", "quark"] {
+        let cookie = if name == "baidu" { &cfg.baidu_cookie } else { &cfg.quark_cookie };
+        if cookie.is_empty() {
+            continue;
+        }
+        if let Err(e) = perform_manual_sync(name, engine::Direction::Upload, &state, &app).await {
+            eprintln!("[vault] 迁移后推送到 {} 失败（下轮自动同步将重试）: {}", name, e);
+        }
+    }
     Ok(())
+}
+
+/// 同步执行体（sync_now 与迁移后推送共用）：组装输入 → 引擎 → 记账 → 事件
+async fn perform_manual_sync(
+    provider: &str,
+    direction: engine::Direction,
+    state: &State<'_, Arc<AppState>>,
+    app: &tauri::AppHandle,
+) -> Result<SyncResult, String> {
+    let config = state.db()?.as_ref().ok_or(LOCKED_MSG)?.load_config()?;
+    let (cookie, remote_path) = match provider {
+        "baidu" => (config.baidu_cookie.clone(), config.baidu_remote_path.clone()),
+        "quark" => (config.quark_cookie.clone(), config.quark_remote_path.clone()),
+        _ => return Err(format!("未知的同步提供者: {}", provider)),
+    };
+    if cookie.is_empty() {
+        return Err("尚未扫码登录".to_string());
+    }
+    let db_path = state.db_path.clone();
+    let database = state.database.clone();
+    let sync_state_path = state.data_dir.join("sync_state.json");
+    let provider_key = provider.to_string();
+
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let (provider_inst, validator) =
+            match shared::sync::build_provider(&provider_key, cookie.clone()) {
+                Ok(x) => x,
+                Err(e) => return engine::SyncReport::new(engine::Outcome::Failed(e)),
+            };
+        let vault = VaultAccess { db_path, database };
+        let sync_state = SyncStateAccess { path: sync_state_path.clone() };
+        engine::run_manual(engine::ManualInputs {
+            provider: provider_inst.as_ref(),
+            validator: Some(validator.as_ref()),
+            cookie: &cookie,
+            remote_path: &remote_path,
+            provider_key: &provider_key,
+            direction,
+            vault: &vault,
+            sync_state: &sync_state,
+        })
+    })
+    .await
+    .map_err(|e| format!("同步任务失败: {}", e))?;
+
+    if report.record_sync {
+        record_last_sync(state, provider);
+    }
+    if report.downloaded {
+        let _ = app.emit("sync://restored", ());
+    }
+    let (success, message) = match &report.outcome {
+        engine::Outcome::Uploaded => (true, format!("已上传到 {}", provider_display(provider))),
+        engine::Outcome::Downloaded => (true, format!("已从 {} 下载", provider_display(provider))),
+        engine::Outcome::GenesisMigrated => (true, "已完成云端旧版密码簿迁移".to_string()),
+        engine::Outcome::ConflictPending => (
+            false,
+            "检测到同步冲突，自动同步已暂停，请在设置中处理".to_string(),
+        ),
+        engine::Outcome::CookieExpired => (false, "登录已失效，请重新扫码".to_string()),
+        engine::Outcome::Failed(e) => (false, e.clone()),
+        engine::Outcome::Skipped | engine::Outcome::NotLoggedIn => (false, "无需同步".to_string()),
+    };
+    Ok(SyncResult { success, message, synced_at: now_ts() })
 }
 
 /// 显式锁定：清空内存中的库（本机缓存保留，解锁免输密码）
@@ -587,6 +592,167 @@ fn migrate_vault_to_password(password: String, state: State<'_, Arc<AppState>>) 
 fn lock_vault(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     *state.db()? = None;
     Ok(())
+}
+
+/// 收养云端钥匙体系（评审 A1）：用**远端信封的盐**验证用户输入的密码，
+/// 通过后本库整体切换到云端钥匙并落盘远端内容。
+/// 场景：新设备接管云端数据；其他设备改过库密码后重新对齐。
+#[tauri::command]
+async fn adopt_remote_key(
+    provider: String,
+    password: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let database = state.database.clone();
+    let sync_state_path = state.data_dir.join("sync_state.json");
+    let provider_key = provider.clone();
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // Cookie / 远端路径（本地库已解锁——新设备首启已建库并绑定）
+        let (cookie, remote_path) = {
+            let g = database.lock().map_err(|e| e.to_string())?;
+            let store = g.as_ref().ok_or(LOCKED_MSG)?;
+            let cfg = store.load_config()?;
+            match provider_key.as_str() {
+                "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
+                "quark" => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
+                _ => return Err(format!("未知的同步提供者: {}", provider_key)),
+            }
+        };
+        if cookie.is_empty() {
+            return Err("尚未扫码登录，无法读取云端版本".to_string());
+        }
+        let (provider_inst, _validator) = shared::sync::build_provider(&provider_key, cookie)?;
+        use shared::sync::manifest;
+        let metas = session::fetch_metas(provider_inst.as_ref(), &remote_path)?;
+        let heads = manifest::resolve_heads(&metas);
+        let head_metas: Vec<(String, shared::sync::manifest::Manifest)> = metas
+            .iter()
+            .filter(|(n, _)| heads.contains(n))
+            .cloned()
+            .collect();
+        let (head_name, head_manifest) = manifest::newest(&head_metas)
+            .ok_or("云端暂无任何版本，无需接管")?
+            .clone();
+        let entry = head_manifest
+            .files
+            .get("vault.json")
+            .ok_or("head meta 缺少 vault.json 条目")?;
+        if entry.deleted {
+            return Err("云端最新版本为已删除状态".to_string());
+        }
+        let bytes = provider_inst
+            .as_ref()
+            .download(&format!("{}/blobs/{}.bin", base_of(&remote_path), entry.blob))?;
+        let sha = shared::sync::manifest::sha256_hex(&bytes);
+        if sha != entry.blob {
+            return Err("远端 blob 校验失败".to_string());
+        }
+
+        // 收养：验证密码（远端盐）→ 切换本库钥匙体系 → 原样落盘远端字节
+        let key_updated = {
+            let mut g = database.lock().map_err(|e| e.to_string())?;
+            let store = g.as_mut().ok_or(LOCKED_MSG)?;
+            store.adopt_remote_envelope(&bytes, &password)?;
+            store.crypto().key_bytes()
+        };
+        shared::storage::key_cache::clear_cache();
+        if let Err(e) = shared::storage::key_cache::cache_key(&key_updated) {
+            eprintln!("[vault] 收养后派生钥缓存失败（下次启动需输密码）: {}", e);
+        }
+
+        // 记账对齐：last_heads 收敛到该 head、清挂起——下轮同步自然收敛
+        let mut st = SyncState::load_or_create(sync_state_path)?;
+        if let Some(p) = st.provider_mut(&provider_key) {
+            p.last_heads = vec![head_name];
+        }
+        st.conflict_pending = None;
+        st.save()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("任务异常: {}", e))?
+}
+
+/// 清理云端历史版本（评审 A2，改库密码后的可选步骤）：
+/// 对所有已绑定的网盘，保留当前 head 的 meta 与 blob，删除其余 meta 与 blob。
+/// 旧版本从此不可找回（防旧密码泄露导致历史回读）；其他设备的 last_heads
+/// 会在下轮 list 后自然收敛到剩余 head。
+#[tauri::command]
+async fn cleanup_cloud_history(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let database = state.database.clone();
+    let sync_state_path = state.data_dir.join("sync_state.json");
+
+    let summary = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
+        use shared::sync::manifest;
+        let mut out = Vec::new();
+        for provider_key in ["baidu", "quark"] {
+            let (cookie, remote_path) = {
+                let g = database.lock().map_err(|e| e.to_string())?;
+                let store = g.as_ref().ok_or(LOCKED_MSG)?;
+                let cfg = store.load_config()?;
+                match provider_key {
+                    "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
+                    _ => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
+                }
+            };
+            if cookie.is_empty() {
+                continue;
+            }
+            let (provider, _validator) = shared::sync::build_provider(provider_key, cookie)?;
+            let metas = session::fetch_metas(provider.as_ref(), &remote_path)?;
+            let heads = manifest::resolve_heads(&metas);
+            if heads.is_empty() {
+                continue;
+            }
+            let head_metas: Vec<(String, shared::sync::manifest::Manifest)> = metas
+                .iter()
+                .filter(|(n, _)| heads.contains(n))
+                .cloned()
+                .collect();
+            let (head_name, head_manifest) = manifest::newest(&head_metas)
+                .ok_or("未找到最新 head")?
+                .clone();
+            let keep_blob = head_manifest
+                .files
+                .get("vault.json")
+                .map(|e| e.blob.clone())
+                .unwrap_or_default();
+            let base = base_of(&remote_path);
+            let mut deleted = 0usize;
+            // 删除全部非 head meta（backup 与被 supersede 的 head）
+            for f in provider.as_ref().list(&format!("{}/meta", base))? {
+                if f.name == head_name {
+                    continue;
+                }
+                if provider.as_ref().delete(&format!("{}/meta/{}", base, f.name)).is_ok() {
+                    deleted += 1;
+                }
+            }
+            // 删除 head 之外的全部 blob
+            for f in provider.as_ref().list(&format!("{}/blobs", base))? {
+                let blob_name = f.name.trim_end_matches(".bin");
+                if blob_name == keep_blob {
+                    continue;
+                }
+                if provider.as_ref().delete(&format!("{}/blobs/{}", base, f.name)).is_ok() {
+                    deleted += 1;
+                }
+            }
+            // 本机 last_heads 收敛，避免引用已删 meta
+            let mut st2 = SyncState::load_or_create(sync_state_path.clone())?;
+            if let Some(p) = st2.provider_mut(provider_key) {
+                p.last_heads = vec![head_name.clone()];
+            }
+            let _ = st2.save();
+            out.push(serde_json::json!({ "provider": provider_key, "deleted": deleted }));
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("任务异常: {}", e))??;
+
+    Ok(serde_json::json!({ "success": true, "providers": summary }))
 }
 
 // ========== 冲突解决（阶段 5） ==========
@@ -627,7 +793,10 @@ fn fetch_winner_data(
     if sha != entry.blob {
         return Err("远端 blob 校验失败".to_string());
     }
-    let data = shared::storage::json_store::decode_store(&bytes, crypto)?;
+    let data = shared::storage::json_store::decode_store(&bytes, crypto).map_err(|_| {
+        // 评审 A1：给前端一个可识别的信号，触发"输入云端库密码接管"流程
+        "远端版本无法用当前库密码解密（可能已在其他设备更换库密码）".to_string()
+    })?;
     Ok((head_name, data, head_manifest.updated_at))
 }
 
@@ -776,32 +945,44 @@ async fn resolve_conflict(
             fetch_winner_data(&provider_key, &remote_path, &cookie, &crypto)?
         };
 
-        // 合并
+        // 本地数据先读出（策略 choice 需要两侧 id 全集）
+        let local_data = {
+            let g = database.lock().map_err(|e| e.to_string())?;
+            g.as_ref().ok_or(LOCKED_MSG)?.load()?
+        };
+
+        // 合并：全用本地/全用云端 = 对两侧全部差异记录统一取舍（评审 C1：
+        // 此前这两个策略丢弃了选择，导致三个按钮结果相同）；
+        // custom/merge 用前端逐条选择，缺省按较新者
         let mut choices: std::collections::HashMap<i64, Choice> = std::collections::HashMap::new();
-        match strategy.as_str() {
-            "local" | "remote" => {}
-            _ => {
-                if let Some(obj) = selections.as_object() {
-                    for (k, v) in obj {
-                        if let (Ok(id), Some(c)) = (k.parse::<i64>(), v.as_str()) {
-                            if let Some(ch) = Choice::parse(c) {
-                                choices.insert(id, ch);
-                            }
-                        }
+        let uniform = match strategy.as_str() {
+            "local" => Some(Choice::Local),
+            "remote" => Some(Choice::Remote),
+            _ => None,
+        };
+        if let Some(ch) = uniform {
+            for r in local_data.passwords.iter().chain(remote_data.passwords.iter()) {
+                choices.insert(r.id, ch);
+            }
+        } else if let Some(obj) = selections.as_object() {
+            for (k, v) in obj {
+                if let (Ok(id), Some(c)) = (k.parse::<i64>(), v.as_str()) {
+                    if let Some(ch) = Choice::parse(c) {
+                        choices.insert(id, ch);
                     }
                 }
             }
         }
+        // config 整体取较新侧：local_dirty_at 是秒、head updated_at 是毫秒（评审 🟠4）
         let config_take_local = match strategy.as_str() {
             "local" => true,
             "remote" => false,
-            _ => local_dirty_at >= head_updated_at,
+            _ => local_dirty_at * 1000 >= head_updated_at,
         };
 
         let merged = {
             let mut g = database.lock().map_err(|e| e.to_string())?;
             let store = g.as_mut().ok_or(LOCKED_MSG)?;
-            let local_data = store.load()?;
             let merged = merge_vaults(local_data, remote_data, config_take_local, &choices);
             store.save(&merged)?;
             merged
@@ -810,7 +991,7 @@ async fn resolve_conflict(
         // 强制推送（push_manual：supersedes 全部 heads，清挂起）
         let (provider_inst, validator) = shared::sync::build_provider(&provider_key, cookie.clone())?;
         let vault = VaultAccess { db_path, database: database.clone() };
-        let sync_state = SyncStateAccess { path: sync_state_path };
+        let sync_state = SyncStateAccess { path: sync_state_path.clone() };
         let report = engine::run_manual(engine::ManualInputs {
             provider: provider_inst.as_ref(),
             validator: Some(validator.as_ref()),
@@ -822,13 +1003,21 @@ async fn resolve_conflict(
             sync_state: &sync_state,
         });
 
+        // 合并结果已按用户裁决落盘：无论推送成败都清挂起——推送失败时
+        // 本地内容与新 head 不同，下轮自动同步按普通 push 路径重试（评审 A6）
+        {
+            let mut st = SyncState::load_or_create(sync_state_path.clone())?;
+            st.conflict_pending = None;
+            let _ = st.save();
+        }
+
         let _ = app.emit(
             "sync://conflict-resolved",
             serde_json::json!({ "provider": provider_key }),
         );
         let msg = match report.outcome {
             engine::Outcome::Uploaded => format!("冲突已解决：合并了 {} 条记录并已上传", merged.passwords.len()),
-            engine::Outcome::Failed(e) => format!("冲突已合并到本地，但推送失败（{}）；下次同步将重试", e),
+            engine::Outcome::Failed(e) => format!("冲突已合并到本地，但推送失败（{}）；下次同步将自动重试", e),
             _ => "冲突已解决".to_string(),
         };
         Ok(msg)
@@ -1127,6 +1316,8 @@ pub fn run() {
         unlock_vault,
         get_conflict_details,
         resolve_conflict,
+        adopt_remote_key,
+        cleanup_cloud_history,
         set_vault_password,
         change_vault_password,
         migrate_vault_to_password,
@@ -1159,6 +1350,8 @@ pub fn run() {
         unlock_vault,
         get_conflict_details,
         resolve_conflict,
+        adopt_remote_key,
+        cleanup_cloud_history,
         set_vault_password,
         change_vault_password,
         migrate_vault_to_password,
@@ -1203,13 +1396,22 @@ pub fn run() {
                         }
                         _ => match shared::storage::key_cache::load_cached_key() {
                             Some(key) => {
-                                let mut store = shared::storage::json_store::JsonStore::open_with_key(
+                                match shared::storage::json_store::JsonStore::open_with_key(
                                     db_path.clone(),
                                     key,
-                                )?;
-                                attach_user_save_callback(&mut store, &data_dir);
-                                eprintln!("[vault] 已用本机缓存解锁密码簿");
-                                Some(store)
+                                ) {
+                                    Ok(mut store) => {
+                                        attach_user_save_callback(&mut store, &data_dir);
+                                        eprintln!("[vault] 已用本机缓存解锁密码簿");
+                                        Some(store)
+                                    }
+                                    // 缓存钥匙与文件不匹配（vault 损坏/残留旧钥）：
+                                    // 转锁定态让用户输密码，而不是整个应用初始化失败（评审 🟠3）
+                                    Err(e) => {
+                                        eprintln!("[vault] 缓存钥匙解锁失败（{}），转入锁定态", e);
+                                        None
+                                    }
+                                }
                             }
                             None => {
                                 eprintln!("[vault] 无本机缓存，密码簿进入锁定态，等待输入库密码");

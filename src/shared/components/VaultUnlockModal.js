@@ -8,7 +8,8 @@
 import { state } from '../lib/state.js';
 import { showToast } from './Toast.js';
 import {
-  unlockVault, setVaultPassword, changeVaultPassword, migrateVaultToPassword, getVaultStatus,
+  unlockVault, setVaultPassword, changeVaultPassword, migrateVaultToPassword,
+  getVaultStatus, adoptRemoteKey, cleanupCloudHistory,
 } from '../lib/api.js';
 import { loadConfig, loadPasswords } from '../lib/dataLoader.js';
 import { renderers } from '../lib/renderer.js';
@@ -93,16 +94,32 @@ async function submit() {
         return;
       }
       await migrateVaultToPassword(val);
+    } else if (mode === 'adopt') {
+      await adoptRemoteKey(activeProvider || 'quark', val);
     } else {
       const oldVal = document.getElementById('vuOld').value;
       await changeVaultPassword(oldVal, val);
+      // 评审 A2：改密码后可选清理云端历史（防旧密码泄露导致历史回读）
+      if (confirm('已切换到新库密码。是否同时清理云端历史版本？\n（所有旧版本将永久删除、不可找回；其他设备将收敛到当前版本）')) {
+        try {
+          await cleanupCloudHistory();
+          showToast('云端历史版本已清理');
+        } catch (e2) {
+          showToast('清理云端历史失败: ' + e2);
+        }
+      }
     }
     // 成功：刷新数据与设置面板
     state.vaultStatus = { format: 'v2', unlocked: true };
     await loadConfig();
     await loadPasswords();
     renderers.populateSettingsForm();
-    showToast(mode === 'create' ? '库密码已设置' : mode === 'unlock' ? '已解锁' : '库密码已修改');
+    showToast(
+      mode === 'create' ? '库密码已设置'
+      : mode === 'adopt' ? '已接管云端密码簿（本机已切换到云端钥匙体系）'
+      : mode === 'unlock' ? '已解锁'
+      : '库密码已修改',
+    );
     if (activeResolve) { activeResolve(true); activeResolve = null; }
     modalEl.classList.remove('show');
   } catch (e) {
@@ -112,24 +129,30 @@ async function submit() {
   }
 }
 
+let activeProvider = 'quark';
+
 /**
  * 打开库密码弹窗
- * @param {'create'|'unlock'|'change'|'migrate'} m 模式
- * @returns {Promise<boolean>} unlock/create/migrate 返回是否成功（change 恒 true）
+ * @param {'create'|'unlock'|'change'|'migrate'|'adopt'} m 模式
+ * @param {{provider?: string}} opts adopt 模式需传网盘标识
+ * @returns {Promise<boolean>} unlock/create/migrate/adopt 返回是否成功（change 恒 true）
  */
-export function showVaultUnlockModal(m) {
+export function showVaultUnlockModal(m, opts = {}) {
   mode = m;
+  activeProvider = opts.provider || activeProvider || 'quark';
   ensureModalDom();
   const desc = {
     create: '库密码用于加密整个密码簿，也是跨设备恢复数据的唯一凭据。',
     unlock: '本机没有缓存的解锁凭据，请输入库密码解锁密码簿（新设备首次使用也在此输入）。',
     change: '修改库密码会对整个密码簿重新加密，云端将在下次同步时更新。',
     migrate: '为 master.key 模式的密码簿设置库密码：全库重新加密，之后凭库密码即可跨设备恢复。',
+    adopt: '云端版本无法用当前库密码解密——库密码可能已在其他设备上设置或修改。输入**云端密码簿的库密码**，本机将切换到云端的钥匙体系并采用云端数据。',
   }[m];
   document.getElementById('vuTitle').textContent =
     m === 'create' ? '设置库密码'
     : m === 'unlock' ? '解锁密码簿'
     : m === 'migrate' ? '升级为库密码模式'
+    : m === 'adopt' ? '接管云端密码簿'
     : '修改库密码';
   document.getElementById('vuDesc').textContent = desc;
   document.getElementById('vuOldWrap').style.display = m === 'change' ? 'block' : 'none';

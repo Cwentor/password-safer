@@ -159,20 +159,13 @@ struct LocalSnapshot {
     bytes: Option<Vec<u8>>,
     sha: Option<String>,
     valid: bool,
-    size: usize,
 }
 
 fn snapshot(i: &SessionInputs) -> LocalSnapshot {
     let bytes = i.vault.read().ok();
     let valid = bytes.as_ref().map(|b| !b.is_empty()).unwrap_or(false);
     let sha = bytes.as_ref().map(|b| manifest::sha256_hex(b));
-    let size = bytes.as_ref().map(|b| b.len()).unwrap_or(0);
-    LocalSnapshot {
-        bytes,
-        sha,
-        valid,
-        size,
-    }
+    LocalSnapshot { bytes, sha, valid }
 }
 
 // ---------- 记账 ----------
@@ -256,6 +249,47 @@ fn push_new_head(
     })
 }
 
+/// 把任意字节以 blob + `kind:"backup"` meta 钉进远端命名空间（不抢 head、可寻址）。
+/// 冲突挂起的本地备份、legacy 迁移前的旧文件归档共用此入口。
+/// 把任意字节以 blob + `kind:"backup"` meta 钉进远端命名空间（不抢 head、可寻址）。
+/// 冲突挂起的本地备份、legacy 迁移前的旧文件归档共用此入口。
+/// blob 从给定字节经临时文件上传（不假设它等于本地密码簿文件）；
+/// backup meta 文件名加进程内序号，避免同一会话内与 head meta 同毫秒撞名。
+fn pin_bytes_as_backup(
+    i: &SessionInputs,
+    st: &SyncState,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let sha = manifest::sha256_hex(bytes);
+    let tmp = std::env::temp_dir().join(format!(
+        "ps-pin-{}-{}-{}.bin",
+        std::process::id(),
+        st.device_id,
+        unique_seq()
+    ));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写备份临时文件失败: {}", e))?;
+    let up = upload_blob(i, &tmp, &sha);
+    let _ = std::fs::remove_file(&tmp);
+    up?;
+
+    // backup meta 的 ms 加序号扰动：与本会话稍后写出的 head meta 永不重名
+    let backup_ms = i.now_ms + unique_seq() as i64;
+    let mut m = Manifest::new_head(&st.device_id, backup_ms);
+    m.kind = MetaKind::Backup;
+    m.files.insert(
+        LEGACY_FILE_NAME.to_string(),
+        FileEntry {
+            blob: sha.clone(),
+            size: bytes.len() as i64,
+            updated_at: i.now_ms,
+            deleted: false,
+        },
+    );
+    let name = manifest::new_filename(&st.device_id, backup_ms);
+    write_meta(i, &m, &name)?;
+    Ok(sha)
+}
+
 /// 冲突挂起：本地内容（若有）先以 backup meta 钉进远端命名空间，再置 pending
 fn park(
     i: &SessionInputs,
@@ -266,21 +300,7 @@ fn park(
 ) -> Result<SessionReport, String> {
     let mut backup_blob = None;
     if local.valid {
-        let sha = local.sha.clone().unwrap();
-        upload_blob(i, i.vault.path(), &sha)?;
-        let mut m = Manifest::new_head(&st.device_id, i.now_ms);
-        m.kind = MetaKind::Backup;
-        m.files.insert(
-            LEGACY_FILE_NAME.to_string(),
-            FileEntry {
-                blob: sha.clone(),
-                size: local.size as i64,
-                updated_at: i.now_ms,
-                deleted: false,
-            },
-        );
-        let name = manifest::new_filename(&st.device_id, i.now_ms);
-        write_meta(i, &m, &name)?;
+        let sha = pin_bytes_as_backup(i, st, local.bytes.as_ref().unwrap())?;
         backup_blob = Some(sha);
     }
     st.conflict_pending = Some(serde_json::json!({
@@ -300,7 +320,8 @@ fn park(
 
 // ---------- legacy 迁移 ----------
 
-/// 删除 legacy 整文件；失败置补删标记（下轮重试），不阻塞主流程
+/// 删除 legacy 整文件；失败置补删标记（下轮重试），不阻塞主流程。
+/// 调用前必须已确认 genesis head 可被 list 到（提交点先行，破坏性动作在后）。
 fn delete_legacy(i: &SessionInputs, st: &mut SyncState) {
     match i.provider.delete(i.remote_path) {
         Ok(()) => {
@@ -318,6 +339,18 @@ fn delete_legacy(i: &SessionInputs, st: &mut SyncState) {
 fn try_pending_legacy_delete(i: &SessionInputs, st: &mut SyncState) {
     if st.legacy_pending_delete {
         delete_legacy(i, st);
+    }
+}
+
+/// 确认本设备刚写入的 head meta 已可被 list 到（网盘 eventual consistency 兜底，
+/// 评审 C2：提交点先行，破坏性动作在后）
+fn confirm_head_visible(i: &SessionInputs, name: &str) -> bool {
+    match i.provider.list(&meta_dir(i.remote_path)) {
+        Ok(files) => files.iter().any(|f| f.name == name),
+        Err(e) => {
+            eprintln!("[session] 确认 head 可见性失败（按未见处理）: {}", e);
+            false
+        }
     }
 }
 
@@ -343,14 +376,27 @@ fn genesis(
             push_new_head(i, st, Vec::new(), local)
         }
         (true, true) => {
-            // 本地与 legacy 都有数据：mtime 新者先落地
+            // 本地与 legacy 都有数据：mtime 新者先落地（规格沉默处的务实裁决）
             let legacy_mtime = legacy.unwrap().mtime;
             let local_mtime = i.vault.local_mtime().unwrap_or(0);
             if legacy_mtime > local_mtime {
                 adopt_legacy(i, st)
             } else {
+                // 评审 C3：本地胜出前，先把 legacy 字节归档为可找回的 backup，
+                // 再 push genesis → 确认可见 → 删除 legacy（破坏性动作最后）
+                let legacy_bytes = i.provider.download(i.remote_path)?;
+                pin_bytes_as_backup(i, st, &legacy_bytes)?;
                 let r = push_new_head(i, st, Vec::new(), local)?;
-                delete_legacy(i, st);
+                let genesis_name = st
+                    .provider(i.provider_key)
+                    .and_then(|p| p.last_heads.first().cloned())
+                    .unwrap_or_default();
+                if confirm_head_visible(i, &genesis_name) {
+                    delete_legacy(i, st);
+                } else {
+                    st.legacy_pending_delete = true;
+                    eprintln!("[session] genesis 未确认可见，legacy 留待下轮补删");
+                }
                 i.sync_state.save(st)?;
                 Ok(SessionReport {
                     outcome: SessionOutcome::GenesisMigrated,
@@ -362,7 +408,7 @@ fn genesis(
     }
 }
 
-/// 收养 legacy：下载 → 验证 → 应用 → genesis push → 删除 legacy
+/// 收养 legacy：下载 → 验证 → 应用 → genesis push → 确认可见 → 删除 legacy
 fn adopt_legacy(i: &SessionInputs, st: &mut SyncState) -> Result<SessionReport, String> {
     let bytes = i.provider.download(i.remote_path)?;
     let sha = manifest::sha256_hex(&bytes);
@@ -371,10 +417,18 @@ fn adopt_legacy(i: &SessionInputs, st: &mut SyncState) -> Result<SessionReport, 
         bytes: Some(bytes.clone()),
         sha: Some(sha),
         valid: true,
-        size: bytes.len(),
     };
     push_new_head(i, st, Vec::new(), &local)?;
-    delete_legacy(i, st);
+    let genesis_name = st
+        .provider(i.provider_key)
+        .and_then(|p| p.last_heads.first().cloned())
+        .unwrap_or_default();
+    if confirm_head_visible(i, &genesis_name) {
+        delete_legacy(i, st);
+    } else {
+        st.legacy_pending_delete = true;
+        eprintln!("[session] genesis 未确认可见，legacy 留待下轮补删");
+    }
     i.sync_state.save(st)?;
     Ok(SessionReport {
         outcome: SessionOutcome::GenesisMigrated,
@@ -410,7 +464,21 @@ fn apply_head(
     if sha != entry.blob {
         return Err(format!("远端 blob 校验失败（期望 {}）", entry.blob));
     }
-    i.vault.replace(&bytes)?;
+    if let Err(e) = i.vault.replace(&bytes) {
+        // 本地钥解不开云端新版本：库密码可能已在其他设备更换（评审 A1）→
+        // 转冲突挂起，走"输入云端库密码接管"路径，而不是报错死循环
+        if e.contains("解密失败") {
+            let local = snapshot(i);
+            return park(
+                i,
+                st,
+                heads,
+                &local,
+                "本地无法解密云端新版本（库密码可能已在其他设备更换）",
+            );
+        }
+        return Err(e);
+    }
     set_heads(st, i.provider_key, heads);
     st.conflict_pending = None;
     i.sync_state.save(st)?;
@@ -556,21 +624,8 @@ pub fn pull_manual(i: &SessionInputs) -> Result<SessionReport, String> {
 
 /// 只写 backup meta（不置 pending）——手动下载前的自救
 fn park_backup_only(i: &SessionInputs, st: &SyncState, local: &LocalSnapshot) -> Result<(), String> {
-    let sha = local.sha.clone().ok_or("本地密码簿为空")?;
-    upload_blob(i, i.vault.path(), &sha)?;
-    let mut m = Manifest::new_head(&st.device_id, i.now_ms);
-    m.kind = MetaKind::Backup;
-    m.files.insert(
-        LEGACY_FILE_NAME.to_string(),
-        FileEntry {
-            blob: sha,
-            size: local.size as i64,
-            updated_at: i.now_ms,
-            deleted: false,
-        },
-    );
-    let name = manifest::new_filename(&st.device_id, i.now_ms);
-    write_meta(i, &m, &name)?;
+    let bytes = local.bytes.as_ref().ok_or("本地密码簿为空")?;
+    pin_bytes_as_backup(i, st, bytes)?;
     Ok(())
 }
 
@@ -987,17 +1042,22 @@ mod tests {
         assert_eq!(r.outcome, SessionOutcome::ConflictPending);
         // 本地内容未被覆盖
         assert_eq!(vault.read().unwrap(), b"local edit");
-        // 备份已钉进远端（backup meta，blob 为本地内容哈希）
+        // 备份已钉进远端（backup meta 文件名带序号，按内容查找；blob 为本地内容哈希）
         let local_sha = manifest::sha256_hex(b"local edit");
         assert!(cloud.has(&format!("{}/{}.bin", blobs_dir("/VAULT/vault.json"), local_sha)));
-        let dev = state.device_id();
-        let backup = Manifest::parse(
-            &cloud
-                .get(&format!("{}/meta_{}_{}.json", meta_dir_of(), NOW_MS + 2000, dev))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(backup.kind, MetaKind::Backup);
+        let backup_found = cloud
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| FakeCloud::parent(p) == meta_dir_of())
+            .filter_map(|(p, (b, _))| {
+                Manifest::parse(b)
+                    .ok()
+                    .map(|m| (p.clone(), m))
+            })
+            .any(|(_, m)| m.kind == MetaKind::Backup && m.files.get("vault.json").map(|e| e.blob == local_sha).unwrap_or(false));
+        assert!(backup_found, "应存在指向本地内容的 backup meta");
         // 挂起状态置位
         assert!(state.0.lock().unwrap().conflict_pending.is_some());
     }
