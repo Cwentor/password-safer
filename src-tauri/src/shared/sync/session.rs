@@ -99,15 +99,19 @@ fn blob_path(remote_path: &str, sha: &str) -> String {
 // ---------- 远端 meta 读写 ----------
 
 /// 拉取 /meta 目录全部 meta 并解析（跳过非 meta 命名与非法文件）
-fn fetch_metas(i: &SessionInputs) -> Result<Vec<(String, Manifest)>, String> {
-    let mdir = meta_dir(i.remote_path);
-    let files = i.provider.list(&mdir)?;
+/// （会话内部与冲突详情命令共用）
+pub fn fetch_metas(
+    provider: &dyn SyncProvider,
+    remote_path: &str,
+) -> Result<Vec<(String, Manifest)>, String> {
+    let mdir = meta_dir(remote_path);
+    let files = provider.list(&mdir)?;
     let mut raw = Vec::new();
     for f in files {
         if manifest::parse_filename(&f.name).is_none() {
             continue;
         }
-        let bytes = i.provider.download(&meta_path(i.remote_path, &f.name))?;
+        let bytes = provider.download(&meta_path(remote_path, &f.name))?;
         raw.push((f.name, bytes));
     }
     Ok(manifest::parse_all(&raw))
@@ -442,7 +446,7 @@ pub fn sync_auto(i: &SessionInputs) -> Result<SessionReport, String> {
         });
     }
 
-    let metas = fetch_metas(i)?;
+    let metas = fetch_metas(i.provider, i.remote_path)?;
     let heads = manifest::resolve_heads(&metas);
     let known = known_heads(&st, i.provider_key);
     let local = snapshot(i);
@@ -500,7 +504,7 @@ pub fn push_manual(i: &SessionInputs) -> Result<SessionReport, String> {
     try_pending_legacy_delete(i, &mut st);
     i.sync_state.save(&st)?;
 
-    let metas = fetch_metas(i)?;
+    let metas = fetch_metas(i.provider, i.remote_path)?;
     let heads = manifest::resolve_heads(&metas);
     let local = snapshot(i);
     if !local.valid {
@@ -528,7 +532,7 @@ pub fn pull_manual(i: &SessionInputs) -> Result<SessionReport, String> {
     try_pending_legacy_delete(i, &mut st);
     i.sync_state.save(&st)?;
 
-    let metas = fetch_metas(i)?;
+    let metas = fetch_metas(i.provider, i.remote_path)?;
     let heads = manifest::resolve_heads(&metas);
     if heads.is_empty() {
         let local = snapshot(i);

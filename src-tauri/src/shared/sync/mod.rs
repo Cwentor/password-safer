@@ -2,6 +2,7 @@ pub mod auth;
 pub mod baidu;
 pub mod engine;
 pub mod manifest;
+pub mod merge;
 pub mod quark;
 pub mod session;
 

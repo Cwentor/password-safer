@@ -589,6 +589,256 @@ fn lock_vault(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     Ok(())
 }
 
+// ========== 冲突解决（阶段 5） ==========
+
+/// 拉取远端最新 head 的密码簿数据（冲突详情与解决共用；网络 I/O，须在阻塞线程调用）
+fn fetch_winner_data(
+    provider_key: &str,
+    remote_path: &str,
+    cookie: &str,
+    crypto: &shared::crypto::Crypto,
+) -> Result<(String, shared::storage::json_store::StoreData, i64), String> {
+    use shared::sync::manifest;
+    let (provider, _validator) = shared::sync::build_provider(provider_key, cookie.to_string())?;
+    let metas = session::fetch_metas(provider.as_ref(), remote_path)?;
+    let heads = manifest::resolve_heads(&metas);
+    if heads.is_empty() {
+        return Err("远端已无任何版本".to_string());
+    }
+    let head_metas: Vec<(String, shared::sync::manifest::Manifest)> = metas
+        .iter()
+        .filter(|(n, _)| heads.contains(n))
+        .cloned()
+        .collect();
+    let (head_name, head_manifest) = manifest::newest(&head_metas)
+        .ok_or("未找到最新 head")?
+        .clone();
+    let entry = head_manifest
+        .files
+        .get("vault.json")
+        .ok_or("head meta 缺少 vault.json 条目")?;
+    if entry.deleted {
+        return Err("云端最新版本为已删除状态".to_string());
+    }
+    let bytes = provider
+        .as_ref()
+        .download(&format!("{}/blobs/{}.bin", base_of(remote_path), entry.blob))?;
+    let sha = shared::sync::manifest::sha256_hex(&bytes);
+    if sha != entry.blob {
+        return Err("远端 blob 校验失败".to_string());
+    }
+    let data = shared::storage::json_store::decode_store(&bytes, crypto)?;
+    Ok((head_name, data, head_manifest.updated_at))
+}
+
+/// legacy 密码簿路径的父目录（与 session::base_dir 一致）
+fn base_of(remote_path: &str) -> String {
+    let trimmed = remote_path.trim_start_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => format!("/{}", &trimmed[..i]),
+        None => "/".to_string(),
+    }
+}
+
+/// 冲突挂起详情：解密本地当前库与远端最新 head 的库，按记录 id 对齐供前端展示
+#[tauri::command]
+async fn get_conflict_details(
+    provider: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let database = state.database.clone();
+    let sync_state_path = state.data_dir.join("sync_state.json");
+    let provider_key = provider.clone();
+
+    let details = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        let st = SyncState::load_or_create(sync_state_path)?;
+        if st.conflict_pending.is_none() {
+            return Err("当前没有待处理的同步冲突".to_string());
+        }
+        // 取 Cookie 与远端路径（锁定时无法读取配置）
+        let (cookie, remote_path) = {
+            let g = database.lock().map_err(|e| e.to_string())?;
+            let store = g.as_ref().ok_or(LOCKED_MSG)?;
+            let cfg = store.load_config()?;
+            match provider_key.as_str() {
+                "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
+                "quark" => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
+                _ => return Err(format!("未知的同步提供者: {}", provider_key)),
+            }
+        };
+        if cookie.is_empty() {
+            return Err("尚未扫码登录，无法读取云端版本".to_string());
+        }
+
+        let g = database.lock().map_err(|e| e.to_string())?;
+        let store = g.as_ref().ok_or(LOCKED_MSG)?;
+        let crypto = store.crypto().clone_key();
+        drop(g);
+
+        let (head_name, remote_data, head_updated_at) =
+            fetch_winner_data(&provider_key, &remote_path, &cookie, &crypto)?;
+        let local_data = {
+            let g = database.lock().map_err(|e| e.to_string())?;
+            g.as_ref().ok_or(LOCKED_MSG)?.load()?
+        };
+
+        // 按 id 对齐
+        use std::collections::HashMap;
+        let local_map: HashMap<i64, &_> =
+            local_data.passwords.iter().map(|r| (r.id, r)).collect();
+        let remote_map: HashMap<i64, &_> =
+            remote_data.passwords.iter().map(|r| (r.id, r)).collect();
+
+        let only_local: Vec<_> = local_map
+            .iter()
+            .filter(|(id, _)| !remote_map.contains_key(id))
+            .map(|(_, r)| shared::storage::json_store::record_to_dto(&crypto, r))
+            .collect();
+        let only_remote: Vec<_> = remote_map
+            .iter()
+            .filter(|(id, _)| !local_map.contains_key(id))
+            .map(|(_, r)| shared::storage::json_store::record_to_dto(&crypto, r))
+            .collect();
+        let both: Vec<_> = local_map
+            .iter()
+            .filter(|(id, lr)| {
+                remote_map
+                    .get(id)
+                    .map(|rr| shared::sync::merge::records_differ(lr, rr))
+                    .unwrap_or(false)
+            })
+            .map(|(id, lr)| {
+                let rr = remote_map.get(id).unwrap();
+                serde_json::json!({
+                    "local": shared::storage::json_store::record_to_dto(&crypto, lr),
+                    "remote": shared::storage::json_store::record_to_dto(&crypto, rr),
+                    "newer": if shared::sync::merge::prefer_local(lr, rr) { "local" } else { "remote" },
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "provider": provider_key,
+            "head": head_name,
+            "head_updated_at": head_updated_at,
+            "only_local": only_local,
+            "only_remote": only_remote,
+            "both": both,
+        }))
+    })
+    .await
+    .map_err(|e| format!("任务异常: {}", e))?;
+
+    details
+}
+
+/// 应用冲突裁决：按策略/逐条选择合并两侧 → 落盘 → 强制推送为新 head（清挂起）
+#[tauri::command]
+async fn resolve_conflict(
+    provider: String,
+    strategy: String,
+    selections: serde_json::Value,
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let db_path = state.db_path.clone();
+    let database = state.database.clone();
+    let data_dir = state.data_dir.clone();
+    let provider_key = provider.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        use shared::sync::merge::{merge_vaults, Choice};
+        let sync_state_path = data_dir.join("sync_state.json");
+        let st = SyncState::load_or_create(sync_state_path.clone())?;
+        if st.conflict_pending.is_none() {
+            return Err("当前没有待处理的同步冲突".to_string());
+        }
+        let local_dirty_at = st.local_dirty_at;
+
+        // Cookie / 远端路径
+        let (cookie, remote_path) = {
+            let g = database.lock().map_err(|e| e.to_string())?;
+            let store = g.as_ref().ok_or(LOCKED_MSG)?;
+            let cfg = store.load_config()?;
+            match provider_key.as_str() {
+                "baidu" => (cfg.baidu_cookie.clone(), cfg.baidu_remote_path.clone()),
+                "quark" => (cfg.quark_cookie.clone(), cfg.quark_remote_path.clone()),
+                _ => return Err(format!("未知的同步提供者: {}", provider_key)),
+            }
+        };
+
+        // 解密远端最新 head
+        let (_head_name, remote_data, head_updated_at) = {
+            let g = database.lock().map_err(|e| e.to_string())?;
+            let store = g.as_ref().ok_or(LOCKED_MSG)?;
+            let crypto = store.crypto().clone_key();
+            drop(g);
+            fetch_winner_data(&provider_key, &remote_path, &cookie, &crypto)?
+        };
+
+        // 合并
+        let mut choices: std::collections::HashMap<i64, Choice> = std::collections::HashMap::new();
+        match strategy.as_str() {
+            "local" | "remote" => {}
+            _ => {
+                if let Some(obj) = selections.as_object() {
+                    for (k, v) in obj {
+                        if let (Ok(id), Some(c)) = (k.parse::<i64>(), v.as_str()) {
+                            if let Some(ch) = Choice::parse(c) {
+                                choices.insert(id, ch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let config_take_local = match strategy.as_str() {
+            "local" => true,
+            "remote" => false,
+            _ => local_dirty_at >= head_updated_at,
+        };
+
+        let merged = {
+            let mut g = database.lock().map_err(|e| e.to_string())?;
+            let store = g.as_mut().ok_or(LOCKED_MSG)?;
+            let local_data = store.load()?;
+            let merged = merge_vaults(local_data, remote_data, config_take_local, &choices);
+            store.save(&merged)?;
+            merged
+        };
+
+        // 强制推送（push_manual：supersedes 全部 heads，清挂起）
+        let (provider_inst, validator) = shared::sync::build_provider(&provider_key, cookie.clone())?;
+        let vault = VaultAccess { db_path, database: database.clone() };
+        let sync_state = SyncStateAccess { path: sync_state_path };
+        let report = engine::run_manual(engine::ManualInputs {
+            provider: provider_inst.as_ref(),
+            validator: Some(validator.as_ref()),
+            cookie: &cookie,
+            remote_path: &remote_path,
+            provider_key: &provider_key,
+            direction: engine::Direction::Upload,
+            vault: &vault,
+            sync_state: &sync_state,
+        });
+
+        let _ = app.emit(
+            "sync://conflict-resolved",
+            serde_json::json!({ "provider": provider_key }),
+        );
+        let msg = match report.outcome {
+            engine::Outcome::Uploaded => format!("冲突已解决：合并了 {} 条记录并已上传", merged.passwords.len()),
+            engine::Outcome::Failed(e) => format!("冲突已合并到本地，但推送失败（{}）；下次同步将重试", e),
+            _ => "冲突已解决".to_string(),
+        };
+        Ok(msg)
+    })
+    .await
+    .map_err(|e| format!("任务异常: {}", e))??;
+
+    Ok(serde_json::json!({ "success": true, "message": result }))
+}
+
 /// 读取云同步本地记账（last_sync 等展示信息；sync_state.json 不上云）
 #[tauri::command]
 fn get_sync_state(
@@ -875,6 +1125,8 @@ pub fn run() {
         get_sync_state,
         get_vault_status,
         unlock_vault,
+        get_conflict_details,
+        resolve_conflict,
         set_vault_password,
         change_vault_password,
         migrate_vault_to_password,
@@ -905,6 +1157,8 @@ pub fn run() {
         get_sync_state,
         get_vault_status,
         unlock_vault,
+        get_conflict_details,
+        resolve_conflict,
         set_vault_password,
         change_vault_password,
         migrate_vault_to_password,

@@ -44,9 +44,9 @@ impl Default for StoreData {
     }
 }
 
-/// 解码并验证密码簿字节（正常读取、.bak 回退、replace_raw 共用）。
+/// 解码并验证密码簿字节（正常读取、.bak 回退、replace_raw、冲突详情共用）。
 /// 双格式：v2 自描述信封（'{' 开头）或 v1 base64（master.key 时代）。
-fn decode_store(bytes: &[u8], crypto: &Crypto) -> Result<StoreData, String> {
+pub fn decode_store(bytes: &[u8], crypto: &Crypto) -> Result<StoreData, String> {
     if VaultEnvelope::looks_like_envelope(bytes) {
         let env: VaultEnvelope = serde_json::from_slice(bytes)
             .map_err(|e| format!("v2 信封解析失败: {}", e))?;
@@ -66,6 +66,25 @@ pub fn vault_format(db_path: &Path) -> &'static str {
         Ok(bytes) if VaultEnvelope::looks_like_envelope(&bytes) => "v2",
         Ok(_) => "v1",
         Err(_) => "none",
+    }
+}
+
+/// 记录 → DTO（密码字段按给定加密器解密）；本地与远端记录映射共用
+pub fn record_to_dto(crypto: &Crypto, r: &PasswordRecord) -> PasswordDto {
+    let password = crypto.decrypt(&r.password_encrypted).unwrap_or_default();
+    PasswordDto {
+        id: r.id,
+        name: r.name.clone(),
+        icon: r.icon.clone(),
+        url: r.url.clone(),
+        username: r.username.clone(),
+        password,
+        tags: r.tags.clone(),
+        notes: r.notes.clone(),
+        favorite: r.favorite,
+        strength: r.strength,
+        created: r.created.clone(),
+        last_used: r.last_used.clone(),
     }
 }
 
@@ -285,23 +304,14 @@ impl JsonStore {
         }
     }
 
+    /// 当前加密器（冲突详情解密远端侧用）
+    pub fn crypto(&self) -> &Crypto {
+        &self.crypto
+    }
+
     /// 将 PasswordRecord 转换为 PasswordDto（解密密码字段）
     fn record_to_dto(&self, r: &PasswordRecord) -> PasswordDto {
-        let password = self.crypto.decrypt(&r.password_encrypted).unwrap_or_default();
-        PasswordDto {
-            id: r.id,
-            name: r.name.clone(),
-            icon: r.icon.clone(),
-            url: r.url.clone(),
-            username: r.username.clone(),
-            password,
-            tags: r.tags.clone(),
-            notes: r.notes.clone(),
-            favorite: r.favorite,
-            strength: r.strength,
-            created: r.created.clone(),
-            last_used: r.last_used.clone(),
-        }
+        record_to_dto(&self.crypto, r)
     }
 
     /// 获取所有密码（已解密），按 name 不区分大小写排序

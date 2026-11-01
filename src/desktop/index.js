@@ -13,6 +13,7 @@ import { showMainWindow } from '../shared/lib/api.js';
 import { showToast } from '../shared/components/Toast.js';
 import { populateSettingsForm, listenSyncEvents } from '../shared/components/SettingsModal.js';
 import { ensureVaultAccessible } from '../shared/components/VaultUnlockModal.js';
+import { initConflictWatcher } from '../shared/components/ResolveConflictModal.js';
 import {
   mountSharedOverlays, registerCoreRenderers, initSharedComponents,
   bindOverlayEscape, getDetailHTML,
@@ -68,6 +69,7 @@ async function init() {
     if (accessible) await loadPasswords();
     populateSettingsForm();
     listenSyncEvents();
+    initConflictWatcher();
   } catch (e) {
     showToast('初始化失败: ' + e);
   } finally {

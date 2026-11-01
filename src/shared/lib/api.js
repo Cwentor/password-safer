@@ -243,6 +243,26 @@ export function onSyncRestored(handler) {
   return tauriEvent.listen('sync://restored', handler);
 }
 
+// ========== 冲突解决 ==========
+
+export function getConflictDetails(provider) {
+  return invoke('get_conflict_details', { provider });
+}
+
+export function resolveConflict(provider, strategy, selections) {
+  return invoke('resolve_conflict', { provider, strategy, selections });
+}
+
+export function onSyncConflict(handler) {
+  if (!tauriEvent || !tauriEvent.listen) return () => {};
+  return tauriEvent.listen('sync://conflict', handler);
+}
+
+export function onSyncConflictResolved(handler) {
+  if (!tauriEvent || !tauriEvent.listen) return () => {};
+  return tauriEvent.listen('sync://conflict-resolved', handler);
+}
+
 export function onBaiduLoginSuccess(handler) {
   if (!tauriEvent || !tauriEvent.listen) return () => {};
   return tauriEvent.listen('baidu-login-success', handler);

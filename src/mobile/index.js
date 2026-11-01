@@ -17,6 +17,7 @@ import { renderPasswordList, renderTagsCloud, countTags } from '../shared/compon
 import { openAddModal } from '../shared/components/AddModal.js';
 import { openSettingsModal, populateSettingsForm, listenSyncEvents } from '../shared/components/SettingsModal.js';
 import { ensureVaultAccessible } from '../shared/components/VaultUnlockModal.js';
+import { initConflictWatcher } from '../shared/components/ResolveConflictModal.js';
 import {
   mountSharedOverlays, registerCoreRenderers, initSharedComponents,
   bindOverlayEscape, getDetailHTML,
@@ -81,6 +82,7 @@ async function doInit() {
     if (accessible) await loadPasswords();
     populateSettingsForm();
     listenSyncEvents();
+    initConflictWatcher();
   } catch (e) {
     showToast('初始化失败: ' + e);
   } finally {
