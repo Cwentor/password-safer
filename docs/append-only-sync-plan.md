@@ -1,6 +1,6 @@
 # 追加式云同步 — 远端不可覆盖、仅允许新增的设计与实施计划
 
-> 日期：2026-11-01 · 分支 `feat/append-only-sync` · 状态：**三项待决已拍板（见 §五），待开工**
+> 日期：2026-11-01 · 分支 `feat/append-only-sync` · 状态：**拍板完成（§五；key 方案当日二次修订为公告自管），待开工**
 > 背景约束：远端网盘（夸克 / 百度）限制为**不能覆盖重写，只能上传全新文件**；
 > 目标：任意新接入客户端一键拉到全量最新状态，多端并发可收敛、历史可追溯。
 > 前置阅读：现有同步为 vault.json 整文件 mtime 新者覆盖（`engine.rs::decide_direction`），
@@ -13,7 +13,7 @@
 | 1 | `upload` 语义 = 覆盖远端：夸克先 `delete_files` 再传新（`quark.rs:614-623`）；百度 `rtype=3` 覆盖语义（`baidu.rs:161`） | 直接违反"不可覆盖"约束 | trait 语义改为**仅新增**；文件名内容寻址/时间戳+设备号，天然不撞名 |
 | 2 | 方向判定靠 mtime 比较（`engine.rs:25-51`）；百度 `remote_file_mtime` 未实现（trait 默认 Err）→ 百度自动同步每轮必报错 | mtime 不再是可靠的"新"信号 | 判定改为 **head 对比**（manifest 快照链），删掉 `remote_file_mtime`，消灭该 bug |
 | 3 | `last_sync` 记账写在 AppConfig 里 = 在 vault.json 内部（`models.rs:42,49`），每次同步后写回（`lib.rs:175-183`）→ 本地 mtime 永远变新 → **每周期重复上传** | 灾难级放大：每周期新增一个 blob + 一个 meta，远端无限膨胀 | 记账搬出 vault.json → 本地 `sync_state.json`（阶段 0，**硬前提**） |
-| 4 | 新客户端拉取 = 下载 vault.json，但 master.key 不上云 → 拉到也解不开 | "拉到最新"只完成一半 | **已拍板上云**：口令包裹方案，阶段 4（§2.8） |
+| 4 | 新客户端拉取 = 下载 vault.json，但 master.key 不上云 → 拉到也解不开 | "拉到最新"只完成一半 | **拍板不上云**：首启密钥公告 + 新设备导入引导（阶段 4，§2.8） |
 | 5 | `JsonStore::open` 解密失败直接拒绝启动，不回退 `.bak` | 与本方案无直接耦合，但新方案依赖本地 vault 可用 | 阶段 0 顺手修 |
 | 6 | 测试接缝完善（`SyncProvider`/`VaultIo`/`QrAuthenticator` 三替身，engine 内联测试） | — | 沿用此风格，新增 FakeAppendOnlyProvider |
 
@@ -65,20 +65,20 @@ meta 为明文 JSON，**不含任何明文数据**（blob 名是密文哈希）�
   "device_id": "a1b2c3d4",
   "supersedes": ["meta_1729999999000_e5f6.json"],
   "files": {
-    "vault.json":  { "blob": "<sha256hex>", "size": 12345, "updated_at": 1730000000000, "deleted": false },
-    "master.key":  { "blob": "<sha256hex>", "size": 321,   "updated_at": 1730000000000, "deleted": false }
+    "vault.json": { "blob": "<sha256hex>", "size": 12345, "updated_at": 1730000000000, "deleted": false }
   }
 }
 ```
 
-`files` 用语义路径作 key：`vault.json` 之外，`master.key` 存放**口令包裹后的密钥**（§2.8），
-未来可扩展附件、导出包。`kind` 取值 `"head"`（默认）| `"backup"`（冲突挂起备份，不参与 head 解析）。
+`files` 用语义路径作 key，未来可扩展附件、导出包（master.key 已拍板不上云，见 §2.8）。
+`kind` 取值 `"head"`（默认）| `"backup"`（冲突挂起备份，不参与 head 解析）。
 
 ### 2.4 本地新增 sidecar：`sync_state.json`（vault.json 同目录，不上云）
 
 ```json
 {
   "device_id": "a1b2c3d4",
+  "key_announced": false,
   "last_heads": { "quark": ["meta_....json"], "baidu": [] },
   "local_dirty_at": 1730000000000,
   "last_sync": { "quark": "2026-11-01 12:00", "baidu": "" },
@@ -88,6 +88,7 @@ meta 为明文 JSON，**不含任何明文数据**（blob 名是密文哈希）�
 ```
 
 - `device_id`：首启随机生成，标识本设备（meta 命名与显示排序用）。
+- `key_announced`：密钥公告是否已确认（§2.8）。
 - `local_dirty_at`：`JsonStore::save`（用户写路径）时刷新；`replace_raw`（同步写路径）不刷新——
   区分"用户改过"与"同步落下"；冲突 UI 用它标注哪侧较新。
 - `last_sync` 从 AppConfig 迁来，前端展示改走新 command（阶段 0）。
@@ -146,28 +147,32 @@ pub trait SyncProvider: Send + Sync {
 - **纪律约束：全设备一起升级**。legacy 删除后，未升级的旧客户端会因"远端无 vault.json"重新上传，
   而新客户端只看 meta，两端静默分叉。个人项目可控，写进冒烟清单。
 
-### 2.8 master.key 上云（拍板：上云；实现为口令包裹，明文 key 永不出本地）
+### 2.8 master.key 自管（拍板修订：不上云，首启公告 + 自行保存）
 
-**包裹方案**
-- 用户在设置里启用"密钥上云"并设置**云解锁口令**；口令不落盘、不上云、不持久化，仅包裹/解锁时使用。
-- KDF：Argon2id（`argon2` crate，纯 Rust），随机 16 字节 salt，参数 m=64MiB / t=3 / p=1（常量可调）；
-  派生密钥 AES-256-GCM 包裹 master.key。
-- 包裹件 blob 内容为自描述 JSON：`{ "v":1, "kdf":{algo,salt_b64,m,t,p}, "nonce", "ct_b64" }`，
-  整体 sha256 命名为 blob；meta 的 `files["master.key"]` 只存指针。
-- **换口令** = unwrap(旧口令) → wrap(新口令) → 新 blob → 新 meta；**撤销上云** = files 条目 `deleted: true`。
-- 未设置口令 = 不上云，行为与现状一致（新设备手动拷 key）。
+**密钥公告（首次运行，key 生成立即弹出）**
+- `Crypto::from_key_file` 走到"新建密钥"分支的那一刻，前端弹出**密钥公告**模态框：
+  - 展示 key 的 Base64 形式（32 字节 → 44 字符，等宽大字号，截图友好）与 key 文件所在路径；
+  - 「复制」按钮（走现有 clipboard 模块）+「打开所在文件夹」；
+  - 必须勾选「我已妥善保存」才可关闭；确认状态记入 `sync_state.key_announced`；
+  - 提示用户自行保存到密码管理器 / 纸面 / 截图，并在文案中写明"丢失密钥且原设备损坏 = 数据无法恢复"。
+- **存量用户**（升级前已生成过 key、从未见过公告）：设置面板新增「查看 / 导出密钥」入口
+  （设置了主密码则先验证，沿用主密码仅前端的现状）；升级后首次启动一次性提醒"请备份你的密钥"。
 
-**新设备引导流程**（本地无 master.key 或本地 vault 为全新空库）
-1. 先拉 meta（不动本地密钥，避免误生成第二把钥）；
-2. 云端有 head 且 `files["master.key"]` 有效 → 弹云解锁口令框 → unwrap 成功 → 保存为本地 master.key
-   → 正常 pull 应用 vault；
-3. 云端有 head 但无包裹件 → 引导手动导入 master.key 文件；保留"以本机为准强制上云"入口
-   （force push genesis，云端旧 head 仍可从 blobs 找回）；
-4. 云端无 head → 正常首装。
+**新设备导入引导（本地解不开云端库时）**
+1. 同步拉到云端 vault blob → `replace_raw` 验密失败（本地 key 是首启自动生成的空库钥）→
+   不应用、不清本地数据，置"待导入密钥"状态；
+2. 弹**导入引导**：粘贴 Base64 密钥 或 选择 key 文件；
+3. 导入验证：Base64 解码须恰为 32 字节，且**能成功解密云端 vault** 才接收——错误密钥直接拒绝；
+4. 验证通过：替换本地 key 文件 → 丢弃本地空库（首启自动生成、无用户数据）→ 重开 store →
+   应用云端 vault，后续同步正常。
+- 「以本机为准强制上云」入口保留（云端有数据但用户想以本机重开）：force push genesis，
+  云端旧 head 仍可从 blobs 找回。
+- **边界情形**：新设备先建库后绑盘、绑定后发现云端有数据且本地已有输入——先解密暂存本地库再换钥，
+  随后转入冲突解决 UI（§2.9）让用户选本地/云端/合并，避免静默丢失。启动顺序不动
+  （先本地 key+空库，绑定后首个同步周期进入导入/冲突路径）。
 
-**边界情形**：新设备先建库后绑盘、绑定后发现云端有数据且本地已有输入——先解密暂存本地库再换钥，
-随后转入冲突解决 UI（§2.9）让用户选本地/云端/合并，避免静默丢失。启动顺序不动
-（先本地 key+空库，绑定后首个同步周期进入引导/冲突路径）。
+**残余风险（写明，属拍板取舍）**：key 不上云、责任完全在用户——原设备损坏 + key 丢失 = 数据永久丢失；
+公告解决"不知道要保存"，不解决"保存后丢失"。与"零账号、数据主权"定位一致。
 
 ### 2.9 冲突解决 UI 与记录级合并（拍板：v2 用户裁决）
 
@@ -221,13 +226,15 @@ pub trait SyncProvider: Send + Sync {
 - FakeAppendOnlyProvider（内存 HashMap，upload 撞名即 Err、delete 可用）覆盖 §2.6/2.7/2.9 挂起路径与崩溃序列。
 - 验证：cargo test（新增 ≥15 用例）。
 
-### 阶段 4：master.key 口令包裹上云
-- `crypto.rs`：Argon2id KDF + `wrap_key` / `unwrap_key`（自描述 JSON 格式）。
-- session：`files["master.key"]` 条目的 push/pull/换口令/撤销；新设备引导流（§2.8 四分支）。
-- 命令与 UI：`set_cloud_passphrase` / `change_cloud_passphrase` / `cloud_unlock`；
-  `SettingsModal` 增加密钥上云设置区；新设备解锁弹框；"以本机为准强制上云"入口。
-- 验证：cargo test（wrap/unwrap 往返、错口令拒绝、换口令后旧包裹件失效）；
-  手工冒烟"新设备扫码 → 输口令 → 全量数据可用"。
+### 阶段 4：密钥公告 + 新设备导入引导
+- `crypto.rs`：`from_key_file` 拆出"新建密钥"信号（返回枚举或标志），供首启触发公告。
+- 命令：`get_key_announcement`（Base64 + 路径 + 是否已确认）、`confirm_key_saved`、
+  `get_master_key`（设置里查看/复制用）、`import_master_key`（粘贴/文件；先验云端库再替换 key 并重开 store，
+  `AppState` 的 `Arc<Mutex<JsonStore>>` 需支持重开）。
+- 前端：`KeyAnnouncementModal`（首启强制公告）、`ImportKeyModal`（新设备引导）、
+  `SettingsModal` 密钥区（查看/导出 + 升级后一次性备份提醒）。
+- 验证：cargo test（导入验证：错格式拒绝、错误密钥拒绝、正确密钥重开成功）；
+  手工冒烟"新设备扫码 → 粘贴密钥 → 全量数据可用"、"首启公告强制确认后才能进入主界面"。
 
 ### 阶段 5：冲突解决 UI + 记录级合并
 - `merge_vaults` 纯函数（含测试：并集、双 id 差异按选择、config 取新侧、删除复活语义）。
@@ -238,7 +245,7 @@ pub trait SyncProvider: Send + Sync {
 ### 阶段 6：接线、前端与总冒烟
 - `lib.rs` 的 `sync_now` / 调度循环 / `apply_sync_report` 换用 session；`sync://conflict` 事件。
 - 总冒烟清单：单端 push→pull、双端同时改（挂起 → 裁决 → 再同步收敛）、
-  新设备口令解锁、换口令后另一设备拉取仍可解、legacy 迁移且旧文件已删、
+  首启密钥公告强制确认、新设备粘贴密钥导入成功、导入错误密钥被拒、legacy 迁移且旧文件已删、
   断网中断 push 后重试、**全设备同版本升级纪律**、百度自动同步连续两轮无报错（修问题①的验收）。
 
 ## 四、明确不做（本期）
@@ -252,6 +259,6 @@ pub trait SyncProvider: Send + Sync {
 
 | 待决项 | 决定 | 落地 |
 |---|---|---|
-| master.key 上云 | **上云** | 按 §2.8 口令包裹实现：明文 key 永不出本地，云端只有 Argon2id 包裹件；未设口令不上云 |
+| master.key 上云 | **不上云，公告自管**（当日二次拍板：放弃口令包裹方案） | §2.8：首启密钥公告（Base64 展示 + 复制，强制勾选"已妥善保存"）+ 新设备导入引导（粘贴/文件，能解开云端库才接收）+ 设置面板查看/导出 |
 | legacy 远端 vault.json | **删除** | §2.7：genesis meta 确认可 list 后删除；失败补删重试；全设备一起升级 |
 | 冲突交互 | **v2 用户裁决** | §2.9：引擎只挂起不裁决，ResolveConflictModal 三选 + 逐条改选，含记录级合并 |
