@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::shared::crypto::Crypto;
+use crate::shared::crypto::{self, Crypto, KdfParams, VaultEnvelope};
 use crate::shared::models::{calculate_strength, AppConfig, PasswordDto, PasswordInput};
 
 /// JSON 文件存储的完整数据
@@ -44,33 +44,56 @@ impl Default for StoreData {
     }
 }
 
-/// 解码并验证密码簿字节（正常读取与 .bak 回退共用）
-/// 文件内容是 base64 字符串（crypto.encrypt 的输出）
+/// 解码并验证密码簿字节（正常读取、.bak 回退、replace_raw 共用）。
+/// 双格式：v2 自描述信封（'{' 开头）或 v1 base64（master.key 时代）。
 fn decode_store(bytes: &[u8], crypto: &Crypto) -> Result<StoreData, String> {
+    if VaultEnvelope::looks_like_envelope(bytes) {
+        let env: VaultEnvelope = serde_json::from_slice(bytes)
+            .map_err(|e| format!("v2 信封解析失败: {}", e))?;
+        let json_str = crypto.decrypt_envelope(&env)?;
+        return serde_json::from_str(&json_str)
+            .map_err(|e| format!("反序列化 StoreData 失败: {}", e));
+    }
     let encoded = String::from_utf8(bytes.to_vec())
         .map_err(|_| "vault.json 不是有效的 UTF-8".to_string())?;
     let json_str = crypto.decrypt(&encoded)?;
     serde_json::from_str(&json_str).map_err(|e| format!("反序列化 StoreData 失败: {}", e))
 }
 
+/// 探测密码簿格式（启动流程决定走 master.key 还是库密码路径）
+pub fn vault_format(db_path: &Path) -> &'static str {
+    match std::fs::read(db_path) {
+        Ok(bytes) if VaultEnvelope::looks_like_envelope(&bytes) => "v2",
+        Ok(_) => "v1",
+        Err(_) => "none",
+    }
+}
+
 /// 加密 JSON 文件存储
 pub struct JsonStore {
     db_path: PathBuf,
     crypto: Crypto,
+    /// v2 信封模式（库密码派生钥）；false = v1 master.key 模式
+    envelope_mode: bool,
+    /// v2 模式的 KDF 参数（随库写进信封头）
+    kdf_params: Option<KdfParams>,
     /// 用户写路径回调（save 成功后触发，用于刷新同步记账的 local_dirty_at；
     /// 同步写路径 replace_raw 不经过 save，不触发——这是区分"用户改过"与"同步落下"的关键）
     on_user_save: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl JsonStore {
-    /// 打开或创建 JSON 存储
-    /// 若文件不存在则创建空 StoreData 并保存
-    /// 若文件解密失败，尝试用 .bak 回退（write_atomic 每次保存前都会备份上一版）
-    /// 回退也失败则报错
+    /// v1 模式打开（master.key 时代）：文件不存在则创建空库；
+    /// 解密失败尝试 .bak 回退；遇到 v2 文件则报错（应走库密码路径）
     pub fn open(db_path: PathBuf, crypto: Crypto) -> Result<Self, String> {
+        if db_path.exists() && vault_format(&db_path) == "v2" {
+            return Err("密码簿已是库密码加密格式，请输入库密码解锁".to_string());
+        }
         let store = JsonStore {
             db_path,
             crypto,
+            envelope_mode: false,
+            kdf_params: None,
             on_user_save: None,
         };
         // 如果文件不存在，创建空 StoreData 并保存
@@ -86,6 +109,75 @@ impl JsonStore {
             }
         }
         Ok(store)
+    }
+
+    /// v2 模式打开：解析信封头 → 派生密钥 → 验证解密。
+    /// 返回 (store, 派生钥)（派生钥供本机凭据库缓存）
+    pub fn open_with_password(db_path: PathBuf, password: &str) -> Result<(Self, [u8; 32]), String> {
+        let bytes = std::fs::read(&db_path)
+            .map_err(|e| format!("读取 vault.json 失败: {}", e))?;
+        let env: VaultEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|_| "密码簿不是 v2 库密码加密格式".to_string())?;
+        let key = crypto::derive_key(password, &env.kdf)?;
+        let crypto = Crypto::from_key_bytes(key);
+        let store = JsonStore {
+            db_path,
+            crypto,
+            envelope_mode: true,
+            kdf_params: Some(env.kdf.clone()),
+            on_user_save: None,
+        };
+        store.load().map_err(|e| format!("库密码解锁失败: {}", e))?;
+        eprintln!("[json_store] vault.json 已用库密码解锁");
+        Ok((store, key))
+    }
+
+    /// v2 模式建库（首启）：生成 KDF 参数 → 派生 → 写入空库。
+    /// 返回 (store, 派生钥)
+    pub fn create_with_password(db_path: PathBuf, password: &str) -> Result<(Self, [u8; 32]), String> {
+        let params = KdfParams::generate();
+        let key = crypto::derive_key(password, &params)?;
+        let crypto = Crypto::from_key_bytes(key);
+        let store = JsonStore {
+            db_path,
+            crypto,
+            envelope_mode: true,
+            kdf_params: Some(params),
+            on_user_save: None,
+        };
+        store.save(&StoreData::default())?;
+        eprintln!("[json_store] 创建库密码加密的空 vault.json: {:?}", store.db_path);
+        Ok((store, key))
+    }
+
+    /// 换库密码：旧钥解密全库（含密码字段）→ 新参数新钥重加密 → 原子写。
+    /// 返回新派生钥（缓存更新用）。任何一步失败都不动现有文件。
+    pub fn re_encrypt(&mut self, new_password: &str) -> Result<[u8; 32], String> {
+        if !self.envelope_mode {
+            return Err("v1 密码簿请先升级为库密码模式".to_string());
+        }
+        let mut data = self.load()?;
+        let params = KdfParams::generate();
+        let new_key = crypto::derive_key(new_password, &params)?;
+        let new_crypto = Crypto::from_key_bytes(new_key);
+
+        // 密码字段逐条换钥（旧钥解不出来即中止，不动文件）
+        for record in &mut data.passwords {
+            let plain = self
+                .crypto
+                .decrypt(&record.password_encrypted)
+                .map_err(|e| format!("换钥中止：字段解密失败（{}）", e))?;
+            record.password_encrypted = new_crypto.encrypt(&plain)?;
+        }
+
+        let old_crypto = std::mem::replace(&mut self.crypto, new_crypto);
+        self.kdf_params = Some(params);
+        if let Err(e) = self.save(&data) {
+            // 回滚内存态（文件未被写坏：save 原子失败即保持旧内容）
+            self.crypto = old_crypto;
+            return Err(e);
+        }
+        Ok(new_key)
     }
 
     /// 主文件解密失败时尝试从 .bak 恢复：先验证 .bak 可解密可解析，再原子覆盖主文件
@@ -116,12 +208,22 @@ impl JsonStore {
         decode_store(&bytes, &self.crypto)
     }
 
-    /// 加密并写入 JSON 文件
+    /// 加密并写入 JSON 文件（v2 信封 / v1 base64 按当前模式）
     pub fn save(&self, data: &StoreData) -> Result<(), String> {
         let json_str = serde_json::to_string(data)
             .map_err(|e| format!("序列化 StoreData 失败: {}", e))?;
-        let encoded = self.crypto.encrypt(&json_str)?;
-        self.write_atomic(encoded.as_bytes())?;
+        let bytes: Vec<u8> = if self.envelope_mode {
+            let params = self
+                .kdf_params
+                .clone()
+                .ok_or_else(|| "v2 模式缺少 KDF 参数".to_string())?;
+            let env = self.crypto.encrypt_envelope(&json_str, &params)?;
+            serde_json::to_vec_pretty(&env).map_err(|e| format!("序列化信封失败: {}", e))?
+        } else {
+            let encoded = self.crypto.encrypt(&json_str)?;
+            encoded.into_bytes()
+        };
+        self.write_atomic(&bytes)?;
         if let Some(cb) = &self.on_user_save {
             cb();
         }
@@ -143,16 +245,17 @@ impl JsonStore {
 
     /// 用外部内容整体替换密码簿（云同步下载、导入共用此单一入口）。
     /// 先验证内容可解密、可解析，验证不过则不动现有文件。
+    /// 跨版本内容（如 v1 云端字节落入 v2 本地）按当前模式重新编码落盘；
+    /// 同格式内容原样写入（与云端字节一致，保住内容寻址去重）。
     pub fn replace_raw(&self, bytes: &[u8]) -> Result<(), String> {
-        let encoded = String::from_utf8(bytes.to_vec())
-            .map_err(|_| "新内容不是有效的 UTF-8 文本".to_string())?;
-        let json_str = self
-            .crypto
-            .decrypt(&encoded)
+        let data = decode_store(bytes, &self.crypto)
             .map_err(|e| format!("新内容解密失败（文件可能已损坏或不是本应用导出）: {}", e))?;
-        let _: StoreData = serde_json::from_str(&json_str)
-            .map_err(|e| format!("新内容无法解析为密码簿结构: {}", e))?;
-        self.write_atomic(bytes)
+        let same_format = self.envelope_mode == VaultEnvelope::looks_like_envelope(bytes);
+        if same_format {
+            self.write_atomic(bytes)
+        } else {
+            self.save(&data)
+        }
     }
 
     /// 将 PasswordRecord 转换为 PasswordDto（解密密码字段）
@@ -457,6 +560,99 @@ mod tests {
         let bytes = std::fs::read(&store.db_path).unwrap();
         store.replace_raw(&bytes).unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn derive_key_deterministic() {
+        let p1 = KdfParams::generate();
+        let k1a = crypto::derive_key("密码12345", &p1).unwrap();
+        let k1b = crypto::derive_key("密码12345", &p1).unwrap();
+        assert_eq!(k1a, k1b);
+        // 同密码不同盐 → 不同钥
+        let p2 = KdfParams::generate();
+        let k2 = crypto::derive_key("密码12345", &p2).unwrap();
+        assert_ne!(k1a, k2);
+        // 不同密码不同钥
+        let k3 = crypto::derive_key("另一些字", &p1).unwrap();
+        assert_ne!(k1a, k3);
+    }
+
+    #[test]
+    fn envelope_roundtrip_and_wrong_key_rejected() {
+        let params = KdfParams::generate();
+        let c1 = Crypto::from_key_bytes(crypto::derive_key("正确的库密码", &params).unwrap());
+        let env = c1.encrypt_envelope("{\"x\":1}", &params).unwrap();
+        let bytes = serde_json::to_vec(&env).unwrap();
+        assert!(VaultEnvelope::looks_like_envelope(&bytes));
+        assert_eq!(c1.decrypt_envelope(&env).unwrap(), "{\"x\":1}");
+        // 错误钥匙解不开
+        let params2 = KdfParams::generate();
+        let c2 = Crypto::from_key_bytes(crypto::derive_key("别的密码", &params2).unwrap());
+        assert!(c2.decrypt_envelope(&env).is_err());
+    }
+
+    #[test]
+    fn v2_create_insert_reopen_roundtrip() {
+        let dir = temp_dir("v2-roundtrip");
+        let db_path = dir.join("vault.json");
+
+        let (store, _key) = JsonStore::create_with_password(db_path.clone(), "库密码12345").unwrap();
+        store.insert(&sample_input("站点A", "abc123456")).unwrap();
+        drop(store);
+
+        let (store2, _) = JsonStore::open_with_password(db_path.clone(), "库密码12345").unwrap();
+        let all = store2.get_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].password, "abc123456");
+
+        // 错误密码被拒
+        assert!(JsonStore::open_with_password(db_path, "错误密码000").is_err());
+    }
+
+    #[test]
+    fn v2_re_encrypt_rotates_all_keys() {
+        let dir = temp_dir("v2-rekey");
+        let db_path = dir.join("vault.json");
+
+        let (store, _old_key) =
+            JsonStore::create_with_password(db_path.clone(), "旧密码12345").unwrap();
+        store.insert(&sample_input("站点A", "abc123456")).unwrap();
+        drop(store);
+
+        let (mut store, new_key) =
+            JsonStore::open_with_password(db_path.clone(), "旧密码12345").unwrap();
+        // 同密码 + 同盐 → 派生钥必然相同（这正是跨设备凭密码可解的根据）
+        let new_key2 = store.re_encrypt("新密码67890").unwrap();
+        assert_ne!(new_key, new_key2);
+        // 新钥下数据完好（含字段级换钥）
+        assert_eq!(store.get_all().unwrap()[0].password, "abc123456");
+        drop(store);
+
+        // 旧密码打不开，新密码可以
+        assert!(JsonStore::open_with_password(db_path.clone(), "旧密码12345").is_err());
+        let (store3, _) = JsonStore::open_with_password(db_path, "新密码67890").unwrap();
+        assert_eq!(store3.get_all().unwrap()[0].password, "abc123456");
+    }
+
+    #[test]
+    fn v2_store_rejects_foreign_format_bytes() {
+        // v1 库不能用库密码路径打开
+        let (_dir, v1_store) = open_store("v1-for-v2");
+        v1_store.insert(&sample_input("旧设备数据", "abc123456")).unwrap();
+        let v1_bytes = std::fs::read(&v1_store.db_path).unwrap();
+        assert!(JsonStore::open_with_password(v1_store.db_path.clone(), "任何密码000").is_err());
+
+        // v1 字节由 master.key 加密，v2 派生钥必然解不开：
+        // replace_raw 干净报错且不动本地文件（v1→v2 只能经本机迁移换钥，不能靠同步吸收）
+        let dir = temp_dir("v2-cross");
+        let db_path = dir.join("vault.json");
+        let (store, _) = JsonStore::create_with_password(db_path, "库密码12345").unwrap();
+        store.insert(&sample_input("本机数据", "xyz987654")).unwrap();
+        let before = std::fs::read(&store.db_path).unwrap();
+
+        assert!(store.replace_raw(&v1_bytes).is_err());
+        assert_eq!(before, std::fs::read(&store.db_path).unwrap());
+        assert_eq!(store.get_all().unwrap().len(), 1);
     }
 
     #[test]
