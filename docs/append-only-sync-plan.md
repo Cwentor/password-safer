@@ -1,6 +1,6 @@
 # 追加式云同步 — 远端不可覆盖、仅允许新增的设计与实施计划
 
-> 日期：2026-11-01 · 分支 `feat/append-only-sync` · 状态：**计划待评审，未开工**
+> 日期：2026-11-01 · 分支 `feat/append-only-sync` · 状态：**三项待决已拍板（见 §五），待开工**
 > 背景约束：远端网盘（夸克 / 百度）限制为**不能覆盖重写，只能上传全新文件**；
 > 目标：任意新接入客户端一键拉到全量最新状态，多端并发可收敛、历史可追溯。
 > 前置阅读：现有同步为 vault.json 整文件 mtime 新者覆盖（`engine.rs::decide_direction`），
@@ -11,9 +11,9 @@
 | # | 现状 | 追加式远端下的问题 | 本计划的处置 |
 |---|---|---|---|
 | 1 | `upload` 语义 = 覆盖远端：夸克先 `delete_files` 再传新（`quark.rs:614-623`）；百度 `rtype=3` 覆盖语义（`baidu.rs:161`） | 直接违反"不可覆盖"约束 | trait 语义改为**仅新增**；文件名内容寻址/时间戳+设备号，天然不撞名 |
-| 2 | 方向判定靠 mtime 比较（`engine.rs:25-51`）；百度 `remote_file_mtime` 未实现（trait 默认 Err）→ 百度自动同步每轮必报错 | mtime 不再是可靠的"新"信号 | 判定改为 **head 对比**（manifest 快照链），顺手删掉 `remote_file_mtime`，消灭该 bug |
+| 2 | 方向判定靠 mtime 比较（`engine.rs:25-51`）；百度 `remote_file_mtime` 未实现（trait 默认 Err）→ 百度自动同步每轮必报错 | mtime 不再是可靠的"新"信号 | 判定改为 **head 对比**（manifest 快照链），删掉 `remote_file_mtime`，消灭该 bug |
 | 3 | `last_sync` 记账写在 AppConfig 里 = 在 vault.json 内部（`models.rs:42,49`），每次同步后写回（`lib.rs:175-183`）→ 本地 mtime 永远变新 → **每周期重复上传** | 灾难级放大：每周期新增一个 blob + 一个 meta，远端无限膨胀 | 记账搬出 vault.json → 本地 `sync_state.json`（阶段 0，**硬前提**） |
-| 4 | 新客户端拉取 = 下载 vault.json，但 master.key 不上云 → 拉到也解不开 | 新方案只解决"拉到最新"，不解决"解得开" | 列为待决问题 §五.1，本期不动 |
+| 4 | 新客户端拉取 = 下载 vault.json，但 master.key 不上云 → 拉到也解不开 | "拉到最新"只完成一半 | **已拍板上云**：口令包裹方案，阶段 4（§2.8） |
 | 5 | `JsonStore::open` 解密失败直接拒绝启动，不回退 `.bak` | 与本方案无直接耦合，但新方案依赖本地 vault 可用 | 阶段 0 顺手修 |
 | 6 | 测试接缝完善（`SyncProvider`/`VaultIo`/`QrAuthenticator` 三替身，engine 内联测试） | — | 沿用此风格，新增 FakeAppendOnlyProvider |
 
@@ -26,25 +26,26 @@
   都支持哈希秒传，push 时零成本判定远端是否已有该 blob。
 - **元数据与实体分离**：远端只存不可变 blob；"最新状态"由 meta 快照维护；客户端先拉 meta 再按需拉 blob。
 - **两段式 push**：先传 blob（崩溃留孤儿 blob，无害，下次秒传复用），meta 后传 = 提交点。
-- **删除即标记**：meta 里 `deleted: true`，blob 永不删除（单文件密码簿没有"文件删除"，此语义为 files map 泛化预留）。
+- **删除即标记**：meta 里 `deleted: true`，实体 blob 永不因"逻辑删除"而消失。
 
-### 2.2 修正的部分（原稿的坑）
+### 2.2 修正的部分（原思考稿的坑）
 
 1. **"列出 /meta 取版本号最大"有并发漏洞**：没有服务器分配单调版本号，两个客户端并发 push
    会产生两个同号/乱序 meta。修正：meta 文件名 `meta_<UTC毫秒>_<device_id>.json`（唯一、可排序），
    meta 内带 `supersedes` 字段记录它已知的一切 head。**head 集合 = 未被任何 meta 的 supersedes
    引用的 meta**。fork（多 head）时按 `(updated_at, device_id)` 字典序确定性裁决——所有客户端
-   对同一组 head 收敛出同一个胜者，避免同秒冲突时各端各说各话。
-2. **冲突败者必须可找回**：胜者直接上位，败者内容先上传为 blob 并以 `kind: "backup"` 的 meta
-   钉进命名空间（backup meta **不参与 head 解析**，纯粹是给 blob 一个可寻址的名字）。
-   原"策略 2 双存备份"落到实现就是这个机制，且用户可在后续版本做恢复 UI。
+   对同一组 head 收敛出同一个胜者。
+2. **冲突不静默裁决（已拍板 v2）**：冲突 = **挂起待用户裁决**，不在引擎里自动 LWW 定胜负。
+   挂起时本地内容先上传为 blob 并写 `kind: "backup"` 的 meta（不参与 head 解析、不抢位，
+   让本地侧在任何设备上都可寻址），远端侧本来就由 head 引用——两侧都不会丢。
+   裁决 UI 与记录级合并见 §2.9，后台自动同步遇冲突一律挂起（无法阻塞等输入）。
 3. **增量日志 log_{start}_{end} 不做**：单文件密码簿的 meta 全量快照只有几百字节，
-   操作日志是过度设计；blob 本身已天然构成历史。列为泛化后续，不进本期。
-4. **定时清理孤立 blob 不做**：网盘 API 实际支持删除（夸克 `delete_files` 在用），
-   但历史版本在密码管理器场景是特性（误覆盖找回），量级可忽略（几 KB/次 × 手动频率）。
-5. **选择性同步 / 目录过滤 / 按需下载不做**：单文件 vault（几 KB～几 MB）用不上，属多文件泛化后续。
-6. **时钟偏差说明**：LWW 裁决按 `(updated_at, device_id)`，时钟严重偏慢的设备永远输——
-   与原稿"全局时间戳后操作覆盖前操作"性质相同，文档化为可接受限制。
+   操作日志是过度设计；blob 本身已天然构成历史。
+4. **定期清理孤立 blob 不做**：历史版本在密码管理器场景是特性（误覆盖找回），量级可忽略
+   （几 KB/次 × 手动频率）。唯一例外是 legacy 迁移（§2.7，拍板删除）。
+5. **选择性同步 / 目录过滤 / 按需下载不做**：单文件 vault（几 KB～几 MB）用不上。
+6. **时钟偏差说明**：head 显示与"较新者胜"的默认合并按 `updated_at` 排序，时钟严重偏慢的
+   设备在合并建议里永远显旧——与原稿"全局时间戳后操作覆盖前操作"性质相同，文档化为可接受限制。
 
 ### 2.3 远端布局（沿用现有 base 目录）
 
@@ -52,7 +53,7 @@
 /apps/VAULT/ （百度） | /VAULT/ （夸克）
 ├── meta/meta_<UTCms>_<device>.json    # 提交点，唯一"最新状态"来源
 ├── blobs/<sha256>.bin                 # 不可变密文 blob，内容寻址
-└── vault.json                         # legacy，迁移期读取一次后不再写（保留不删）
+└── vault.json                         # legacy：迁移成功后删除（已拍板）
 ```
 
 meta 为明文 JSON，**不含任何明文数据**（blob 名是密文哈希）：
@@ -64,12 +65,14 @@ meta 为明文 JSON，**不含任何明文数据**（blob 名是密文哈希）�
   "device_id": "a1b2c3d4",
   "supersedes": ["meta_1729999999000_e5f6.json"],
   "files": {
-    "vault.json": { "blob": "<sha256hex>", "size": 12345, "updated_at": 1730000000000, "deleted": false }
+    "vault.json":  { "blob": "<sha256hex>", "size": 12345, "updated_at": 1730000000000, "deleted": false },
+    "master.key":  { "blob": "<sha256hex>", "size": 321,   "updated_at": 1730000000000, "deleted": false }
   }
 }
 ```
 
-`files` 用 map 是给未来多文件（master.key 包裹件、附件、导出包）留的扩展位。
+`files` 用语义路径作 key：`vault.json` 之外，`master.key` 存放**口令包裹后的密钥**（§2.8），
+未来可扩展附件、导出包。`kind` 取值 `"head"`（默认）| `"backup"`（冲突挂起备份，不参与 head 解析）。
 
 ### 2.4 本地新增 sidecar：`sync_state.json`（vault.json 同目录，不上云）
 
@@ -79,14 +82,17 @@ meta 为明文 JSON，**不含任何明文数据**（blob 名是密文哈希）�
   "last_heads": { "quark": ["meta_....json"], "baidu": [] },
   "local_dirty_at": 1730000000000,
   "last_sync": { "quark": "2026-11-01 12:00", "baidu": "" },
-  "conflict_backups": ["<sha256hex>"]
+  "conflict_pending": null,
+  "legacy_pending_delete": false
 }
 ```
 
-- `device_id`：首启随机生成，标识本设备（meta 命名与 LWW tie-break 用）。
+- `device_id`：首启随机生成，标识本设备（meta 命名与显示排序用）。
 - `local_dirty_at`：`JsonStore::save`（用户写路径）时刷新；`replace_raw`（同步写路径）不刷新——
-  这是区分"用户改过"与"同步落下"的关键，冲突裁决靠它。
-- `last_sync` 从 AppConfig 迁来，前端展示改走新 command（见阶段 0）。
+  区分"用户改过"与"同步落下"；冲突 UI 用它标注哪侧较新。
+- `last_sync` 从 AppConfig 迁来，前端展示改走新 command（阶段 0）。
+- `conflict_pending`：冲突挂起状态（§2.9），非 null 时自动同步周期直接 Skip。
+- `legacy_pending_delete`：legacy 删除失败的补删标记（§2.7）。
 
 ### 2.5 接口演进
 
@@ -99,90 +105,153 @@ pub trait SyncProvider: Send + Sync {
     fn download(&self, remote_path: &str) -> Result<Vec<u8>, String>;
     /// 列出远端目录（分页内部消化），返回 name/size/mtime。
     fn list(&self, remote_dir: &str) -> Result<Vec<RemoteFile>, String>;
+    /// 删除远端单个文件（仅用于 legacy 迁移补删；同步主流程不得调用）。
+    fn delete(&self, remote_path: &str) -> Result<(), String>;
 }
 ```
 
 - `remote_file_mtime` 删除（连同 `decide_direction` 的 mtime 语义）。
-- 夸克：upload 去掉 delete 分支；list 复用 `file/list` 分页（`find_file_fid` 已在用同一接口）。
-- 百度：实现 list（`/api/file/list`，web=1 分页）；`rtype=3` 在唯一文件名下永不触发，等效 append-only。
+- 夸克：upload 去掉 delete 分支；list 复用 `file/list` 分页（`find_file_fid` 已在用同一接口）；
+  delete 复用 `file/delete`（`delete_files` 现成）。
+- 百度：实现 list（`/api/file/list`，web=1 分页）与 delete（`/api/filemanager`）；`rtype=3`
+  在唯一文件名下永不触发，等效 append-only。
 
 ### 2.6 核心流程
 
 **push（本地有变更）**
 1. list `/meta` → 解析 head 集合；
-2. 若存在本地 `last_heads` 之外的 head → 走冲突分支（下）；
+2. 若存在本地 `last_heads` 之外的 head 且本地 vault 哈希 ≠ 其 blob → 走冲突挂起（§2.9）；
 3. 计算 vault 密文 sha256；等于当前 head 引用的 blob → 无需 push，更新 state 收尾；
 4. 传 blob（秒传命中即跳过）→ 传 meta（`supersedes` = 已知全部 heads）→ 更新 `last_heads`。
 
 **pull（含首装）**
 1. list `/meta` → head 集合；空且 legacy vault.json 存在 → 迁移（§2.7）；空且无 legacy → 空库跳过；
-2. head 集合 ⊆ `last_heads` → 无新，跳过；
-3. 多 head（fork）→ `(updated_at, device_id)` 裁决出胜者；
-4. 下载胜者 blob → sha256 校验 → `replace_raw`（已有验密 + 原子替换 + .bak）→ 更新 `last_heads`。
-
-**冲突（push 时发现远端有未见过的 head，且本地 vault 哈希 ≠ 任何 head 的 blob）**
-- `local_dirty_at > 胜者 head.updated_at` → **本地胜**：本地内容作为新 head 正常 push（supersedes 全部）。
-- 反之 → **远端胜**：本地内容先传 blob + 写 `kind: "backup"` 的 meta（不抢 head），
-  再 pull 胜者，向用户报告"检测到冲突：已应用云端版本，本地版本已备份（可找回）"。
+2. head 集合 ⊆ `last_heads`，或仅多出自己 push 过的 head → 无新，跳过；
+3. 多 head（fork）→ 提示冲突待处理（§2.9），不自动择一；
+4. 单一新 head → 下载 blob → sha256 校验 → `replace_raw`（已有验密 + 原子替换 + .bak）→ 更新 `last_heads`。
 
 **幂等与崩溃安全**
 - blob 传完、meta 未传 → 孤儿 blob，无害（下次同内容秒传命中）；
 - meta 传完、state 未更新 → 下轮 list 看到自己的 head，`last_heads` 收敛，跳过；
 - 下载完未 apply → 下轮重来；apply 前有 sha 校验 + `replace_raw` 验密双保险。
 
-### 2.7 legacy 迁移
+### 2.7 legacy 迁移（拍板：迁移成功后删除旧文件）
 
 远端 `/meta` 为空且旧 `vault.json` 存在：
-读旧文件字节 → 传为 blob（同一份密文，秒传大概率直接命中）→ 写 genesis meta（supersedes 空）。
-旧 `vault.json` 保留不删（见待决 §五.2）。本地 vault 有效时本地胜出路径同样适用（正常 push 即 genesis）。
+读旧文件字节 → 传为 blob（同一份密文，秒传大概率直接命中）→ 写 genesis meta（supersedes 空）→
+**list `/meta` 确认 genesis head 在列后，`delete` 旧 vault.json**。
+
+- 删除前必须先确认 genesis meta 已可被 list 到（提交点先行，破坏性动作在后）；
+- 删除失败不阻塞同步：置 `legacy_pending_delete: true`，后续周期重试补删；
+- **纪律约束：全设备一起升级**。legacy 删除后，未升级的旧客户端会因"远端无 vault.json"重新上传，
+  而新客户端只看 meta，两端静默分叉。个人项目可控，写进冒烟清单。
+
+### 2.8 master.key 上云（拍板：上云；实现为口令包裹，明文 key 永不出本地）
+
+**包裹方案**
+- 用户在设置里启用"密钥上云"并设置**云解锁口令**；口令不落盘、不上云、不持久化，仅包裹/解锁时使用。
+- KDF：Argon2id（`argon2` crate，纯 Rust），随机 16 字节 salt，参数 m=64MiB / t=3 / p=1（常量可调）；
+  派生密钥 AES-256-GCM 包裹 master.key。
+- 包裹件 blob 内容为自描述 JSON：`{ "v":1, "kdf":{algo,salt_b64,m,t,p}, "nonce", "ct_b64" }`，
+  整体 sha256 命名为 blob；meta 的 `files["master.key"]` 只存指针。
+- **换口令** = unwrap(旧口令) → wrap(新口令) → 新 blob → 新 meta；**撤销上云** = files 条目 `deleted: true`。
+- 未设置口令 = 不上云，行为与现状一致（新设备手动拷 key）。
+
+**新设备引导流程**（本地无 master.key 或本地 vault 为全新空库）
+1. 先拉 meta（不动本地密钥，避免误生成第二把钥）；
+2. 云端有 head 且 `files["master.key"]` 有效 → 弹云解锁口令框 → unwrap 成功 → 保存为本地 master.key
+   → 正常 pull 应用 vault；
+3. 云端有 head 但无包裹件 → 引导手动导入 master.key 文件；保留"以本机为准强制上云"入口
+   （force push genesis，云端旧 head 仍可从 blobs 找回）；
+4. 云端无 head → 正常首装。
+
+**边界情形**：新设备先建库后绑盘、绑定后发现云端有数据且本地已有输入——先解密暂存本地库再换钥，
+随后转入冲突解决 UI（§2.9）让用户选本地/云端/合并，避免静默丢失。启动顺序不动
+（先本地 key+空库，绑定后首个同步周期进入引导/冲突路径）。
+
+### 2.9 冲突解决 UI 与记录级合并（拍板：v2 用户裁决）
+
+**挂起（引擎侧，同步周期内完成，不阻塞用户）**
+- push/pull 发现 fork 且本地有未推送修改 → 本地内容上传为 blob + 写 `kind:"backup"` meta
+  （不抢 head，任意设备可寻址）→ `conflict_pending = { remote_heads, backup_blob, detected_at }`
+  → `Outcome::ConflictPending`，通知用户"同步冲突待处理"；
+- 挂起期间 vault 照常可编辑；后续同步周期遇 pending 直接 Skip，不再重复挂起；
+- 若期间远端又出现更新 head → 重新挂起并对齐到最新 head 集合（备份 meta 链自然累积，均可找回）。
+
+**裁决（用户操作时）**
+- 新 command `get_conflict_details`：解密两侧（本地当前 vault + 远端 head blob，同一 master.key 均可解），
+  按 `PasswordRecord.id` 对齐，返回 `only_local / only_remote / both_differ` 三组记录
+  （复用现有 DTO 约定），并标注每条较新侧（`last_used` + `local_dirty_at` 辅助）；
+- 新 command `resolve_conflict(choices)`：纯函数 `merge_vaults(local, remote, choices) -> StoreData`
+  → `JsonStore::save` → push 新 head（supersedes = 挂起的 remote_heads + 本地已知 heads）→ 清 pending；
+- 前端新增 `ResolveConflictModal`：三个快捷按钮（全部用本地 / 全部用云端 / 智能合并）+
+  逐条可改选；智能合并默认逐条取较新者。
+- `merge_vaults` 合并语义：passwords 按 id 取并集；config（Cookie、设置等）不逐字段合并，
+  整体取较新侧；**"仅一侧存在"无法区分新建与删除**（StoreData 无墓碑），默认保留（并集）——
+  误复活好过误删除，墓碑列为 v3 演进。
 
 ## 三、实施阶段（每阶段独立可验证、独立提交）
 
 ### 阶段 0：记账搬出 vault.json（硬前提）+ `.bak` 回退
-- 新增 `sync_state.json` 读写模块（`shared/storage/sync_state.rs`）：device_id、last_heads、
-  local_dirty_at、last_sync、conflict_backups。
+- 新增 `shared/storage/sync_state.rs`：`sync_state.json` 读写（device_id、last_heads、
+  local_dirty_at、last_sync、conflict_pending、legacy_pending_delete）。
 - `lib.rs` 删除所有 `cfg.baidu_last_sync/quark_last_sync` 写回（`lib.rs:175-183`、`lib.rs:427-433`）。
-- `JsonStore::save` 刷新 `local_dirty_at`（经注入的 state 句柄或回调，保持 store 不依赖 state 文件布局）。
+- `JsonStore::save` 刷新 `local_dirty_at`（注入回调，store 不依赖 state 文件布局）。
 - `JsonStore::open` 解密失败回退 `.bak`（修审计问题③）。
 - 新 command `get_sync_state`；`SettingsModal.js` 的 last_sync 展示改走它（`SettingsModal.js:99-100`）。
-- 验证：cargo test 全绿；两轮自动同步不产生第二次上传（现有 FakeProvider 日志断言）。
+- 验证：cargo test 全绿；两轮自动同步不产生第二次上传。
 
-### 阶段 1：Provider 扩展——list + 仅新增语义
-- `SyncProvider` 增加 `RemoteFile` + `list()`；删 `remote_file_mtime`。
-- 夸克 / 百度分别实现 list；夸克 upload 去 delete 分支；百度 upload 不动（唯一名下等效 append-only）。
-- `FakeProvider` 测试适配；新增"upload 不删远端同名"断言。
-- 验证：cargo test；真机各手动列目录一次。
+### 阶段 1：Provider 扩展——list / delete + 仅新增语义
+- `SyncProvider` 增加 `RemoteFile` + `list()` + `delete()`；删 `remote_file_mtime`。
+- 夸克 / 百度分别实现 list 与 delete；夸克 upload 去 delete 分支；百度 upload 不动。
+- `FakeProvider` 适配；新增"upload 不删远端同名"断言。
+- 验证：cargo test；真机各手动列目录、删测试文件一次。
 
 ### 阶段 2：manifest 模块（纯函数核心，测试密度最高）
 - 新增 `shared/sync/manifest.rs`：meta 结构体、命名生成、解析校验、
-  **head 解析**（supersedes 集合减法 + 忽略 `kind:"backup"`）、fork 裁决 `(updated_at, device_id)`。
-- 单测：正常单链、并发 fork、同秒 device_id tie-break、backup 不参与 head、坏 meta 文件跳过。
+  **head 解析**（supersedes 集合减法 + 忽略 `kind:"backup"`）、fork 检出。
+- 单测：正常单链、并发 fork、backup 不参与 head、坏 meta 文件跳过、孤立 supersedes 引用容错。
 - 验证：cargo test（本模块 ≥10 个用例）。
 
 ### 阶段 3：session 编排 + 引擎改造
-- 新增 `shared/sync/session.rs`：push / pull / 冲突 / genesis / legacy 迁移 / 幂等，
-  依赖 `SyncProvider` + `VaultIo` + `SyncStateIo`（新接缝，替身实现）。
+- 新增 `shared/sync/session.rs`：push / pull / genesis / **legacy 迁移（含确认后删除 + 补删重试）** /
+  冲突挂起 / 幂等，依赖 `SyncProvider` + `VaultIo` + `SyncStateIo`（新接缝，替身实现）。
 - `engine.rs`：`decide_direction(mtime)` → `decide_action(local_state, remote_heads)`；
-  Cookie 校验、过期预警、SyncReport 骨架保留不动；新增 `Outcome::ConflictResolved(String)`。
-- FakeAppendOnlyProvider（内存 HashMap，upload 撞名即 Err）覆盖 §2.6 全流程与崩溃序列。
+  Cookie 校验、过期预警、SyncReport 骨架保留；新增 `Outcome::ConflictPending` / `Migrated`。
+- FakeAppendOnlyProvider（内存 HashMap，upload 撞名即 Err、delete 可用）覆盖 §2.6/2.7/2.9 挂起路径与崩溃序列。
 - 验证：cargo test（新增 ≥15 用例）。
 
-### 阶段 4：接线、前端与冒烟
+### 阶段 4：master.key 口令包裹上云
+- `crypto.rs`：Argon2id KDF + `wrap_key` / `unwrap_key`（自描述 JSON 格式）。
+- session：`files["master.key"]` 条目的 push/pull/换口令/撤销；新设备引导流（§2.8 四分支）。
+- 命令与 UI：`set_cloud_passphrase` / `change_cloud_passphrase` / `cloud_unlock`；
+  `SettingsModal` 增加密钥上云设置区；新设备解锁弹框；"以本机为准强制上云"入口。
+- 验证：cargo test（wrap/unwrap 往返、错口令拒绝、换口令后旧包裹件失效）；
+  手工冒烟"新设备扫码 → 输口令 → 全量数据可用"。
+
+### 阶段 5：冲突解决 UI + 记录级合并
+- `merge_vaults` 纯函数（含测试：并集、双 id 差异按选择、config 取新侧、删除复活语义）。
+- 命令 `get_conflict_details` / `resolve_conflict`；引擎挂起状态落地与清除。
+- 前端 `ResolveConflictModal`（快捷三选 + 逐条改选）+ 冲突横幅/通知。
+- 验证：cargo test（merge ≥8 用例）；手工双端冲突全路径。
+
+### 阶段 6：接线、前端与总冒烟
 - `lib.rs` 的 `sync_now` / 调度循环 / `apply_sync_report` 换用 session；`sync://conflict` 事件。
-- 前端：冲突 Toast / 通知（桌面 Toast、移动 notification），文案含备份位置。
-- 手工冒烟清单：单端 push→pull、双端同时改（fork 收敛）、首装无 master.key 提示、
-  legacy 远端迁移、断网中断 push 后重试、百度自动同步连续两轮无报错（修问题①的验收）。
+- 总冒烟清单：单端 push→pull、双端同时改（挂起 → 裁决 → 再同步收敛）、
+  新设备口令解锁、换口令后另一设备拉取仍可解、legacy 迁移且旧文件已删、
+  断网中断 push 后重试、**全设备同版本升级纪律**、百度自动同步连续两轮无报错（修问题①的验收）。
 
 ## 四、明确不做（本期）
 
 - 增量日志 meta（log_{start}_{end}）→ blob + meta 快照已覆盖需求，量级不需要。
 - 孤立 blob 清理、选择性同步、目录过滤、按需下载 → 多文件泛化时再说。
-- 记录级合并（按 PasswordRecord id 取并集）→ 有价值但改动面大，作为冲突处理的 v2 演进，接口已留好。
+- 墓碑机制（区分"删除"与"另一侧新建"）→ v3 演进，冲突合并先按"存在即保留"。
+- 冲突"自动 LWW"模式开关 → 拍板为用户裁决，不加配置项；有需求再说。
 
-## 五、待决问题（不阻塞开工，请拍板）
+## 五、已拍板决策（2026-11-01）
 
-1. **master.key 上云**：不做则新设备仍是"拷 key + 拉取"两步。可选方案为用户设置"云解锁口令"、
-   用其派生密钥包裹 master.key 后作为第二个 files 条目上云。涉及产品定位（零账号、E2E），
-   建议单独立项。
-2. **legacy 远端 vault.json 的去留**：建议保留（append-only 精神 + 兜底），不清理。
-3. **冲突交互**：v1 静默 LWW + 通知备份位置（本计划）；v2 再做让用户二选一的 UI。
+| 待决项 | 决定 | 落地 |
+|---|---|---|
+| master.key 上云 | **上云** | 按 §2.8 口令包裹实现：明文 key 永不出本地，云端只有 Argon2id 包裹件；未设口令不上云 |
+| legacy 远端 vault.json | **删除** | §2.7：genesis meta 确认可 list 后删除；失败补删重试；全设备一起升级 |
+| 冲突交互 | **v2 用户裁决** | §2.9：引擎只挂起不裁决，ResolveConflictModal 三选 + 逐条改选，含记录级合并 |
