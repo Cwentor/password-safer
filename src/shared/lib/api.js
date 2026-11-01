@@ -158,6 +158,47 @@ export function syncNow(provider, direction) {
   return invoke('sync_now', { provider, direction });
 }
 
+// 云同步本地记账（last_sync 等，存于 sync_state.json，不上云）
+export function getSyncState() {
+  return invoke('get_sync_state');
+}
+
+// ========== 库密码（v2 信封） ==========
+
+export function getVaultStatus() {
+  return invoke('get_vault_status');
+}
+
+export function unlockVault(password) {
+  return invoke('unlock_vault', { password });
+}
+
+export function setVaultPassword(password) {
+  return invoke('set_vault_password', { password });
+}
+
+export function changeVaultPassword(oldPassword, newPassword) {
+  return invoke('change_vault_password', { oldPassword, newPassword });
+}
+
+export function migrateVaultToPassword(password) {
+  return invoke('migrate_vault_to_password', { password });
+}
+
+export function lockVault() {
+  return invoke('lock_vault');
+}
+
+// 收养云端钥匙体系：用远端信封的盐验证密码并切换本库钥匙（新设备接管/换密码对齐）
+export function adoptRemoteKey(provider, password) {
+  return invoke('adopt_remote_key', { provider, password });
+}
+
+// 清理云端历史版本（保留当前 head，防旧密码泄露导致历史回读）
+export function cleanupCloudHistory() {
+  return invoke('cleanup_cloud_history');
+}
+
 export function logout(provider) {
   return invoke('logout', { provider });
 }
@@ -210,6 +251,26 @@ export function onSyncError(handler) {
 export function onSyncRestored(handler) {
   if (!tauriEvent || !tauriEvent.listen) return () => {};
   return tauriEvent.listen('sync://restored', handler);
+}
+
+// ========== 冲突解决 ==========
+
+export function getConflictDetails(provider) {
+  return invoke('get_conflict_details', { provider });
+}
+
+export function resolveConflict(provider, selections) {
+  return invoke('resolve_conflict', { provider, selections });
+}
+
+export function onSyncConflict(handler) {
+  if (!tauriEvent || !tauriEvent.listen) return () => {};
+  return tauriEvent.listen('sync://conflict', handler);
+}
+
+export function onSyncConflictResolved(handler) {
+  if (!tauriEvent || !tauriEvent.listen) return () => {};
+  return tauriEvent.listen('sync://conflict-resolved', handler);
 }
 
 export function onBaiduLoginSuccess(handler) {

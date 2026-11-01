@@ -299,6 +299,17 @@ ${syncPanel}
 
           <div class="setting-item">
             <div class="setting-item-info">
+              <div class="setting-item-name">库密码</div>
+              <div class="setting-item-desc" id="vaultPwdStatus">检查中…</div>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="secondary-btn" id="vaultLockBtn" style="display:none">立即锁定</button>
+              <button class="secondary-btn" id="vaultPwdAction">设置</button>
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-item-info">
               <div class="setting-item-name">自动锁定</div>
               <div class="setting-item-desc">闲置一段时间后自动锁定保管箱</div>
             </div>

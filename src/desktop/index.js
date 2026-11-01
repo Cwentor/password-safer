@@ -12,6 +12,8 @@ import { loadConfig, loadPasswords } from '../shared/lib/dataLoader.js';
 import { showMainWindow } from '../shared/lib/api.js';
 import { showToast } from '../shared/components/Toast.js';
 import { populateSettingsForm, listenSyncEvents } from '../shared/components/SettingsModal.js';
+import { ensureVaultAccessible } from '../shared/components/VaultUnlockModal.js';
+import { initConflictWatcher } from '../shared/components/ResolveConflictModal.js';
 import {
   mountSharedOverlays, registerCoreRenderers, initSharedComponents,
   bindOverlayEscape, getDetailHTML,
@@ -61,10 +63,13 @@ function getMainHTML() {
 
 async function init() {
   try {
+    // 密码簿分流：首启设库密码 / v2 无缓存时解锁（阻塞到完成或用户选择稍后）
+    const accessible = await ensureVaultAccessible();
     await loadConfig();
-    await loadPasswords();
+    if (accessible) await loadPasswords();
     populateSettingsForm();
     listenSyncEvents();
+    initConflictWatcher();
   } catch (e) {
     showToast('初始化失败: ' + e);
   } finally {

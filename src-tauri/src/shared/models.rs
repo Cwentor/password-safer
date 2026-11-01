@@ -30,7 +30,9 @@ pub struct PasswordInput {
     pub favorite: Option<bool>,
 }
 
-/// 应用配置（同步设置等）
+/// 应用配置（同步设置等）。
+/// 注意：last_sync 等同步记账已迁到本地 sync_state.json，不再放进密码簿
+/// （否则每轮同步写回都会改动文件，造成"本地永远较新"的重复上传）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     // 百度网盘（Cookie 方式）
@@ -39,14 +41,12 @@ pub struct AppConfig {
     pub baidu_sync_enabled: bool,
     pub baidu_sync_interval: u64,
     pub baidu_cookie_expires_at: i64,
-    pub baidu_last_sync: String,
     // 夸克网盘（Cookie 方式）
     pub quark_cookie: String,
     pub quark_remote_path: String,
     pub quark_sync_enabled: bool,
     pub quark_sync_interval: u64,
     pub quark_cookie_expires_at: i64,
-    pub quark_last_sync: String,
     // 通用设置
     pub auto_lock_minutes: u64,
     pub clipboard_clear_seconds: u64,
@@ -61,13 +61,11 @@ impl Default for AppConfig {
             baidu_sync_enabled: false,
             baidu_sync_interval: 300,
             baidu_cookie_expires_at: 0,
-            baidu_last_sync: String::new(),
             quark_cookie: String::new(),
             quark_remote_path: "/VAULT/vault.json".to_string(),
             quark_sync_enabled: false,
             quark_sync_interval: 300,
             quark_cookie_expires_at: 0,
-            quark_last_sync: String::new(),
             auto_lock_minutes: 30,
             clipboard_clear_seconds: 30,
             master_password: String::new(),

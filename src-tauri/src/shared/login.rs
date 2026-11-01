@@ -333,7 +333,12 @@ pub fn save_login_cookie<R: Runtime>(
     let state = app.state::<Arc<AppState>>();
     let expires_at = chrono::Local::now().timestamp() + spec.expiry_days * 86400;
     {
-        let mut config = state.database.lock().unwrap().load_config().unwrap_or_default();
+        let mut g = state.database.lock().map_err(|e| e.to_string())?;
+        let mut config = g
+            .as_mut()
+            .ok_or("密码簿已锁定，请先解锁")?
+            .load_config()
+            .unwrap_or_default();
         match spec.provider {
             "baidu" => {
                 config.baidu_cookie = cookie.to_string();
@@ -345,7 +350,9 @@ pub fn save_login_cookie<R: Runtime>(
             }
             _ => return Err(format!("未知的登录提供者: {}", spec.provider)),
         }
-        state.database.lock().unwrap().save_config(&config)?;
+        g.as_mut()
+            .ok_or("密码簿已锁定，请先解锁")?
+            .save_config(&config)?;
     }
     eprintln!("[{}] config saved, expires_at={}", tag, expires_at);
 

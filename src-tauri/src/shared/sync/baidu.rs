@@ -200,6 +200,87 @@ impl SyncProvider for BaiduProvider {
             .map(|b| b.to_vec())
             .map_err(|e| format!("读取下载内容失败: {}", e))
     }
+
+    /// 列出远端目录一层内容（翻页取全；目录不存在返回空列表，errno -9）
+    fn list(&self, remote_dir: &str) -> Result<Vec<super::RemoteFile>, String> {
+        let trimmed = remote_dir.trim_start_matches('/').trim_end_matches('/');
+        let dir = if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", trimmed)
+        };
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        let num = 1000u32;
+        loop {
+            let url = format!(
+                "https://pan.baidu.com/api/list?dir={}&order=name&desc=0&page={}&num={}&clienttype=0&web=1&app_id=250528",
+                urlenc(&dir),
+                page,
+                num
+            );
+            let resp: Value = self
+                .client
+                .get(&url)
+                .headers(self.header())
+                .send()
+                .map_err(|e| format!("列目录失败: {}", e))?
+                .json()
+                .map_err(|e| format!("解析列目录响应失败: {}", e))?;
+            let errno = resp["errno"].as_i64().unwrap_or(-1);
+            if errno == -9 {
+                return Ok(Vec::new()); // 目录不存在
+            }
+            if errno != 0 {
+                return Err(format!("列目录返回错误: {:?}", resp));
+            }
+            let list = resp["list"].as_array().cloned().unwrap_or_default();
+            let got = list.len();
+            for item in list {
+                if item["isdir"].as_i64() == Some(1) {
+                    continue; // 只列文件
+                }
+                out.push(super::RemoteFile {
+                    name: item["server_filename"].as_str().unwrap_or("").to_string(),
+                    size: item["size"].as_i64().unwrap_or(0),
+                    mtime: item["server_mtime"].as_i64().unwrap_or(0),
+                });
+            }
+            if got < num as usize || page > 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
+    /// 删除远端单个文件（幂等：目标不存在视为成功；仅限 legacy 补删与历史清理）
+    fn delete(&self, remote_path: &str) -> Result<(), String> {
+        let bdstoken = self.bdstoken()?;
+        let url = format!(
+            "https://pan.baidu.com/api/filemanager?bdstoken={}&clienttype=0&app_id=250528&web=1&opera=delete&async=0",
+            bdstoken
+        );
+        let filelist = format!("[\"{}\"]", remote_path);
+        let body = format!("filelist={}&async=0", urlenc(&filelist));
+        let resp: Value = self
+            .client
+            .post(&url)
+            .headers(self.header())
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .map_err(|e| format!("删除请求失败: {}", e))?
+            .json()
+            .map_err(|e| format!("解析删除响应失败: {}", e))?;
+        let errno = resp["errno"].as_i64().unwrap_or(-1);
+        if errno == 0 || errno == 12 {
+            // 12 = 文件或目录不存在，视为已删（幂等）
+            eprintln!("[baidu] delete {} -> errno {}（成功或不存在）", remote_path, errno);
+            return Ok(());
+        }
+        Err(format!("删除返回错误: {:?}", resp))
+    }
 }
 
 /// 简易 URL 编码

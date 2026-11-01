@@ -3,10 +3,10 @@
 // 集中管理 loadPasswords / loadConfig / reloadConfigAndUI
 // ============================================
 
-import { state, DEFAULT_CONFIG } from './state.js';
+import { state, DEFAULT_CONFIG, DEFAULT_SYNC_STATE } from './state.js';
 import { renderers } from './renderer.js';
 import { showToast } from '../components/Toast.js';
-import { getAllPasswords, getConfig } from './api.js';
+import { getAllPasswords, getConfig, getSyncState } from './api.js';
 import { refreshAll } from './passwordService.js';
 
 export async function loadPasswords() {
@@ -25,6 +25,12 @@ export async function loadConfig() {
     state.appConfig = await getConfig();
   } catch (e) {
     state.appConfig = { ...DEFAULT_CONFIG };
+  }
+  // 同步记账（last_sync 等）存于本地 sync_state.json，与密码簿配置分开加载
+  try {
+    state.syncState = await getSyncState();
+  } catch (e) {
+    state.syncState = { ...DEFAULT_SYNC_STATE };
   }
 }
 

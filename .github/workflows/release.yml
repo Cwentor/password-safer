@@ -1,0 +1,97 @@
+# ============================================================
+# Password Safer - Tag 发布流水线
+#
+# 触发：推送 v* 格式 tag（如 v2.1.0）
+# 产物：GitHub Release，包含
+#   - Windows 安装包（NSIS .exe / MSI .msi）
+#   - 源码压缩包（password-safer-<版本>-source.zip）
+#   - GitHub 自动附带的 Source code (zip / tar.gz)
+#
+# 注意：
+#   - tag 与版本号必须与 src-tauri/tauri.conf.json 一致，流水线会校验
+#   - 仅构建桌面端（Windows）；Android 需 NDK + 签名密钥，暂不纳入
+# ============================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 校验 tag 与应用版本一致
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          CARGO_VERSION="$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d '"' -f2)"
+          echo "tag: v$TAG_VERSION | tauri.conf.json: $APP_VERSION | package.json: $PKG_VERSION | Cargo.toml: $CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$APP_VERSION" ] || [ "$TAG_VERSION" != "$PKG_VERSION" ] || [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag 版本与版本清单不一致（tauri.conf.json / package.json / Cargo.toml 需与 tag 同为 $TAG_VERSION），请先对齐再打 tag"
+            exit 1
+          fi
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 生成源码压缩包
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git archive --format=zip --prefix="password-safer-$VERSION/" -o "password-safer-$VERSION-source.zip" HEAD
+
+      - name: 构建 Tauri 应用并创建 Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Password Safer ${{ github.ref_name }}"
+          releaseBody: |
+            Windows 桌面安装包与源码压缩包。
+
+            **安装包**
+            - `*_x64-setup.exe` — NSIS 安装器（推荐）
+            - `*_x64_en-US.msi` — MSI 安装包
+
+            **源码**
+            - `password-safer-*-source.zip` — 源码压缩包（不含构建产物）
+            - GitHub 自动附带 Source code (zip / tar.gz)
+
+            安装包未做代码签名，首次运行如遇 SmartScreen 提示，选择「仍要运行」即可。
+          releaseDraft: false
+          prerelease: false
+
+      - name: 上传源码压缩包到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: password-safer-*-source.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

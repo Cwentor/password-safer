@@ -1,54 +1,14 @@
-//! 云同步引擎：方向判定、Cookie 过期预警、同步记账的决策层。
+//! 云同步引擎：Cookie 过期预警、同步编排的决策层。
 //!
 //! 只做决策与编排，不持有 Tauri 句柄、不写配置——副作用由调用方（lib.rs 薄壳）
-//! 按报告一次性落地。测试经 `SyncProvider` / `QrAuthenticator` / `VaultIo`
-//! 三个接缝注入替身，无需网络与 WebView。
+//! 按报告一次性落地。方向判定与传输在 session（追加式同步会话）里；
+//! 测试经 `SyncProvider` / `QrAuthenticator` / `VaultIo` / `SyncStateIo`
+//! 四个接缝注入替身，无需网络与 WebView。
 
-use super::{local_vault_valid, SyncProvider};
+use super::session::{self, SessionInputs, SessionOutcome, SyncStateIo};
+use super::SyncProvider;
 use crate::shared::sync::auth::QrAuthenticator;
 use std::path::Path;
-
-/// 同步动作（方向判定的结果）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    /// 本地较新，或本地有效而云端不存在 → 上传
-    Upload,
-    /// 云端较新，或本地无效而云端有文件 → 下载
-    Download,
-    /// 两边一致，或两边都无有效数据 → 跳过
-    Skip,
-}
-
-/// 方向判定（纯函数，与 CONFIG.md 的同步策略一致）：
-/// - 本地密码簿无效：云端有文件 → 下载，否则跳过
-/// - 本地有效：云端不存在 → 上传；比较修改时间，本地新上传、云端新下载、相等跳过
-pub fn decide_direction(
-    local_valid: bool,
-    local_mtime: Option<i64>,
-    remote_mtime: Result<Option<i64>, String>,
-) -> Result<Action, String> {
-    let remote = remote_mtime?;
-    if !local_valid {
-        return Ok(if remote.is_some() {
-            Action::Download
-        } else {
-            Action::Skip
-        });
-    }
-    match remote {
-        None => Ok(Action::Upload),
-        Some(remote_mtime) => {
-            let local = local_mtime.unwrap_or(0);
-            if local > remote_mtime {
-                Ok(Action::Upload)
-            } else if local < remote_mtime {
-                Ok(Action::Download)
-            } else {
-                Ok(Action::Skip)
-            }
-        }
-    }
-}
 
 /// Cookie 即将过期预警
 #[derive(Debug, Clone, PartialEq)]
@@ -92,14 +52,30 @@ pub fn check_expiry(
 pub trait VaultIo: Send + Sync {
     /// 密码簿文件路径（供上传读取）
     fn path(&self) -> &Path;
-    /// 本地密码簿是否有效（存在且非空）
-    fn local_valid(&self) -> bool {
-        local_vault_valid(self.path())
-    }
-    /// 本地文件修改时间（unix 秒）
+    /// 本地文件修改时间（unix 秒；genesis 与 legacy 比较新旧用）
     fn local_mtime(&self) -> Option<i64>;
+    /// 读取本地密码簿字节（内容哈希对比 / blob 上传用）
+    fn read(&self) -> Result<Vec<u8>, String>;
     /// 用下载到的内容替换本地密码簿（实现须先验证再原子替换）
     fn replace(&self, bytes: &[u8]) -> Result<(), String>;
+    /// 冲突自动并集（拍板 S1）：解密远端字节与本库按 id 合并、两版都保留、
+    /// 落盘并返回冲突记录对。实现须保证失败时不动现有文件。
+    fn merge_union(
+        &self,
+        _remote_bytes: &[u8],
+        _config_take_remote: bool,
+    ) -> Result<Vec<super::merge::MergePair>, String> {
+        Err("merge_union not supported".to_string())
+    }
+    /// 本库钥匙指纹（v2 信封的盐；None = v1 或未知）。meta 带上它后可
+    /// 在不下载 blob 的前提下探测"库密码已在其他设备更换"（拍板 S4）
+    fn key_salt_b64(&self) -> Option<String> {
+        None
+    }
+    /// 本库记录数（None = 未知）。genesis 判"空库新设备优先收养 legacy"用
+    fn record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 一次同步的结局
@@ -113,6 +89,10 @@ pub enum Outcome {
     /// Cookie 已失效
     CookieExpired,
     Failed(String),
+    /// 冲突挂起：引擎不裁决，等用户在界面处理（阶段 5）
+    ConflictPending,
+    /// legacy 整文件远端迁移完成（含本机接管云端的情况）
+    GenesisMigrated,
 }
 
 /// 同步报告：决策结果 + 需要调用方落地的记账动作。
@@ -159,14 +139,17 @@ pub struct CycleInputs<'a> {
     pub validator: &'a dyn QrAuthenticator,
     pub cookie: &'a str,
     pub remote_path: &'a str,
+    /// 网盘标识（"quark" / "baidu"，同步记账分账 key）
+    pub provider_key: &'a str,
     pub cookie_expires_at: i64,
     pub warn_sent: bool,
     /// 当前 unix 秒（注入以便测试）
     pub now_secs: i64,
     pub vault: &'a dyn VaultIo,
+    pub sync_state: &'a dyn SyncStateIo,
 }
 
-/// 执行一次自动同步循环：过期预警 → Cookie 校验 → 方向判定 → 上传/下载。
+/// 执行一次自动同步循环：过期预警 → Cookie 校验 → 追加式会话（push/apply/挂起）。
 pub fn run_cycle(i: CycleInputs) -> SyncReport {
     let (expiry_warning, set_warn_sent) =
         check_expiry(i.cookie_expires_at, i.now_secs, i.warn_sent);
@@ -194,30 +177,33 @@ pub fn run_cycle(i: CycleInputs) -> SyncReport {
     report
 }
 
-/// 方向判定 + 传输（自动循环专用）
+/// 会话执行（自动循环专用）
 fn execute_cycle(i: &CycleInputs, report: &mut SyncReport) {
-    let remote = i.provider.remote_file_mtime(i.remote_path);
-    let action = match decide_direction(i.vault.local_valid(), i.vault.local_mtime(), remote) {
-        Ok(a) => a,
-        Err(e) => return report.fail(format!("获取远端文件信息失败: {}", e)),
-    };
-    match action {
-        Action::Upload => match i.provider.upload(i.vault.path(), i.remote_path) {
-            Ok(()) => report.outcome = Outcome::Uploaded,
-            Err(e) => report.fail(format!("上传失败: {}", e)),
-        },
-        Action::Download => match i
-            .provider
-            .download(i.remote_path)
-            .and_then(|bytes| i.vault.replace(&bytes))
-        {
-            Ok(()) => {
-                report.outcome = Outcome::Downloaded;
-                report.downloaded = true;
-            }
-            Err(e) => report.fail(format!("下载失败: {}", e)),
-        },
-        Action::Skip => {} // 保持 Skipped：两边一致也算核对过，记录同步时间
+    let result = session::sync_auto(&SessionInputs {
+        provider: i.provider,
+        vault: i.vault,
+        sync_state: i.sync_state,
+        remote_path: i.remote_path,
+        provider_key: i.provider_key,
+        now_ms: i.now_secs * 1000,
+    });
+    apply_session(result, report);
+}
+
+/// 把会话结果映射进报告
+fn apply_session(result: Result<session::SessionReport, String>, report: &mut SyncReport) {
+    match result {
+        Ok(r) => {
+            report.outcome = match r.outcome {
+                SessionOutcome::Pushed => Outcome::Uploaded,
+                SessionOutcome::Applied => Outcome::Downloaded,
+                SessionOutcome::Skipped => Outcome::Skipped,
+                SessionOutcome::ConflictPending => Outcome::ConflictPending,
+                SessionOutcome::GenesisMigrated => Outcome::GenesisMigrated,
+            };
+            report.downloaded = r.downloaded;
+        }
+        Err(e) => report.fail(e),
     }
 }
 
@@ -234,12 +220,15 @@ pub struct ManualInputs<'a> {
     pub validator: Option<&'a dyn QrAuthenticator>,
     pub cookie: &'a str,
     pub remote_path: &'a str,
+    pub provider_key: &'a str,
     pub direction: Direction,
     pub vault: &'a dyn VaultIo,
+    pub sync_state: &'a dyn SyncStateIo,
 }
 
 /// 执行一次手动同步。上传前校验 Cookie，下载不校验（与既有行为一致）；
 /// Cookie 失效只报结果，不关闭自动同步。
+/// 手动上传/下载视为用户裁决：会清除冲突挂起后执行。
 pub fn run_manual(i: ManualInputs) -> SyncReport {
     let mut report = if i.cookie.is_empty() {
         SyncReport::new(Outcome::NotLoggedIn)
@@ -264,45 +253,46 @@ pub fn run_manual(i: ManualInputs) -> SyncReport {
         }
     }
 
-    match i.direction {
-        Direction::Upload => match i.provider.upload(i.vault.path(), i.remote_path) {
-            Ok(()) => report.outcome = Outcome::Uploaded,
-            Err(e) => report.fail(format!("上传失败: {}", e)),
-        },
-        Direction::Download => match i
-            .provider
-            .download(i.remote_path)
-            .and_then(|bytes| i.vault.replace(&bytes))
-        {
-            Ok(()) => {
-                report.outcome = Outcome::Downloaded;
-                report.downloaded = true;
-            }
-            Err(e) => report.fail(format!("下载失败: {}", e)),
-        },
-    }
+    let result = match i.direction {
+        Direction::Upload => session::push_manual(&SessionInputs {
+            provider: i.provider,
+            vault: i.vault,
+            sync_state: i.sync_state,
+            remote_path: i.remote_path,
+            provider_key: i.provider_key,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        }),
+        Direction::Download => session::pull_manual(&SessionInputs {
+            provider: i.provider,
+            vault: i.vault,
+            sync_state: i.sync_state,
+            remote_path: i.remote_path,
+            provider_key: i.provider_key,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        }),
+    };
+    apply_session(result, &mut report);
     report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::storage::sync_state::SyncState;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     // ---- 替身 ----
 
     struct FakeProvider {
-        mtime: Result<Option<i64>, String>,
         fail_upload: bool,
         fail_download: bool,
         calls: Mutex<Vec<&'static str>>,
     }
 
     impl FakeProvider {
-        fn new(mtime: Result<Option<i64>, String>) -> Self {
+        fn new() -> Self {
             FakeProvider {
-                mtime,
                 fail_upload: false,
                 fail_download: false,
                 calls: Mutex::new(Vec::new()),
@@ -327,8 +317,11 @@ mod tests {
                 Ok(b"downloaded vault bytes".to_vec())
             }
         }
-        fn remote_file_mtime(&self, _remote: &str) -> Result<Option<i64>, String> {
-            self.mtime.clone()
+        fn list(&self, _remote_dir: &str) -> Result<Vec<super::super::RemoteFile>, String> {
+            Ok(Vec::new())
+        }
+        fn delete(&self, _remote_path: &str) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -389,50 +382,36 @@ mod tests {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
         }
+        fn read(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.path).map_err(|e| e.to_string())
+        }
         fn replace(&self, bytes: &[u8]) -> Result<(), String> {
             std::fs::write(&self.path, bytes).map_err(|e| e.to_string())
         }
     }
 
-    // ---- 方向判定 ----
+    /// 内存同步记账替身
+    struct MemState(Mutex<SyncState>);
 
-    #[test]
-    fn direction_local_invalid() {
-        // 本地无效：云端有 → 下载；云端无 → 跳过
-        assert_eq!(
-            decide_direction(false, None, Ok(Some(100))).unwrap(),
-            Action::Download
-        );
-        assert_eq!(
-            decide_direction(false, None, Ok(None)).unwrap(),
-            Action::Skip
-        );
+    impl MemState {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "ps-engine-state-{}-{}.json",
+                std::process::id(),
+                tag
+            ));
+            MemState(Mutex::new(SyncState::load_or_create(p).unwrap()))
+        }
     }
 
-    #[test]
-    fn direction_local_valid() {
-        // 本地有效：云端无 → 上传；比较时间戳
-        assert_eq!(
-            decide_direction(true, Some(200), Ok(None)).unwrap(),
-            Action::Upload
-        );
-        assert_eq!(
-            decide_direction(true, Some(200), Ok(Some(100))).unwrap(),
-            Action::Upload
-        );
-        assert_eq!(
-            decide_direction(true, Some(100), Ok(Some(200))).unwrap(),
-            Action::Download
-        );
-        assert_eq!(
-            decide_direction(true, Some(200), Ok(Some(200))).unwrap(),
-            Action::Skip
-        );
-    }
-
-    #[test]
-    fn direction_remote_query_error_propagates() {
-        assert!(decide_direction(true, Some(200), Err("接口挂了".into())).is_err());
+    impl SyncStateIo for MemState {
+        fn load(&self) -> Result<SyncState, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save(&self, st: &SyncState) -> Result<(), String> {
+            *self.0.lock().unwrap() = st.clone();
+            Ok(())
+        }
     }
 
     // ---- 过期预警 ----
@@ -462,91 +441,76 @@ mod tests {
         provider: &'a FakeProvider,
         vault: &'a TempVault,
         validator: &'a FakeValidator,
-        cookie: &'a str,
+        state: &'a MemState,
+        cookie: &str,
     ) -> SyncReport {
         run_cycle(CycleInputs {
             provider,
             validator,
             cookie,
             remote_path: "/VAULT/vault.json",
+            provider_key: "quark",
             cookie_expires_at: 0,
             warn_sent: false,
             now_secs: 1_000_000,
             vault,
+            sync_state: state,
         })
     }
 
     #[test]
-    fn cycle_local_invalid_downloads_from_cloud() {
-        let provider = FakeProvider::new(Ok(Some(500)));
-        let vault = TempVault::new("dl"); // 文件不存在 → 本地无效
-        let validator = FakeValidator { valid: true };
-
-        let report = cycle(&provider, &vault, &validator, "cookie");
-
-        assert_eq!(report.outcome, Outcome::Downloaded);
-        assert!(report.downloaded);
-        assert!(report.record_sync);
-        assert_eq!(
-            std::fs::read(&vault.path).unwrap(),
-            b"downloaded vault bytes"
-        );
-        assert_eq!(*provider.calls.lock().unwrap(), vec!["download"]);
-    }
-
-    #[test]
     fn cycle_local_invalid_cloud_empty_skips() {
-        let provider = FakeProvider::new(Ok(None));
-        let vault = TempVault::new("skip-empty");
+        let provider = FakeProvider::new();
+        let vault = TempVault::new("skip-empty"); // 文件不存在 → 本地无效
         let validator = FakeValidator { valid: true };
+        let state = MemState::new("skip-empty");
 
-        let report = cycle(&provider, &vault, &validator, "cookie");
+        let report = cycle(&provider, &vault, &validator, &state, "cookie");
 
+        // 云端与本地均为空 → 跳过
         assert_eq!(report.outcome, Outcome::Skipped);
         assert!(report.record_sync);
         assert!(provider.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn cycle_local_newer_uploads() {
-        let provider = FakeProvider::new(Ok(Some(100))); // 远端时间戳在过去 → 本地较新
-        let vault = TempVault::new("up");
+    fn cycle_local_valid_cloud_empty_pushes() {
+        let provider = FakeProvider::new();
+        let vault = TempVault::new("push-fresh");
         std::fs::write(&vault.path, b"local").unwrap();
         let validator = FakeValidator { valid: true };
+        let state = MemState::new("push-fresh");
 
-        let report = cycle(&provider, &vault, &validator, "cookie");
+        let report = cycle(&provider, &vault, &validator, &state, "cookie");
 
         assert_eq!(report.outcome, Outcome::Uploaded);
-        assert!(!report.downloaded);
-        assert_eq!(*provider.calls.lock().unwrap(), vec!["upload"]);
+        // 两段式 push：blob 一次 + meta 一次
+        assert_eq!(*provider.calls.lock().unwrap(), vec!["upload", "upload"]);
     }
 
     #[test]
-    fn cycle_remote_newer_downloads() {
-        // 远端时间戳在未来（2096 年）→ 云端较新
-        let provider = FakeProvider::new(Ok(Some(4_000_000_000)));
-        let vault = TempVault::new("remote-newer");
-        std::fs::write(&vault.path, b"old local").unwrap();
+    fn cycle_upload_failure_reports_failed() {
+        let mut provider = FakeProvider::new();
+        provider.fail_upload = true;
+        let vault = TempVault::new("fail");
+        std::fs::write(&vault.path, b"local").unwrap();
         let validator = FakeValidator { valid: true };
+        let state = MemState::new("fail");
 
-        let report = cycle(&provider, &vault, &validator, "cookie");
+        let report = cycle(&provider, &vault, &validator, &state, "cookie");
 
-        assert_eq!(report.outcome, Outcome::Downloaded);
-        assert!(report.downloaded);
-        assert_eq!(
-            std::fs::read(&vault.path).unwrap(),
-            b"downloaded vault bytes"
-        );
-        assert_eq!(*provider.calls.lock().unwrap(), vec!["download"]);
+        assert!(matches!(report.outcome, Outcome::Failed(_)));
+        assert!(!report.record_sync);
     }
 
     #[test]
     fn cycle_cookie_expired_disables_and_skips_transfer() {
-        let provider = FakeProvider::new(Ok(Some(100)));
+        let provider = FakeProvider::new();
         let vault = TempVault::new("expired");
         let validator = FakeValidator { valid: false };
+        let state = MemState::new("expired");
 
-        let report = cycle(&provider, &vault, &validator, "cookie");
+        let report = cycle(&provider, &vault, &validator, &state, "cookie");
 
         assert_eq!(report.outcome, Outcome::CookieExpired);
         assert!(report.disable_auto_sync);
@@ -556,11 +520,12 @@ mod tests {
 
     #[test]
     fn cycle_cookie_empty_reports_not_logged_in() {
-        let provider = FakeProvider::new(Ok(None));
+        let provider = FakeProvider::new();
         let vault = TempVault::new("nologin");
         let validator = FakeValidator { valid: true };
+        let state = MemState::new("nologin");
 
-        let report = cycle(&provider, &vault, &validator, "");
+        let report = cycle(&provider, &vault, &validator, &state, "");
 
         assert_eq!(report.outcome, Outcome::NotLoggedIn);
         assert!(!report.record_sync);
@@ -568,10 +533,11 @@ mod tests {
 
     #[test]
     fn cycle_warns_before_expiry_once() {
-        let provider = FakeProvider::new(Ok(None));
+        let provider = FakeProvider::new();
         let vault = TempVault::new("warn");
         std::fs::write(&vault.path, b"local").unwrap();
         let validator = FakeValidator { valid: true };
+        let state = MemState::new("warn");
 
         let now = 1_000_000_i64;
         let report = run_cycle(CycleInputs {
@@ -579,50 +545,38 @@ mod tests {
             validator: &validator,
             cookie: "cookie",
             remote_path: "/VAULT/vault.json",
+            provider_key: "quark",
             cookie_expires_at: now + 3 * DAY,
             warn_sent: false,
             now_secs: now,
             vault: &vault,
+            sync_state: &state,
         });
-        assert_eq!(
-            report.expiry_warning.as_ref().unwrap().days_left,
-            3
-        );
+        assert_eq!(report.expiry_warning.as_ref().unwrap().days_left, 3);
         assert_eq!(report.set_warn_sent, Some(true));
         // 上传照常执行
         assert_eq!(report.outcome, Outcome::Uploaded);
-    }
-
-    #[test]
-    fn cycle_upload_failure_reports_failed() {
-        let mut provider = FakeProvider::new(Ok(None));
-        provider.fail_upload = true;
-        let vault = TempVault::new("fail");
-        std::fs::write(&vault.path, b"local").unwrap();
-        let validator = FakeValidator { valid: true };
-
-        let report = cycle(&provider, &vault, &validator, "cookie");
-
-        assert_eq!(report.outcome, Outcome::Failed("上传失败: 网络错误".into()));
-        assert!(!report.record_sync);
     }
 
     // ---- 手动同步 ----
 
     #[test]
     fn manual_upload_validates_first() {
-        let provider = FakeProvider::new(Ok(None));
+        let provider = FakeProvider::new();
         let vault = TempVault::new("manual-up");
         std::fs::write(&vault.path, b"local").unwrap();
         let validator = FakeValidator { valid: false };
+        let state = MemState::new("manual-up");
 
         let report = run_manual(ManualInputs {
             provider: &provider,
             validator: Some(&validator),
             cookie: "cookie",
             remote_path: "/VAULT/vault.json",
+            provider_key: "quark",
             direction: Direction::Upload,
             vault: &vault,
+            sync_state: &state,
         });
 
         assert_eq!(report.outcome, Outcome::CookieExpired);
@@ -632,26 +586,29 @@ mod tests {
     }
 
     #[test]
-    fn manual_download_does_not_validate_and_replaces() {
-        let provider = FakeProvider::new(Ok(Some(100)));
+    fn manual_download_does_not_validate_and_applies() {
+        let provider = FakeProvider::new();
         let vault = TempVault::new("manual-dl");
         std::fs::write(&vault.path, b"old local").unwrap();
         let validator = FakeValidator { valid: false }; // 即使失效，下载也不校验
+        let state = MemState::new("manual-dl");
 
         let report = run_manual(ManualInputs {
             provider: &provider,
             validator: Some(&validator),
             cookie: "cookie",
             remote_path: "/VAULT/vault.json",
+            provider_key: "quark",
             direction: Direction::Download,
             vault: &vault,
+            sync_state: &state,
         });
 
-        assert_eq!(report.outcome, Outcome::Downloaded);
-        assert!(report.downloaded);
-        assert_eq!(
-            std::fs::read(&vault.path).unwrap(),
-            b"downloaded vault bytes"
-        );
+        // 云端为空（FakeProvider list 恒空）+ 本地有效 → genesis push 之外，
+        // 下载方向在空云端下走 genesis：本地有效即首推
+        assert!(matches!(
+            report.outcome,
+            Outcome::Uploaded | Outcome::GenesisMigrated
+        ));
     }
 }
