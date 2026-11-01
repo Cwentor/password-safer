@@ -6,6 +6,7 @@ mod desktop;
 mod mobile;
 
 use shared::models::*;
+use shared::storage::sync_state::SyncState;
 use shared::sync::auth::{baidu::BaiduAuth, quark::QuarkAuth, QrAuthenticator, QrLoginSession, QrLoginStatus};
 use shared::sync::engine;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,24 @@ fn now_ts() -> String {
     chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
+}
+
+/// 把最近一次同步时间写进本地记账 sync_state.json。
+/// 不再写入密码簿内的 AppConfig——那会让每轮同步都改动 vault.json，
+/// 下轮就被 mtime 判为"本地较新"而重复上传。
+fn record_last_sync(state: &Arc<AppState>, provider: &str) {
+    let path = state.data_dir.join("sync_state.json");
+    match SyncState::load_or_create(path) {
+        Ok(mut st) => {
+            if let Some(p) = st.provider_mut(provider) {
+                p.last_sync = now_ts();
+            }
+            if let Err(e) = st.save() {
+                eprintln!("[sync_state] 记录同步时间失败: {}", e);
+            }
+        }
+        Err(e) => eprintln!("[sync_state] 读取失败: {}", e),
+    }
 }
 
 /// 网盘显示名（提示信息与事件用）
@@ -172,15 +191,9 @@ async fn sync_now(
     .await
     .map_err(|e| format!("同步任务失败: {}", e))?;
 
-    // 同步成功则更新 last_sync
+    // 同步成功则更新本地记账（不再写进密码簿）
     if report.record_sync {
-        let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
-        match provider.as_str() {
-            "baidu" => cfg.baidu_last_sync = now_ts(),
-            "quark" => cfg.quark_last_sync = now_ts(),
-            _ => {}
-        }
-        let _ = state.database.lock().unwrap().save_config(&cfg);
+        record_last_sync(&state, &provider);
     }
 
     // 下载成功后通知前端刷新（JSON 文件无需 reopen，下次 load() 自动读取新内容）
@@ -389,6 +402,14 @@ fn get_db_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, Str
     }))
 }
 
+/// 读取云同步本地记账（last_sync 等展示信息；sync_state.json 不上云）
+#[tauri::command]
+fn get_sync_state(
+    state: State<'_, Arc<AppState>>,
+) -> Result<shared::storage::sync_state::SyncState, String> {
+    SyncState::load_or_create(state.data_dir.join("sync_state.json"))
+}
+
 // ========== 定时同步调度 ==========
 
 /// 把云同步引擎的报告落地：所有同步副作用的唯一出口。
@@ -425,13 +446,7 @@ fn apply_sync_report(
     match report.outcome {
         engine::Outcome::Uploaded | engine::Outcome::Downloaded | engine::Outcome::Skipped => {
             if report.record_sync {
-                let mut cfg = state.database.lock().unwrap().load_config().unwrap_or_default();
-                match provider {
-                    "baidu" => cfg.baidu_last_sync = now_ts(),
-                    "quark" => cfg.quark_last_sync = now_ts(),
-                    _ => {}
-                }
-                let _ = state.database.lock().unwrap().save_config(&cfg);
+                record_last_sync(state, provider);
             }
             if report.downloaded {
                 let _ = app.emit("sync://restored", ());
@@ -637,6 +652,7 @@ pub fn run() {
         export_db,
         generate_password,
         get_db_info,
+        get_sync_state,
         desktop::auth::quark::open_quark_login,
         desktop::auth::quark::save_quark_cookie,
         desktop::auth::baidu::open_baidu_login,
@@ -660,6 +676,7 @@ pub fn run() {
         export_db,
         generate_password,
         get_db_info,
+        get_sync_state,
         mobile::auth::quark::open_quark_login,
         mobile::auth::baidu::open_baidu_login,
     ]);
@@ -692,8 +709,25 @@ pub fn run() {
                     let crypto = shared::crypto::Crypto::from_key_file(&key_path)?;
 
                     // 初始化 JSON 存储（双重加密：密码字段加密 + 文件整体加密）
-                    let database =
+                    let mut database =
                         shared::storage::json_store::JsonStore::open(db_path.clone(), crypto)?;
+
+                    // 初始化同步记账（不存在则创建并生成 device_id）
+                    let sync_state_path = data_dir.join("sync_state.json");
+                    SyncState::load_or_create(sync_state_path.clone())?;
+
+                    // 用户写密码簿时刷新 local_dirty_at（同步写路径 replace_raw 不触发）
+                    database.set_on_user_save(Box::new(move || {
+                        match SyncState::load_or_create(sync_state_path.clone()) {
+                            Ok(mut st) => {
+                                st.local_dirty_at = chrono::Local::now().timestamp();
+                                if let Err(e) = st.save() {
+                                    eprintln!("[sync_state] 刷新 local_dirty_at 失败: {}", e);
+                                }
+                            }
+                            Err(e) => eprintln!("[sync_state] 刷新 local_dirty_at 读取失败: {}", e),
+                        }
+                    }));
 
                     let state = Arc::new(AppState {
                         database: Arc::new(Mutex::new(database)),

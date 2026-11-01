@@ -158,6 +158,11 @@ export function syncNow(provider, direction) {
   return invoke('sync_now', { provider, direction });
 }
 
+// 云同步本地记账（last_sync 等，存于 sync_state.json，不上云）
+export function getSyncState() {
+  return invoke('get_sync_state');
+}
+
 export function logout(provider) {
   return invoke('logout', { provider });
 }

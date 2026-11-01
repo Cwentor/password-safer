@@ -1,4 +1,5 @@
 pub mod json_store;
+pub mod sync_state;
 
 use tauri::{AppHandle, Manager};
 

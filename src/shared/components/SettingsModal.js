@@ -96,8 +96,8 @@ export function populateSettingsForm() {
   setVal('baiduRemotePath', state.appConfig.baidu_remote_path);
   setVal('baiduInterval', String(state.appConfig.baidu_sync_interval || 300));
 
-  setText('quarkLastSync', state.appConfig.quark_last_sync || '—');
-  setText('baiduLastSync', state.appConfig.baidu_last_sync || '—');
+  setText('quarkLastSync', (state.syncState && state.syncState.quark && state.syncState.quark.last_sync) || '—');
+  setText('baiduLastSync', (state.syncState && state.syncState.baidu && state.syncState.baidu.last_sync) || '—');
   setText('quarkExpires', formatExpires(state.appConfig.quark_cookie_expires_at));
   setText('baiduExpires', formatExpires(state.appConfig.baidu_cookie_expires_at));
 

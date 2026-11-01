@@ -44,20 +44,34 @@ impl Default for StoreData {
     }
 }
 
+/// 解码并验证密码簿字节（正常读取与 .bak 回退共用）
+/// 文件内容是 base64 字符串（crypto.encrypt 的输出）
+fn decode_store(bytes: &[u8], crypto: &Crypto) -> Result<StoreData, String> {
+    let encoded = String::from_utf8(bytes.to_vec())
+        .map_err(|_| "vault.json 不是有效的 UTF-8".to_string())?;
+    let json_str = crypto.decrypt(&encoded)?;
+    serde_json::from_str(&json_str).map_err(|e| format!("反序列化 StoreData 失败: {}", e))
+}
+
 /// 加密 JSON 文件存储
 pub struct JsonStore {
     db_path: PathBuf,
     crypto: Crypto,
+    /// 用户写路径回调（save 成功后触发，用于刷新同步记账的 local_dirty_at；
+    /// 同步写路径 replace_raw 不经过 save，不触发——这是区分"用户改过"与"同步落下"的关键）
+    on_user_save: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl JsonStore {
     /// 打开或创建 JSON 存储
     /// 若文件不存在则创建空 StoreData 并保存
-    /// 若文件存在则验证可解密（不验证则启动失败）
+    /// 若文件解密失败，尝试用 .bak 回退（write_atomic 每次保存前都会备份上一版）
+    /// 回退也失败则报错
     pub fn open(db_path: PathBuf, crypto: Crypto) -> Result<Self, String> {
         let store = JsonStore {
             db_path,
             crypto,
+            on_user_save: None,
         };
         // 如果文件不存在，创建空 StoreData 并保存
         if !store.db_path.exists() {
@@ -68,23 +82,38 @@ impl JsonStore {
             // 验证可解密
             match store.load() {
                 Ok(_) => eprintln!("[json_store] vault.json 加载验证成功"),
-                Err(e) => return Err(format!("vault.json 解密失败: {}", e)),
+                Err(e) => store.recover_from_bak(&e)?,
             }
         }
         Ok(store)
+    }
+
+    /// 主文件解密失败时尝试从 .bak 恢复：先验证 .bak 可解密可解析，再原子覆盖主文件
+    fn recover_from_bak(&self, main_err: &str) -> Result<(), String> {
+        let bak_path = self.db_path.with_extension("json.bak");
+        let bytes = std::fs::read(&bak_path)
+            .map_err(|_| format!("vault.json 解密失败（{}）且无可用 .bak", main_err))?;
+        decode_store(&bytes, &self.crypto)
+            .map_err(|e| format!("vault.json 解密失败（{}）且 .bak 不可用（{}）", main_err, e))?;
+        std::fs::write(&self.db_path, bytes)
+            .map_err(|e| format!(".bak 恢复写入失败: {}", e))?;
+        // 覆盖后复核一次，确保主文件恢复可用
+        self.load()
+            .map_err(|e| format!(".bak 恢复后复核失败: {}", e))?;
+        eprintln!("[json_store] vault.json 已从 .bak 恢复");
+        Ok(())
+    }
+
+    /// 注册用户写路径回调（需在 open 之后、并发使用之前调用）
+    pub fn set_on_user_save(&mut self, f: Box<dyn Fn() + Send + Sync>) {
+        self.on_user_save = Some(f);
     }
 
     /// 读取并解密 JSON 文件
     pub fn load(&self) -> Result<StoreData, String> {
         let bytes = std::fs::read(&self.db_path)
             .map_err(|e| format!("读取 vault.json 失败: {}", e))?;
-        // 文件内容是 base64 字符串（crypto.encrypt 的输出）
-        let encoded = String::from_utf8(bytes)
-            .map_err(|e| format!("vault.json 不是有效的 UTF-8: {}", e))?;
-        let json_str = self.crypto.decrypt(&encoded)?;
-        let data: StoreData = serde_json::from_str(&json_str)
-            .map_err(|e| format!("反序列化 StoreData 失败: {}", e))?;
-        Ok(data)
+        decode_store(&bytes, &self.crypto)
     }
 
     /// 加密并写入 JSON 文件
@@ -92,7 +121,11 @@ impl JsonStore {
         let json_str = serde_json::to_string(data)
             .map_err(|e| format!("序列化 StoreData 失败: {}", e))?;
         let encoded = self.crypto.encrypt(&json_str)?;
-        self.write_atomic(encoded.as_bytes())
+        self.write_atomic(encoded.as_bytes())?;
+        if let Some(cb) = &self.on_user_save {
+            cb();
+        }
+        Ok(())
     }
 
     /// 原子写入：先写临时文件再改名替换，并发读不会读到半截文件。
@@ -372,6 +405,58 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "别的设备");
         assert_eq!(all[0].password, "xyz987654321");
+    }
+
+    #[test]
+    fn open_recovers_from_bak_when_main_corrupted() {
+        let dir = temp_dir("bak-recover");
+        let crypto = Crypto::from_key_file(&dir.join("master.key")).unwrap();
+        let db_path = dir.join("vault.json");
+
+        let store = JsonStore::open(db_path.clone(), crypto.clone_key()).unwrap();
+        store.insert(&sample_input("第一版", "abc123456")).unwrap();
+        store.insert(&sample_input("第二版", "xyz987654321")).unwrap();
+        // 此时 .bak 持有"第一版"内容，主文件持有"第二版"
+        drop(store);
+
+        // 主文件损坏 → 打开时从 .bak 回退
+        std::fs::write(&db_path, b"corrupted garbage").unwrap();
+        let store2 = JsonStore::open(db_path, crypto).unwrap();
+        let all = store2.get_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "第一版");
+    }
+
+    #[test]
+    fn open_fails_when_corrupted_without_bak() {
+        let dir = temp_dir("bak-missing");
+        let crypto = Crypto::from_key_file(&dir.join("master.key")).unwrap();
+        let db_path = dir.join("vault.json");
+        std::fs::write(&db_path, b"corrupted garbage").unwrap();
+        assert!(JsonStore::open(db_path, crypto).is_err());
+    }
+
+    #[test]
+    fn user_save_callback_fires_only_on_save() {
+        let dir = temp_dir("callback");
+        let crypto = Crypto::from_key_file(&dir.join("master.key")).unwrap();
+        let db_path = dir.join("vault.json");
+        let mut store = JsonStore::open(db_path, crypto).unwrap();
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = counter.clone();
+        store.set_on_user_save(Box::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        // 用户写路径：回调触发
+        store.insert(&sample_input("站点A", "abc123456")).unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 同步写路径：replace_raw 不触发回调
+        let bytes = std::fs::read(&store.db_path).unwrap();
+        store.replace_raw(&bytes).unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
