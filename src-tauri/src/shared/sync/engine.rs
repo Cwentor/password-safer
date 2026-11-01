@@ -327,7 +327,13 @@ mod tests {
                 Ok(b"downloaded vault bytes".to_vec())
             }
         }
-        fn remote_file_mtime(&self, _remote: &str) -> Result<Option<i64>, String> {
+        fn list(&self, _remote_dir: &str) -> Result<Vec<crate::shared::sync::RemoteFile>, String> {
+            Ok(Vec::new())
+        }
+        fn delete(&self, _remote_path: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn remote_file_mtime(&self, _remote_path: &str) -> Result<Option<i64>, String> {
             self.mtime.clone()
         }
     }

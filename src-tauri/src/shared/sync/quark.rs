@@ -438,6 +438,109 @@ impl QuarkProvider {
         Ok(None)
     }
 
+    /// 逐级查找目录 fid（只查不建）；任一级不存在返回 Ok(None)
+    fn find_dir_fid(&self, remote_dir: &str) -> Result<Option<String>, String> {
+        let trimmed = remote_dir.trim_start_matches('/');
+        let comps: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        if comps.is_empty() {
+            return Ok(Some("0".to_string()));
+        }
+        let mut cur = "0".to_string();
+        for name in &comps {
+            match self.find_child_dir(&cur, name)? {
+                Some(fid) => cur = fid,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(cur))
+    }
+
+    /// 在目录的直接子层查找名为 name 的子目录（只查不建）
+    fn find_child_dir(&self, pdir_fid: &str, name: &str) -> Result<Option<String>, String> {
+        let resp = self.file_sort(pdir_fid, 1, 200, "file_type:asc,updated_at:desc")?;
+        if let Some(list) = resp["data"]["list"].as_array() {
+            for item in list {
+                if item["file_type"].as_i64() == Some(0) && item["file_name"].as_str() == Some(name)
+                {
+                    return Ok(Some(item["fid"].as_str().unwrap_or("").to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 列出远端目录一层内容（翻页取全；目录不存在返回空列表）
+    fn list_dir(&self, remote_dir: &str) -> Result<Vec<super::RemoteFile>, String> {
+        let pdir_fid = match self.find_dir_fid(remote_dir)? {
+            Some(fid) => fid,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self.file_sort(&pdir_fid, page, 200, "file_type:asc,updated_at:desc")?;
+            let list = resp["data"]["list"].as_array().cloned().unwrap_or_default();
+            let got = list.len();
+            for item in list {
+                if item["file_type"].as_i64() != Some(1) {
+                    continue; // 只列文件
+                }
+                out.push(super::RemoteFile {
+                    name: item["file_name"].as_str().unwrap_or("").to_string(),
+                    size: item["size"].as_i64().unwrap_or(0),
+                    mtime: item["update_time"].as_i64().unwrap_or(0),
+                });
+            }
+            if got < 200 || page > 500 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
+    /// 查找文件 fid（只在直接父目录层查，不递归，避免误删；翻页取全）
+    fn find_file_fid_exact(&self, parent_fid: &str, fname: &str) -> Result<Option<String>, String> {
+        let mut page = 1u32;
+        loop {
+            let resp = self.file_sort(parent_fid, page, 200, "file_type:asc,updated_at:desc")?;
+            let list = resp["data"]["list"].as_array().cloned().unwrap_or_default();
+            let got = list.len();
+            for item in list {
+                if item["file_type"].as_i64() == Some(1)
+                    && item["file_name"].as_str() == Some(fname)
+                {
+                    return Ok(item["fid"].as_str().map(|s| s.to_string()));
+                }
+            }
+            if got < 200 || page > 500 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(None)
+    }
+
+    /// 删除远端单个文件（幂等：目标不存在视为成功）
+    fn delete_one(&self, remote_path: &str) -> Result<(), String> {
+        let trimmed = remote_path.trim_start_matches('/');
+        let (dir, fname) = match trimmed.rfind('/') {
+            Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+            None => ("", trimmed),
+        };
+        let dir_path = format!("/{}", dir);
+        let parent_fid = self
+            .find_dir_fid(&dir_path)?
+            .ok_or_else(|| format!("远端目录不存在: {}", dir_path))?;
+        match self.find_file_fid_exact(&parent_fid, fname)? {
+            Some(fid) => self.delete_files(&[fid.as_str()]),
+            None => {
+                eprintln!("[quark] delete: {} 不存在，视为已删", remote_path);
+                Ok(())
+            }
+        }
+    }
+
     /// 获取远端文件的最后修改时间（unix 秒）
     /// 文件不存在时返回 Ok(None)
     pub fn remote_file_mtime(&self, remote_path: &str) -> Result<Option<i64>, String> {
@@ -611,16 +714,8 @@ impl SyncProvider for QuarkProvider {
         let fname = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
         let parent_fid = self.ensure_parent_fid(remote_path)?;
 
-        // 上传前检查远端同名文件，若存在则删除（避免 23008 同名冲突）
-        if let Ok(Some(existing_fid)) = self.find_file_fid(&parent_fid, &fname, 0) {
-            eprintln!("[quark] 远端已存在同名文件 fid={}, 先删除", existing_fid);
-            if let Err(e) = self.delete_files(&[existing_fid.as_str()]) {
-                eprintln!("[quark] 删除远端旧文件失败（继续尝试上传）: {}", e);
-            } else {
-                // 删除后等待夸克服务端处理完成，避免 23008
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-        }
+        // 追加式语义：只新增，绝不删除/覆盖远端已有文件。
+        // 调用方保证 remote_path 唯一；若真的撞名，由网盘 23008 报错暴露，不静默删旧。
 
         let data = std::fs::read(local_path).map_err(|e| format!("读取本地文件失败: {}", e))?;
         let fsize = data.len() as i64;
@@ -1036,6 +1131,14 @@ impl SyncProvider for QuarkProvider {
         }?;
 
         Ok(bytes)
+    }
+
+    fn list(&self, remote_dir: &str) -> Result<Vec<super::RemoteFile>, String> {
+        self.list_dir(remote_dir)
+    }
+
+    fn delete(&self, remote_path: &str) -> Result<(), String> {
+        self.delete_one(remote_path)
     }
 
     fn remote_file_mtime(&self, remote_path: &str) -> Result<Option<i64>, String> {
