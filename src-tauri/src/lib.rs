@@ -1295,6 +1295,7 @@ pub fn run() {
         migrate_vault_to_password,
         lock_vault,
         mobile::auth::quark::open_quark_login,
+        mobile::auth::quark::save_quark_cookie,
         mobile::auth::baidu::open_baidu_login,
     ]);
 
