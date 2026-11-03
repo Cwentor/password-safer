@@ -257,8 +257,9 @@ pub async fn open_login_window(app: tauri::AppHandle, spec: WebviewLoginSpec) ->
         }
     };
 
-    // 始终打开 DevTools（不限于 debug 模式），便于调试空白问题
-    #[cfg(desktop)]
+    // Debug 构建打开 DevTools，便于调试空白问题；
+    // release 构建无 devtools API（未启用 feature），不得编译
+    #[cfg(all(desktop, debug_assertions))]
     webview_window.open_devtools();
 
     // 探询线程：定期用 Tauri 2 官方 cookies_for_url() 获取完整 Cookie（含 HttpOnly）；
