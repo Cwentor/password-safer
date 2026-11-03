@@ -23,6 +23,22 @@ async function getDialogModule() {
   }
 }
 
+// 动态加载 fs 插件（移动端对 SAF content:// URI 的字节读写）
+let _fsModule = null;
+let _fsError = false;
+export async function getFsModule() {
+  if (_fsError) return null;
+  if (_fsModule) return _fsModule;
+  try {
+    _fsModule = await import('@tauri-apps/plugin-fs');
+    return _fsModule;
+  } catch (e) {
+    console.warn('[api] fs 插件加载失败:', e);
+    _fsError = true;
+    return null;
+  }
+}
+
 // ========== 文件选择器封装（移动端使用 SAF，桌面端走 prompt） ==========
 //
 // 设计说明：
@@ -150,6 +166,20 @@ export function exportDb(filePath) {
 
 export function importDb(filePath) {
   return invoke('import_db', { filePath });
+}
+
+// ========== 导入导出（字节级，移动端 SAF content:// 用） ==========
+//
+// - export_db_data 经 tauri::ipc::Response 返回 raw 通道，invoke 解析为 ArrayBuffer
+// - import_db_data 传 Uint8Array 作为 invoke 第二参，走 IPC raw 通道到 Vec<u8>
+//   （Tauri v2 二进制传输，避免 JSON 数字数组序列化膨胀）
+
+export function readVaultBytes() {
+  return invoke('export_db_data');
+}
+
+export function importDbData(data) {
+  return invoke('import_db_data', data);
 }
 
 // ========== 云同步 ==========

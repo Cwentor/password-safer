@@ -12,6 +12,7 @@ import { saveConfig, syncNow, logout, getVaultStatus, lockVault } from '../lib/a
 import { showVaultUnlockModal } from './VaultUnlockModal.js';
 import { startQrLogin } from './QrLoginModal.js';
 import { exportDb, importDb, saveFileDialog, openFileDialog } from '../lib/api.js';
+import { getFsModule, readVaultBytes, importDbData } from '../lib/api.js';
 import {
   onSyncExpired, onSyncError, onSyncRestored,
   onBaiduLoginSuccess, onQuarkLoginSuccess
@@ -309,10 +310,26 @@ function initSyncFields() {
 
 // ========== 导入导出 ==========
 //
-// 平台分支策略（SubTask 5.2）：
-// - 桌面端：保持原有 prompt() 方式，用户手动输入路径
-// - 移动端：调用 saveFileDialog/openFileDialog 走 SAF 文件选择器
-//   （Android WebView 无 window.prompt，必须改用原生对话框）
+// 平台分支策略（SubTask 5.2 + 移动端 SAF 兼容）：
+// - 桌面端：保持原有 prompt() 方式，用户手动输入路径，后端 std::fs 直读直写
+// - 移动端：saveFileDialog/openFileDialog 走 SAF 返回 content:// URI，
+//   后端 std::fs 无法访问该 URI，改为字节搬运：
+//   导出 = export_db_data（IPC raw 返回 ArrayBuffer）→ fs 插件写 content://
+//   导入 = fs 插件读 content:// → import_db_data（Uint8Array 走 IPC raw）
+
+async function exportMobile(uri) {
+  const fs = await getFsModule();
+  if (!fs) throw new Error('fs 插件不可用');
+  const bytes = await readVaultBytes();
+  await fs.writeFile(uri, new Uint8Array(bytes));
+}
+
+async function importMobile(uri) {
+  const fs = await getFsModule();
+  if (!fs) throw new Error('fs 插件不可用');
+  const bytes = await fs.readFile(uri);
+  return importDbData(bytes);
+}
 
 function initImportExport() {
   document.addEventListener('click', async (e) => {
@@ -320,13 +337,18 @@ function initImportExport() {
     if (!btn) return;
     const text = btn.textContent.trim();
     if (text === '导出数据库') {
-      let path;
       if (isMobile()) {
-        path = await saveFileDialog('vault_export.json');
+        const uri = await saveFileDialog('vault_export.json');
+        if (!uri) return;
+        try {
+          await exportMobile(uri);
+          showToast('数据库已导出到所选文件');
+        } catch (err) {
+          showToast('导出失败: ' + err);
+        }
       } else {
-        path = prompt('请输入导出文件路径：', 'vault_export.json');
-      }
-      if (path) {
+        const path = prompt('请输入导出文件路径：', 'vault_export.json');
+        if (!path) return;
         try {
           await exportDb(path);
           showToast('数据库已导出到: ' + path);
@@ -335,13 +357,23 @@ function initImportExport() {
         }
       }
     } else if (text === '导入数据') {
-      let path;
       if (isMobile()) {
-        path = await openFileDialog();
+        const uri = await openFileDialog();
+        if (!uri) return;
+        try {
+          const result = await importMobile(uri);
+          if (result.success) {
+            showToast(result.message);
+            await loadPasswords();
+          } else {
+            showToast('导入失败: ' + result.message);
+          }
+        } catch (err) {
+          showToast('导入失败: ' + err);
+        }
       } else {
-        path = prompt('请输入要导入的数据库文件路径：', 'vault_import.json');
-      }
-      if (path) {
+        const path = prompt('请输入要导入的数据库文件路径：', 'vault_import.json');
+        if (!path) return;
         try {
           const result = await importDb(path);
           if (result.success) {

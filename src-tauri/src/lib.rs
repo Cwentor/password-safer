@@ -373,31 +373,56 @@ fn import_db(file_path: String, state: State<'_, Arc<AppState>>) -> Result<Impor
         }
     };
 
-    // 单一写入口：先验证可解密、可解析，再原子替换；验证不过不会破坏现有数据
-    let import_result = {
-        let g = state.db()?;
-        match g.as_ref().ok_or(LOCKED_MSG)?.replace_raw(&bytes) {
-            Ok(()) => {
-                let imported_count = g
-                    .as_ref()
-                    .ok_or(LOCKED_MSG)?
-                    .get_all()
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-                Ok(ImportResult {
-                    success: true,
-                    message: format!("成功导入，共 {} 条密码记录", imported_count),
-                    imported_count,
-                })
-            }
-            Err(e) => Ok(ImportResult {
-                success: false,
-                message: format!("导入失败: {}", e),
-                imported_count: 0,
-            }),
+    import_from_bytes(&state, &bytes)
+}
+
+/// 字节级导入公共流程：单一写入口，先验证可解密、可解析，再原子替换；
+/// 验证不过不会破坏现有数据。import_db 与 import_db_data 共用
+fn import_from_bytes(state: &AppState, bytes: &[u8]) -> Result<ImportResult, String> {
+    let g = state.db()?;
+    match g.as_ref().ok_or(LOCKED_MSG)?.replace_raw(bytes) {
+        Ok(()) => {
+            let imported_count = g
+                .as_ref()
+                .ok_or(LOCKED_MSG)?
+                .get_all()
+                .map(|v| v.len())
+                .unwrap_or(0);
+            Ok(ImportResult {
+                success: true,
+                message: format!("成功导入，共 {} 条密码记录", imported_count),
+                imported_count,
+            })
         }
+        Err(e) => Ok(ImportResult {
+            success: false,
+            message: format!("导入失败: {}", e),
+            imported_count: 0,
+        }),
+    }
+}
+
+/// 导入密码簿（移动端 SAF 导入用）：字节经 IPC raw 通道传入
+/// （JS 侧 invoke 第二参直接传 Uint8Array）
+#[tauri::command]
+fn import_db_data(
+    request: tauri::ipc::Request,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ImportResult, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        _ => return Err("导入数据格式错误（需要二进制载荷）".to_string()),
     };
-    import_result
+    import_from_bytes(&state, &bytes)
+}
+
+/// 导出密码簿原始字节（移动端 SAF 导出用）：经 IPC raw 通道返回 ArrayBuffer，
+/// 规避 JSON 数字数组序列化的体积膨胀
+#[tauri::command]
+fn export_db_data(state: State<'_, Arc<AppState>>) -> Result<tauri::ipc::Response, String> {
+    let _guard = state.database.lock().unwrap();
+    let bytes = std::fs::read(&state.db_path).map_err(|e| format!("导出失败: {}", e))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// 导出数据库文件到指定路径（复制在锁内进行，不与写入并发）
@@ -1247,6 +1272,8 @@ pub fn run() {
         logout,
         import_db,
         export_db,
+        import_db_data,
+        export_db_data,
         generate_password,
         get_db_info,
         get_sync_state,
@@ -1281,6 +1308,8 @@ pub fn run() {
         logout,
         import_db,
         export_db,
+        import_db_data,
+        export_db_data,
         generate_password,
         get_db_info,
         get_sync_state,
@@ -1304,6 +1333,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        // fs 插件：移动端 SAF 导入导出经 content:// URI 读写（桌面端导库仍走 std::fs）
+        .plugin(tauri_plugin_fs::init())
         .setup(move |app| {
             // 初始化数据目录（通过 Tauri AppHandle 获取跨平台路径）
             // 仅保留快速路径计算与目录创建，避免阻塞 Android 主线程触发 ANR
