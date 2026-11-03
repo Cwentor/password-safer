@@ -26,10 +26,8 @@ export function initSettingsModal() {
   const settingsClose = document.getElementById('settingsClose');
 
   if (settingsBtn) {
-    settingsBtn.addEventListener('click', async () => {
-      await loadConfig();
-      populateSettingsForm();
-      if (settingsModalEl) settingsModalEl.classList.add('show');
+    settingsBtn.addEventListener('click', () => {
+      openSettingsModal();
     });
   }
 
@@ -116,7 +114,13 @@ function initVaultSecurity() {
   }
 }
 
-export function openSettingsModal() {
+// 打开设置弹窗（两端统一入口）：先刷新配置再显示，避免展示启动时刻的旧状态。
+// 刷新失败仍打开弹窗，回退展示上次缓存
+export async function openSettingsModal() {
+  try {
+    await loadConfig();
+  } catch (e) { /* 展示上次缓存 */ }
+  populateSettingsForm();
   if (settingsModalEl) settingsModalEl.classList.add('show');
 }
 
