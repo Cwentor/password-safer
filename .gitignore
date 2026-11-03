@@ -77,3 +77,6 @@ competition/
 # ========== Trae 工作区（开发辅助文件，不需提交） ==========
 .trae/documents/
 .trae/specs/
+
+# ========== ZCode 会话产物 ==========
+.zcode/

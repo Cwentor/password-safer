@@ -15,6 +15,14 @@ let listTitleEl = null;
 let listCountEl = null;
 let tagsCloudEl = null;
 
+// 排序函数表：key 与 .filter-tab[data-sort]（桌面排序栏）/ 移动端筛选排序面板对齐
+const SORTERS = {
+  name: (a, b) => a.name.localeCompare(b.name, 'zh'),
+  recent: (a, b) => (b.last_used || '').localeCompare(a.last_used || ''),
+  created: (a, b) => (b.created || '').localeCompare(a.created || ''),
+  strength: (a, b) => (a.strength || 0) - (b.strength || 0),
+};
+
 export function initPasswordList() {
   passwordListEl = document.getElementById('passwordList');
   searchInputEl = document.getElementById('searchInput');
@@ -90,8 +98,6 @@ export function renderPasswordList() {
     filtered = filtered.filter(p => p.favorite);
   } else if (state.currentFilter === 'weak') {
     filtered = filtered.filter(p => p.strength <= 2);
-  } else if (state.currentFilter === 'recent') {
-    filtered.sort((a, b) => (b.last_used || '').localeCompare(a.last_used || ''));
   }
 
   if (state.currentTag) {
@@ -109,8 +115,12 @@ export function renderPasswordList() {
     );
   }
 
-  if (state.currentFilter !== 'recent') {
-    filtered.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  // 排序单一出口：「最近使用」分类固定按 last_used 降序展示，
+  // 其余分类消费 state.currentSort（桌面排序栏 / 移动端筛选排序面板写入）
+  if (state.currentFilter === 'recent') {
+    filtered.sort(SORTERS.recent);
+  } else {
+    filtered.sort(SORTERS[state.currentSort] || SORTERS.name);
   }
 
   if (listCountEl) listCountEl.textContent = `${filtered.length} 个条目`;

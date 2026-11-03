@@ -21,7 +21,8 @@ export default defineConfig({
       '@tauri-apps/plugin-dialog',
       '@tauri-apps/plugin-notification',
       '@tauri-apps/plugin-os',
-      '@tauri-apps/plugin-shell'
+      '@tauri-apps/plugin-shell',
+      '@tauri-apps/plugin-fs'
     ]
   }
 });

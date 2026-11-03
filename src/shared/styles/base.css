@@ -577,3 +577,27 @@ body::after {
   from { opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; }
   to { opacity: 1; max-height: 300px; padding-top: 16px; padding-bottom: 16px; }
 }
+
+/* ============================================
+   Vault Usage Bar (设置-存储页占用条，两端共用；
+   与桌面侧栏 .storage-bar 独立命名，避免样式互扰)
+   ============================================ */
+
+.vault-usage {
+  padding: 12px 16px 0;
+}
+
+.vault-usage-bar {
+  height: 8px;
+  background: var(--bg-card);
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.vault-usage-fill {
+  height: 100%;
+  background: var(--gradient-primary);
+  border-radius: 4px;
+  transition: width 0.5s ease;
+}

@@ -202,6 +202,41 @@ input, textarea {
   color: var(--text-dim);
 }
 
+/* 列表头右侧：计数 + 筛选/排序入口按钮 */
+.mobile-password-list .list-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mobile-password-list .list-controls-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.mobile-password-list .list-controls-btn:active {
+  background: var(--bg-card-hover);
+}
+
+.mobile-password-list .list-controls-btn svg {
+  width: 18px;
+  height: 18px;
+  stroke: var(--text-secondary);
+  stroke-width: 2;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 /* 密码卡片移动端样式 */
 .mobile-password-list .password-card {
   display: flex;
@@ -1436,6 +1471,39 @@ input, textarea {
 
 .actionsheet-cancel:active {
   background: var(--bg-card-hover);
+}
+
+/* 筛选/排序面板（ListControls）复用 ActionSheet 的扩展项 */
+.actionsheet-group-label {
+  padding: 10px 20px 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.actionsheet-item .actionsheet-check {
+  visibility: hidden;
+  margin-left: auto;
+  stroke: var(--accent);
+}
+
+.actionsheet-item.active .actionsheet-check {
+  visibility: visible;
+}
+
+.actionsheet-item .actionsheet-count {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* 有计数时勾选标记紧跟标签，计数贴最右 */
+.actionsheet-item:has(.actionsheet-count) .actionsheet-check {
+  margin-left: 0;
+}
+
+.actionsheet-item.active {
+  color: var(--accent);
+  font-weight: 500;
 }
 
 /* ========== 触摸交互优化（Task 6.4） ========== */

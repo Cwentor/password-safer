@@ -27,6 +27,7 @@ import { getMobileHeaderHTML, initMobileHeader } from './components/MobileHeader
 import { getMobileSearchBarHTML } from './components/MobileSearchBar.js';
 import { getBottomNavHTML, initBottomNav, setActiveTab } from './components/BottomNav.js';
 import { initLongPressMenu, tryCloseLongPressMenu } from './components/LongPressMenu.js';
+import { initListControls, tryCloseListControls } from './components/ListControls.js';
 
 // 主区域 HTML（含内容容器，根据 Tab 切换）
 function getMainHTML() {
@@ -37,7 +38,12 @@ function getMainHTML() {
       <div class="password-list mobile-password-list" id="passwordList">
         <div class="list-header">
           <span class="list-title" id="listTitle">全部密码</span>
-          <span class="list-count" id="listCount">0 个条目</span>
+          <span class="list-right">
+            <span class="list-count" id="listCount">0 个条目</span>
+            <button class="list-controls-btn" id="listControlsBtn" aria-label="筛选与排序">
+              <svg viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+            </button>
+          </span>
         </div>
       </div>
     </div>
@@ -138,6 +144,8 @@ export function mount(appElement) {
   registerCoreRenderers();
   initSharedComponents({ longPress: initLongPressMenu });
   initMobileHeader({ onSettingsClick: () => openSettingsModal() });
+  // 列表筛选/排序面板（分类/排序入口，见 ListControls）
+  initListControls();
 
   // 底部导航：Tab 切换逻辑
   initBottomNav({
@@ -169,11 +177,11 @@ export function mount(appElement) {
     },
   });
 
-  // 安卓返回键 / Escape 关浮层（长按菜单最优先，含二维码弹窗）
+  // 安卓返回键 / Escape 关浮层（长按菜单最优先，其次筛选排序面板，含二维码弹窗）
   bindOverlayEscape({
     keys: ['Escape', 'Backspace'],
     before: (e) => {
-      if (tryCloseLongPressMenu()) {
+      if (tryCloseLongPressMenu() || tryCloseListControls()) {
         e.preventDefault();
         return true;
       }

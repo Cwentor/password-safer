@@ -265,6 +265,11 @@ ${syncPanel}
               <span>加密 JSON 存储</span>
               <span class="mono" style="color:var(--accent)">vault.json</span>
             </div>
+            <div class="vault-usage">
+              <div class="vault-usage-bar">
+                <div class="vault-usage-fill" id="storageFillSettings" style="width: 0%"></div>
+              </div>
+            </div>
             <div class="storage-card-body">
               <div class="detail-row">
                 <span class="detail-key">数据库路径</span>
@@ -272,7 +277,7 @@ ${syncPanel}
               </div>
               <div class="detail-row">
                 <span class="detail-key">当前大小</span>
-                <span class="detail-val mono">2.3 MB</span>
+                <span class="detail-val mono" id="storageSizeSettings">—</span>
               </div>
               <div class="detail-row">
                 <span class="detail-key">密码条目</span>
